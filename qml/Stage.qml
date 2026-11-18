@@ -205,8 +205,8 @@ Item {
             id: viewer
             anchors.top: title.bottom
             anchors.topMargin: 47  // room for the pager dots, which stay put while panes slide
-            anchors.left: parent.left
-            anchors.right: parent.right
+            anchors.horizontalCenter: parent.horizontalCenter
+            width: Math.min(parent.width, Math.max(760, parent.width * 0.72))
             anchors.bottom: parent.bottom
             sourceComponent: {
                 switch (p.kind) {

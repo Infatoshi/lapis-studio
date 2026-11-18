@@ -42,6 +42,7 @@ struct GamepadAction {
         Nav,
         Confirm,
         Back,
+        BackHeld,
         AcceptPrediction,
         Secondary,
         Step,
@@ -157,6 +158,7 @@ signals:
     void nav(int dx, int dy);
     void confirm();
     void back();
+    void backHeld(bool down);
     void acceptPrediction();
     void secondary();
     void step(int delta);

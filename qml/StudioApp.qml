@@ -496,7 +496,8 @@ FocusScope {
         } else if (answers.pickerOpen && backend) {
             if (dy !== 0) backend.cycleModel(dy); else backend.cycleEffort(dx);
         } else if (answers.inputFocused) {
-            if (dy < 0) answers.openPicker();          // Up from the composer: the model strip
+            if (dx !== 0) answers.cursorStep(dx);
+            else if (dy < 0) answers.openPicker();          // Up from the composer: the model strip
             else if (dy > 0) takeFocus();               // Down: back to the lens, text kept
         } else if (lens === 2 && stage.terms.active) {
             stage.terms.step(dx + dy);
@@ -521,7 +522,7 @@ FocusScope {
         else if (dialog.open) dialog.start();
         else if (settings.open) settings.hide();
         else if (answers.pickerOpen) answers.pickerOpen = false;  // the composer keeps focus
-        else if (answers.inputFocused) answers.send(0);
+        else if (answers.inputFocused) { if (!answers.toggleHighlight()) answers.send(0); }
         else if (lens === 2 && stage.terms.active) scopeToParam(stage.terms.current());
         else if (lens === 0) { if (projects.length > 0) enterProject(selectedIsland); }
         else if (lens === 1 && artifacts.length > 0) goLens(2);
@@ -623,6 +624,7 @@ FocusScope {
         function onNav(dx, dy) { app.padNav(dx, dy); }
         function onConfirm() { app.padConfirm(); }
         function onBack() { app.padBack(); }
+        function onBackHeld(down) { answers.setBackHeld(down); }
         function onAcceptPrediction() { app.padTriangle(); }
         function onSecondary() { app.padSecondary(); }
         function onStep(d) { app.padStep(d); }

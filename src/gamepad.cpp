@@ -102,14 +102,18 @@ void GamepadState::emitMappedAction(const QString &inputId, bool down, QList<Gam
         out.append({GamepadAction::VoiceHold, 0, 0, down ? 1.0 : 0.0, {}});
         return;
     }
+    if (act == QLatin1String("back")) {
+        out.append(GamepadAction::make(GamepadAction::BackHeld, 0, 0, down ? 1.0 : 0.0));
+        if (down)
+            out.append(GamepadAction::make(GamepadAction::Back));
+        return;
+    }
     if (!down)
         return;
     if (act == QLatin1String("send"))
         out.append(GamepadAction::make(GamepadAction::Send));
     else if (act == QLatin1String("confirm"))
         out.append(GamepadAction::make(GamepadAction::Confirm));
-    else if (act == QLatin1String("back"))
-        out.append(GamepadAction::make(GamepadAction::Back));
     else if (act == QLatin1String("secondary"))
         out.append(GamepadAction::make(GamepadAction::Secondary));
     else if (act == QLatin1String("accept_prediction"))
@@ -363,6 +367,7 @@ void Gamepad::processSnapshot(const Snapshot &s, qint64 nowMs)
         case GamepadAction::Nav: emit nav(a.dx, a.dy); break;
         case GamepadAction::Confirm: emit confirm(); break;
         case GamepadAction::Back: emit back(); break;
+        case GamepadAction::BackHeld: emit backHeld(a.value > 0.5); break;
         case GamepadAction::AcceptPrediction: emit acceptPrediction(); break;
         case GamepadAction::Secondary: emit secondary(); break;
         case GamepadAction::Step: emit step(a.dx); break;

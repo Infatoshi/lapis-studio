@@ -269,6 +269,8 @@ public:
     void setOpenaiCompatModel(const QString &model);
     Q_INVOKABLE void setGamepadBinding(const QString &inputId, const QString &actionId);
     Q_INVOKABLE void resetGamepadBindings();
+    Q_INVOKABLE void recordAction(const QString &action);
+    QStringList recentActions() const { return m_recentActions; }
     QString activeCategory() const { return m_activeCategory; }
 
     // The prompt preamble for quick asks and traces: on-screen artifact, last turns, files, tools, write-up.
@@ -452,6 +454,7 @@ private:
     QByteArray m_compatBuf;
     QString m_activeCategory;
     QStringList m_selectedAgentIds;
+    QStringList m_recentActions;
     Gamepad m_gamepad;
 
     QString m_quickQuestion, m_quickAnswer;

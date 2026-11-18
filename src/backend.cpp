@@ -1063,6 +1063,16 @@ void Backend::resetGamepadBindings()
     m_prefsSave.start();
 }
 
+void Backend::recordAction(const QString &action)
+{
+    const QString a = action.simplified();
+    if (a.isEmpty())
+        return;
+    m_recentActions << a;
+    while (m_recentActions.size() > 12)
+        m_recentActions.removeFirst();
+}
+
 void Backend::setOpenaiCompatUrl(const QString &url)
 {
     const QString trimmed = url.trimmed();
@@ -1781,7 +1791,9 @@ void Backend::askOpenAiCompat(const QString &projectKey, int artifactIndex, cons
     static const QString kSystemPrompt = QStringLiteral(
         "You are Lapis Studio's fast-feedback engineering assistant. "
         "Answer concisely in plain English, grounded in the pinned context.");
-    const QString ctx = contextFor(projectKey, artifactIndex);
+    QString ctx = contextFor(projectKey, artifactIndex);
+    if (!m_recentActions.isEmpty())
+        ctx += QStringLiteral("\nRecent user actions:\n- ") + m_recentActions.join(QStringLiteral("\n- "));
     const QByteArray payload = buildOpenAiCompatRequest(model, kSystemPrompt, ctx, question, m_chatEffort);
 
     QNetworkRequest req{QUrl(endpoint)};
@@ -2067,8 +2079,11 @@ void Backend::requestSuggestion(const QString &projectKey, int artifactIndex)
         static const QString kSuggestSys = QStringLiteral(
             "Predict the user's most likely next prompt in one short sentence under 12 words, "
             "matching their current mode (question, approval, correction, or next step).");
+        QString ctx = contextFor(projectKey, artifactIndex);
+        if (!m_recentActions.isEmpty())
+            ctx += QStringLiteral("\nRecent user actions:\n- ") + m_recentActions.join(QStringLiteral("\n- "));
         const QByteArray payload = buildOpenAiCompatRequest(
-            model, kSuggestSys, contextFor(projectKey, artifactIndex),
+            model, kSuggestSys, ctx,
             QStringLiteral("Suggest the next prompt only."), QStringLiteral("low"));
         QNetworkRequest req{QUrl(endpoint)};
         req.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json"));

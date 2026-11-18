@@ -2292,6 +2292,13 @@ void openAiCompatUnitTests()
     check(channelKeyFor(QStringLiteral("qwen3.8-flash-next"), QStringLiteral("low"))
               == "openai-compat:qwen3.8-flash-next",
           "openai-compat: channel key stable");
+
+    Backend b(Backend::Mode::Mock);
+    for (int i = 0; i < 15; ++i)
+        b.recordAction(QStringLiteral("act %1").arg(i));
+    check(b.recentActions().size() == 12 && b.recentActions().first() == "act 3"
+              && b.recentActions().last() == "act 14",
+          "openai-compat: recordAction keeps last 12 actions for intent inference");
 }
 
 }  // namespace

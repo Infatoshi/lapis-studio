@@ -19,7 +19,7 @@ FocusScope {
         { id: "wasd", name: "Gaming", tag: "" },
         { id: "mouse", name: "Mouse", tag: "" }
     ]
-    readonly property int rowCount: 5
+    readonly property int rowCount: 6
     readonly property var keybinds: mode === "controller" ? [
             ["✕", "confirm"], ["○", "back"], ["△", "tab"], ["□", "prose"],
             ["L1 R1", "slide"], ["L2 R2", "zoom"], ["☰", "settings"], ["pad", "new session"]]
@@ -38,8 +38,8 @@ FocusScope {
     readonly property string padName: gamepad && gamepad.controllerName.length > 0 ? gamepad.controllerName : "Gamepad"
     readonly property var padBinds: [
         ["L2", "voice"], ["R2", "send"], ["✕", "confirm"], ["○", "back"],
-        ["△", "tab"], ["□", "prose"], ["L1 R1", "slide"], ["R3", "zoom +"],
-        ["L3", "zoom 1x"], ["☰", "settings"]]
+        ["△", "tab"], ["□", "Write-up"], ["L1 R1", "slide"], ["R3", "zoom +"],
+        ["L3", "zoom 1x"], ["L-Stick", "nav"], ["R-Stick", "scroll"], ["☰", "settings"]]
 
     function show() {
         row = 0;
@@ -66,6 +66,7 @@ FocusScope {
         case 2: backend.cycleModel(d); break;
         case 3: backend.cycleEffort(d); break;
         case 4: backend.modelSuggestions = d > 0; break;
+        case 5: openControllerMap(); break;
         }
     }
 
@@ -90,7 +91,10 @@ FocusScope {
         } else if (k === Qt.Key_Left || k === Qt.Key_H || k === Qt.Key_A) {
             change(-1);
         } else if (k === Qt.Key_Return || k === Qt.Key_Enter) {
-            hide();
+            if (row === 5)
+                openControllerMap();
+            else
+                hide();
         } else if (k === Qt.Key_C) {
             openControllerMap();
         }
@@ -315,10 +319,43 @@ FocusScope {
                         TapHandler { onTapped: { root.row = 4; if (root.backend) root.backend.modelSuggestions = !root.backend.modelSuggestions; } }
                     }
                     Text {
-                        text: root.backend && root.backend.modelSuggestions ? "Tab prompts come from GPT-6 Luna, warm" : "Tab prompts from local heuristics only"
+                        text: root.backend && root.backend.modelSuggestions ? "Tab prompts come from fast model, warm" : "Tab prompts from local heuristics only"
                         color: Theme.dim
                         font.family: Theme.sans
                         font.pixelSize: 15
+                        anchors.verticalCenter: parent.verticalCenter
+                    }
+                }
+            }
+
+            SettingRow {
+                index: 5
+                caption: "Controller"
+                Row {
+                    spacing: 14
+                    Rectangle {
+                        width: ctrlMapLbl.implicitWidth + 28
+                        height: 36
+                        radius: 18
+                        color: root.row === 5 ? "#1b1408" : "#11100e"
+                        border.width: 1
+                        border.color: root.row === 5 ? Theme.gold : Theme.line
+                        Text {
+                            id: ctrlMapLbl
+                            anchors.centerIn: parent
+                            text: "Controller Mapping  →"
+                            color: root.row === 5 ? Theme.gold : Theme.ink
+                            font.family: Theme.sans
+                            font.pixelSize: 15
+                            font.weight: Font.Medium
+                        }
+                        TapHandler { onTapped: { root.row = 5; root.openControllerMap(); } }
+                    }
+                    Text {
+                        text: "Remap DualShock 4 buttons, triggers, and sticks (C)"
+                        color: Theme.dim
+                        font.family: Theme.sans
+                        font.pixelSize: 14
                         anchors.verticalCenter: parent.verticalCenter
                     }
                 }

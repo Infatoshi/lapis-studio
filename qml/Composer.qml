@@ -59,17 +59,85 @@ Item {
         if (t.length > 0)
             input.insert(input.cursorPosition, t);
     }
-    // Esc without a key event (gamepad ○): clear the text, then the scope, then leave.
+    property string deletedBuffer: ""
+    property bool highlighting: false
+    property int highlightAnchor: 0
+    property real restoreProgress: 0
+    property bool backHolding: false
+
+    // Esc without a key event (gamepad ○): save to undo buffer + clear text, then scope, then leave.
     function escapeInput() {
         if (pickerOpen) {
             pickerOpen = false;
         } else if (input.text.length > 0) {
+            deletedBuffer = input.text;
+            highlighting = false;
             input.text = "";
+            if (backend) backend.recordAction("deleted prompt text");
         } else if (scope.length > 0) {
             scopeCleared();
         } else {
             escaped();
         }
+    }
+    function setBackHeld(down) {
+        if (down && deletedBuffer.length > 0 && input.text.length === 0) {
+            backHolding = true;
+            restoreAnim.restart();
+        } else {
+            backHolding = false;
+            restoreAnim.stop();
+            restoreProgress = 0;
+        }
+    }
+    function restoreDeleted() {
+        if (deletedBuffer.length === 0)
+            return;
+        input.forceActiveFocus();
+        input.text = deletedBuffer;
+        input.cursorPosition = input.text.length;
+        deletedBuffer = "";
+        backHolding = false;
+        restoreProgress = 0;
+        if (backend) backend.recordAction("restored deleted prompt");
+    }
+    function cursorStep(dx) {
+        const s = input.text;
+        if (s.length === 0 || dx === 0)
+            return;
+        let pos = input.cursorPosition;
+        if (dx < 0) {
+            if (pos > 0) {
+                --pos;
+                while (pos > 0 && s[pos - 1] === ' ') --pos;
+                while (pos > 0 && s[pos - 1] !== ' ') --pos;
+            }
+        } else {
+            if (pos < s.length) {
+                while (pos < s.length && s[pos] !== ' ') ++pos;
+                while (pos < s.length && s[pos] === ' ') ++pos;
+            }
+        }
+        input.cursorPosition = pos;
+        if (highlighting)
+            input.select(highlightAnchor, pos);
+    }
+    function toggleHighlight() {
+        if (input.text.length === 0)
+            return false;
+        highlighting = !highlighting;
+        if (highlighting) {
+            highlightAnchor = input.cursorPosition;
+            if (highlightAnchor === input.text.length && highlightAnchor > 0) {
+                cursorStep(-1);
+                highlightAnchor = input.text.length;
+                input.select(highlightAnchor, input.cursorPosition);
+            }
+            if (backend) backend.recordAction("highlighted text in composer");
+        } else {
+            input.deselect();
+        }
+        return true;
     }
     function openPicker() {
         pickerOpen = true;
@@ -528,5 +596,63 @@ Item {
                 font.pixelSize: Theme.px(16)
             }
         }
+    }
+
+    NumberAnimation {
+        id: restoreAnim
+        target: root
+        property: "restoreProgress"
+        from: 0
+        to: 1
+        duration: 450
+        onFinished: if (root.backHolding) root.restoreDeleted()
+    }
+
+    // Hold-○-to-restore circular hint below the bar when text was just cleared.
+    Rectangle {
+        id: restorePill
+        anchors.horizontalCenter: parent.horizontalCenter
+        anchors.top: col.bottom
+        anchors.topMargin: 6
+        width: restoreRow.implicitWidth + 24
+        height: 24
+        radius: 12
+        color: "#110e09"
+        border.width: 1
+        border.color: root.backHolding ? Theme.gold : Theme.line
+        visible: root.deletedBuffer.length > 0 && input.text.length === 0
+        Row {
+            id: restoreRow
+            anchors.centerIn: parent
+            spacing: 8
+            Canvas {
+                width: 14; height: 14
+                anchors.verticalCenter: parent.verticalCenter
+                property real p: root.restoreProgress
+                onPChanged: requestPaint()
+                onPaint: {
+                    const ctx = getContext("2d");
+                    ctx.clearRect(0, 0, width, height);
+                    ctx.lineWidth = 2;
+                    ctx.strokeStyle = "#3a352c";
+                    ctx.beginPath();
+                    ctx.arc(7, 7, 5, 0, Math.PI * 2);
+                    ctx.stroke();
+                    if (p > 0.01) {
+                        ctx.strokeStyle = "#e09f3e";
+                        ctx.beginPath();
+                        ctx.arc(7, 7, 5, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * p);
+                        ctx.stroke();
+                    }
+                }
+            }
+            Text {
+                text: root.backHolding ? "Restoring…" : "Hold ○ to restore deleted text"
+                color: root.backHolding ? Theme.gold : Theme.dim
+                font.family: Theme.mono
+                font.pixelSize: 11
+            }
+        }
+        TapHandler { onTapped: root.restoreDeleted() }
     }
 }
