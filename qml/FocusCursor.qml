@@ -124,9 +124,10 @@ Item {
     Rectangle {
         id: chip
         objectName: "focusCursorHint"
+        z: 20
         visible: root.hint.length > 0
         readonly property real bx: root.hintSide === "right" ? ring.x + ring.width + 12 : root.cx - width / 2
-        readonly property real by: root.hintSide === "right" ? ring.y : ring.y + ring.height + 8
+        readonly property real by: root.hintSide === "right" ? ring.y : ring.y + ring.height + 10
         x: Math.max(8, Math.min(root.width - width - 8, bx))
         y: Math.max(8, Math.min(root.height - height - 8, by))
         width: hintText.implicitWidth + 20

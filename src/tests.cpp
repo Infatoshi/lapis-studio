@@ -1321,12 +1321,26 @@ void uiTests()
         settle(700);  // idle: the ring breathes in
         QQuickItem *ring = firstItem(win, "predictorRingShape");
         QQuickItem *badge = firstItem(win, "tabBadgeLabel");
+        QQuickItem *badgeBox = firstItem(win, "tabBadge");
+        QQuickItem *fRing = firstItem(win, "focusCursorRing");
         const QVariantMap p = app->property("predictedAction").toMap();
         const int target = p.value("index").toInt();
         const auto isl = findItems(win->contentItem(), "island");
         check(p.value("actionKind").toString() == "open" && p.value("targetId").toString().startsWith("island:"),
               "predictor: Constellation predicts an island", p.value("targetId").toString());
-        check(ring && ring->isVisible() && firstItem(win, "predictorRing")->opacity() > 0.9, "predictor: gold ring visible when idle");
+        check(ring && firstItem(win, "predictorRing")->opacity() > 0.9 && badge && badge->isVisible(),
+              "predictor: gold ring / badge visible when idle");
+        if (badgeBox && ring) {
+            const QRectF br = badgeBox->mapRectToScene(QRectF(0, 0, badgeBox->width(), badgeBox->height()));
+            const QRectF pr = ring->mapRectToScene(QRectF(0, 0, ring->width(), ring->height()));
+            check(!br.intersects(pr), "predictor: tabBadge clears predictor ring",
+                  QStringLiteral("badge %1..%2 ring %3..%4").arg(br.y()).arg(br.bottom()).arg(pr.y()).arg(pr.bottom()));
+            if (fRing && fRing->isVisible()) {
+                const QRectF fr = fRing->mapRectToScene(QRectF(0, 0, fRing->width(), fRing->height()));
+                check(!br.intersects(fr), "predictor: tabBadge clears focusCursor ring",
+                      QStringLiteral("badge %1..%2 fRing %3..%4").arg(br.y()).arg(br.bottom()).arg(fr.y()).arg(fr.bottom()));
+            }
+        }
         if (ring && isl.value(target)) {
             const QRectF rr = ring->mapRectToScene(QRectF(0, 0, ring->width(), ring->height()));
             const QRectF ir = isl.value(target)->mapRectToScene(QRectF(0, 0, isl.value(target)->width(), isl.value(target)->height()));

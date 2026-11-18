@@ -60,6 +60,7 @@ Item {
     visible: opacity > 0.01
     Behavior on opacity { NumberAnimation { duration: 220; easing.type: Easing.OutCubic } }
 
+    property bool showRing: true
     // 0..1 breathing phase: drives the halo's spread and fade, 1.6 s per breath.
     property real phase: 0
     SequentialAnimation on phase {
@@ -72,6 +73,8 @@ Item {
     // Halo: a second ring that breathes outward.
     Rectangle {
         id: halo
+        objectName: "predictorRingHalo"
+        visible: root.showRing
         x: root.cx - width / 2
         y: root.cy - height / 2
         width: root.rw + 10 + 8 * root.phase
@@ -85,6 +88,7 @@ Item {
     Rectangle {
         id: ring
         objectName: "predictorRingShape"
+        visible: root.showRing
         x: root.cx - width / 2
         y: root.cy - height / 2
         width: root.rw
@@ -96,17 +100,18 @@ Item {
         antialiasing: true
     }
 
-    // "Open Stage  ⇥ Tab"
+    // "Open Stage  R1" — placed cleanly outside both the ring and halo so borders never cross text.
     Rectangle {
         id: badge
         objectName: "tabBadge"
+        z: 20
         visible: root.sLabel.length > 0
-        readonly property real bx: root.sSide === "right" ? ring.x + ring.width + 14
-                                   : root.sSide === "left" ? ring.x - width - 14
+        readonly property real bx: root.sSide === "right" ? ring.x + ring.width + 16
+                                   : root.sSide === "left" ? ring.x - width - 16
                                    : root.cx - width / 2
         readonly property real by: root.sSide === "right" || root.sSide === "left" ? root.cy - height / 2
-                                   : root.sSide === "bottom" ? ring.y + ring.height + 12
-                                   : ring.y - height / 2
+                                   : root.sSide === "bottom" ? ring.y + ring.height + 14
+                                   : ring.y - height - 14
         x: Math.max(8, Math.min(root.width - width - 8, bx))
         y: Math.max(8, Math.min(root.height - height - 8, by))
         width: badgeRow.implicitWidth + 26

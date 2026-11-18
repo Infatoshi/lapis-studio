@@ -942,9 +942,11 @@ FocusScope {
     // Tab predictor ring + "⇥ Tab" (or "R1") badge, over whichever lens is settled on screen.
     PredictorRing {
         id: predictor
+        z: 15
         anchors.fill: parent
         readonly property var p: app.predictedAction
         readonly property string tid: p ? p.targetId : ""
+        showRing: !(app.lens === 0 && focusCursor.active && tid === "island:" + app.selectedIsland)
         target: app.predictedRect
         label: p ? p.label : ""
         round: tid.startsWith("pager:") || tid.startsWith("rung:") || tid === "newSession"
