@@ -42,6 +42,9 @@ Item {
     function scrollPixels(px) {  // gamepad right stick: smooth, unanimated
         pane.scrollPixels(px);
     }
+    function panPixels(dx, dy) {
+        pane.panPixels(dx, dy);
+    }
     function scrollToEnd(d) {
         for (let i = 0; i < 40; ++i)
             pane.scrollBy(d);
@@ -173,6 +176,12 @@ Item {
         function scrollPixels(px) {
             if (viewer.item && viewer.item.scrollPixels)
                 viewer.item.scrollPixels(px);
+        }
+        function panPixels(dx, dy) {
+            if (viewer.item && viewer.item.panPixels)
+                viewer.item.panPixels(dx, dy);
+            else if (dy !== 0)
+                scrollPixels(dy);
         }
 
         readonly property real sp: st ? st.slideP : 1

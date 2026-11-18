@@ -264,7 +264,21 @@ QList<GamepadAction> GamepadState::process(const GamepadSnapshot &s, qint64 nowM
     handleDigital("l3", s.l3, p.l3);
     handleDigital("r3", s.r3, p.r3);
     handleDigital("menu", s.menu, p.menu);
-    handleDigital("options", shareOrPadNow, shareOrPadPrev);
+    // Split touchpad click: left half opens Morning Briefing; right half (or Share) runs mapped "options" action.
+    if (pressed(s.touchpad, p.touchpad) && !s.options && !p.options && s.touchpadX < -0.15)
+        out.append(GamepadAction::make(GamepadAction::ToggleBriefing));
+    else
+        handleDigital("options", shareOrPadNow, shareOrPadPrev);
+
+    // Touchpad finger drag: smooth 2D pan for wide tables / charts.
+    const bool touchingNow = std::abs(s.touchpadX) > 1e-4 || std::abs(s.touchpadY) > 1e-4;
+    const bool touchingPrev = std::abs(p.touchpadX) > 1e-4 || std::abs(p.touchpadY) > 1e-4;
+    if (touchingNow && touchingPrev) {
+        const int pdx = int(std::lround((s.touchpadX - p.touchpadX) * 420.0));
+        const int pdy = int(std::lround((p.touchpadY - s.touchpadY) * 420.0));
+        if (pdx != 0 || pdy != 0)
+            out.append(GamepadAction::make(GamepadAction::TouchpadPan, pdx, pdy));
+    }
 
     if (l2EdgeOn)
         emitMappedAction(QStringLiteral("l2"), true, out);
@@ -289,6 +303,23 @@ QList<GamepadAction> GamepadState::process(const GamepadSnapshot &s, qint64 nowM
             m_lastScrollMs = nowMs;
             m_scrolling = true;
         }
+    }
+
+    // Right stick horizontal: discrete detail inspect / zoom or horizontal step.
+    const int rdx = (std::abs(s.rx) > kStickDeadzone && std::abs(s.rx) > std::abs(s.ry))
+                        ? (s.rx > 0 ? 1 : -1)
+                        : 0;
+    if (rdx == 0) {
+        m_rNavDx = 0;
+    } else if (rdx != m_rNavDx) {
+        m_rNavDx = rdx;
+        m_nextRNavMs = nowMs + kRepeatDelayMs;
+        out.append(GamepadAction::make(GamepadAction::HorizontalInspect, rdx));
+    } else if (nowMs >= m_nextRNavMs) {
+        m_nextRNavMs += kRepeatIntervalMs;
+        if (m_nextRNavMs <= nowMs)
+            m_nextRNavMs = nowMs + kRepeatIntervalMs;
+        out.append(GamepadAction::make(GamepadAction::HorizontalInspect, rdx));
     }
 
     m_prev = s;
@@ -386,7 +417,10 @@ void Gamepad::processSnapshot(const Snapshot &s, qint64 nowMs)
         case GamepadAction::ZoomReset: emit zoomReset(); break;
         case GamepadAction::ToggleSettings: emit toggleSettings(); break;
         case GamepadAction::ToggleNewSession: emit toggleNewSession(); break;
+        case GamepadAction::ToggleBriefing: emit toggleBriefing(); break;
         case GamepadAction::Scroll: emit scrollDelta(a.value); break;
+        case GamepadAction::TouchpadPan: emit touchpadPan(double(a.dx), double(a.dy)); break;
+        case GamepadAction::HorizontalInspect: emit horizontalInspect(a.dx); break;
         case GamepadAction::Send: emit sendPressed(); break;
         case GamepadAction::VoiceHold: {
             const bool active = a.value > 0.5;

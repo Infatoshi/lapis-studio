@@ -669,7 +669,24 @@ FocusScope {
         function onZoomReset() { if (app.backend) app.backend.resetZoom(); }
         function onToggleSettings() { app.padSettings(); }
         function onToggleNewSession() { app.padNewSession(); }
+        function onToggleBriefing() {
+            app.poke();
+            if (!onboarding.open && !dialog.open && !settings.open && !controllerMap.open)
+                briefing.open ? briefing.hide() : briefing.show();
+        }
         function onScrollDelta(dy) { app.padScroll(dy); }
+        function onTouchpadPan(dx, dy) {
+            if (onboarding.open || dialog.open || settings.open || controllerMap.open)
+                return;
+            if (app.proseOpen && app.lens > 0) prose.scrollPixels(dy);
+            else if (app.lens === 2) stage.panPixels(dx, dy);
+        }
+        function onHorizontalInspect(dir) {
+            app.poke();
+            if (onboarding.open || dialog.open || settings.open || controllerMap.open)
+                return;
+            if (app.lens === 2) stage.panPixels(dir * 96, 0);
+        }
         function onVoiceHold(active) { app.padVoiceHold(active); }
         function onSendPressed() { app.padSend(); }
     }

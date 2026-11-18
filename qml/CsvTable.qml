@@ -59,6 +59,12 @@ Item {
         padIdle.restart();
         list.contentY = Math.max(0, Math.min(Math.max(0, list.contentHeight - list.height), list.contentY + px));
     }
+    function panPixels(dx, dy) {
+        padScrolling = true;
+        padIdle.restart();
+        hFlick.contentX = Math.max(0, Math.min(Math.max(0, hFlick.contentWidth - hFlick.width), hFlick.contentX + dx));
+        list.contentY = Math.max(0, Math.min(Math.max(0, list.contentHeight - list.height), list.contentY + dy));
+    }
     function scrollBy(d) {
         list.contentY = Math.max(0, Math.min(Math.max(0, list.contentHeight - list.height), list.contentY + d * 48 * 2));
     }

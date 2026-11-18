@@ -2077,7 +2077,10 @@ struct PadLog {
         QObject::connect(g, &Gamepad::zoomReset, g, [this] { evs.append({"zoomReset", 0, 0, 0, now}); });
         QObject::connect(g, &Gamepad::toggleSettings, g, [this] { evs.append({"settings", 0, 0, 0, now}); });
         QObject::connect(g, &Gamepad::toggleNewSession, g, [this] { evs.append({"newSession", 0, 0, 0, now}); });
+        QObject::connect(g, &Gamepad::toggleBriefing, g, [this] { evs.append({"briefing", 0, 0, 0, now}); });
         QObject::connect(g, &Gamepad::scrollDelta, g, [this](double d) { evs.append({"scroll", 0, 0, d, now}); });
+        QObject::connect(g, &Gamepad::touchpadPan, g, [this](double dx, double dy) { evs.append({"pan", int(dx), int(dy), 0, now}); });
+        QObject::connect(g, &Gamepad::horizontalInspect, g, [this](int dir) { evs.append({"rinspect", dir, 0, 0, now}); });
         QObject::connect(g, &Gamepad::voiceHold, g, [this](bool on) { evs.append({"voice", on ? 1 : 0, 0, 0, now}); });
         QObject::connect(g, &Gamepad::sendPressed, g, [this] { evs.append({"send", 0, 0, 0, now}); });
     }
@@ -2261,6 +2264,35 @@ void gamepadUnitTests()
                   && log.evs[2].a == 1 && log.evs[3].a == 0,
               "pad: R2 re-arms under 0.45; L2 fires voiceHold(true) on press and false on release",
               log.names());
+    }
+    // Touchpad split click + 2D pan + Right Stick horizontal inspect.
+    {
+        Gamepad g;
+        PadLog log;
+        log.attach(&g);
+        S s;
+        s.touchpad = true;
+        s.touchpadX = -0.6;
+        log.feed(&g, s, 0);
+        log.feed(&g, S(), 16);
+        s.touchpad = true;
+        s.touchpadX = 0.5;
+        log.feed(&g, s, 32);
+        log.feed(&g, S(), 48);
+        check(log.count("briefing") == 1 && log.count("newSession") == 1,
+              "pad: touchpad left half -> Morning Briefing, right half -> New Session", log.names());
+        log.evs.clear();
+        S p0; p0.touchpadX = 0.1; p0.touchpadY = 0.2;
+        log.feed(&g, p0, 64);
+        S p1; p1.touchpadX = 0.3; p1.touchpadY = 0.1;
+        log.feed(&g, p1, 72);
+        check(log.count("pan") == 1 && log.evs[0].a > 0 && log.evs[0].b > 0,
+              "pad: touchpad drag emits 2D pan deltas", log.names());
+        log.evs.clear();
+        S r; r.rx = 0.8;
+        log.feed(&g, r, 100);
+        check(log.count("rinspect") == 1 && log.evs[0].a == 1,
+              "pad: right stick horizontal triggers horizontalInspect", log.names());
     }
     // Remapping + capture mode + prefs persistence.
     {

@@ -143,11 +143,18 @@ struct Gamepad::Platform {
         s.r3 = g.rightThumbstickButton.pressed;
         s.menu = g.buttonMenu.pressed;
         s.options = g.buttonOptions.pressed;
-        if ([g isKindOfClass:[GCDualShockGamepad class]])
-            s.touchpad = static_cast<GCDualShockGamepad *>(g).touchpadButton.pressed;
-        else if (@available(macOS 11.3, *)) {
-            if ([g isKindOfClass:[GCDualSenseGamepad class]])
-                s.touchpad = static_cast<GCDualSenseGamepad *>(g).touchpadButton.pressed;
+        if ([g isKindOfClass:[GCDualShockGamepad class]]) {
+            GCDualShockGamepad *ds4 = static_cast<GCDualShockGamepad *>(g);
+            s.touchpad = ds4.touchpadButton.pressed;
+            s.touchpadX = ds4.touchpadPrimary.xAxis.value;
+            s.touchpadY = ds4.touchpadPrimary.yAxis.value;
+        } else if (@available(macOS 11.3, *)) {
+            if ([g isKindOfClass:[GCDualSenseGamepad class]]) {
+                GCDualSenseGamepad *ds = static_cast<GCDualSenseGamepad *>(g);
+                s.touchpad = ds.touchpadButton.pressed;
+                s.touchpadX = ds.touchpadPrimary.xAxis.value;
+                s.touchpadY = ds.touchpadPrimary.yAxis.value;
+            }
         }
         q->processSnapshot(s, clock.elapsed());
     }

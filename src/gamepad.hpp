@@ -35,6 +35,8 @@ struct GamepadSnapshot {
     bool menu = false;              // Options ☰ (GCExtendedGamepad.buttonMenu)
     bool options = false;           // Share (GCExtendedGamepad.buttonOptions)
     bool touchpad = false;          // touchpad click (GCDualShockGamepad.touchpadButton)
+    double touchpadX = 0;           // touchpad primary finger X (-1..+1, 0 = untouched/center)
+    double touchpadY = 0;           // touchpad primary finger Y (-1..+1, 0 = untouched/center)
 };
 
 struct GamepadAction {
@@ -50,7 +52,10 @@ struct GamepadAction {
         ZoomReset,
         ToggleSettings,
         ToggleNewSession,
+        ToggleBriefing,
         Scroll,
+        TouchpadPan,
+        HorizontalInspect,
         VoiceHold,
         Send,
         RawCaptured
@@ -105,6 +110,8 @@ private:
     bool m_l2 = false, m_r2 = false;
     bool m_scrolling = false;
     qint64 m_lastScrollMs = 0;
+    int m_rNavDx = 0;
+    qint64 m_nextRNavMs = 0;
 };
 
 class Gamepad : public QObject {
@@ -168,7 +175,10 @@ signals:
     void zoomReset();
     void toggleSettings();
     void toggleNewSession();
+    void toggleBriefing();
     void scrollDelta(double dy);
+    void touchpadPan(double dx, double dy);
+    void horizontalInspect(int dir);
     void voiceHold(bool active);
     void sendPressed();
     void rawInputCaptured(const QString &inputId);
