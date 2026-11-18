@@ -29,12 +29,18 @@ struct Turn {
 QStringList mediaPathsIn(const QString &text);
 // "video" | "image" | "svg" | "audio" | "pdf" for a file extension.
 QString mediaKindForExt(const QString &ext);
+// The key points of a write-up: its bullets when it has two or more, else its opening sentences.
+// Code fences, tables and headings are dropped; markdown emphasis is stripped.
+QStringList distillKeyPoints(const QString &prose, int maxPoints = 5);
 
 // Parse raw JSONL (possibly cut mid-line by a tail read) into turns, oldest first.
 QList<Turn> parseTranscript(const QByteArray &raw, Harness harness);
 
 struct Extracted {
-    QVariantList artifacts;   // newest first; each a QVariantMap with a "kind"
+    // Newest first; each a QVariantMap with a "kind". "chart"/"line" only for a genuine sweep
+    // (>= 2 distinct measured points); a qualitative newest write-up adds a "summary"
+    // ({kind, title, metric: "", text, points}) so Stage leads with text, not a forced graph.
+    QVariantList artifacts;
     QString headline;         // e.g. "29.6 tok/s · 2.63x"
     QVariantList spark;       // up to 8 normalised bar heights 0..1
     int sparkBest = -1;       // index of the winning bar (lowest when lower is better)

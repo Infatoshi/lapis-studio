@@ -143,6 +143,19 @@ QByteArray buildOpenAiCompatRequest(const QString &model, const QString &systemP
                                       const QString &effort = QString());
 OpenAiSseEvent parseOpenAiSseLine(const QByteArray &line);
 
+// Human-interest filter: the request asking the fast model to keep only what matches the human's
+// direction (goal), pinned params / terms and what they are inspecting right now (recent actions),
+// dropping boilerplate and routine steps, and to say whether a chart or summary text fits better.
+QByteArray buildFilterPrompt(const QString &model, const QString &goal, const QVariantList &params,
+                             const QStringList &recentActions, const QString &latestTurn);
+struct HumanFilterReply {
+    QString stateLine;  // one plain-English line, what matters now
+    QString summary;    // key points, one per line, no bullets
+    QString form;       // "chart" | "summary" | "" when the model did not say
+};
+// Parses "STATE: ... / FORM: chart|summary / POINTS: - ..." (tolerant of case and stray markdown).
+HumanFilterReply parseFilterReply(const QString &reply);
+
 struct ParsedCache {
     qint64 mtime = 0;
     qint64 size = 0;
@@ -286,6 +299,11 @@ public:
     bool briefingBusy() const { return m_briefingReply != nullptr; }
     QString briefingSource() const { return m_briefingSource; }
     Q_INVOKABLE void requestBriefing();
+    // Live only, with an OpenAI-compatible endpoint: qwen3.8-flash-next distills the project's
+    // latest turn down to what the human cares about and updates its summary / stateLine.
+    // Async, one request in flight; repeats for the same project + transcript mtime are dropped.
+    Q_INVOKABLE void filterForHuman(const QString &projectKey);
+    int filterRequests() const { return m_filterRequests; }
     // Island metrics stay hidden unless pinned for that project.
     Q_INVOKABLE void toggleMetricPin(const QString &projectKey);
     // What the latest ask was routed to (tests): model, effort and channel key.
@@ -488,6 +506,17 @@ private:
     QPointer<QNetworkReply> m_compatReply;
     QPointer<QNetworkReply> m_suggestReply;
     QPointer<QNetworkReply> m_briefingReply;
+    struct HumanFilter {
+        qint64 mtime = 0;
+        QString stateLine, summary, form;
+    };
+    QHash<QString, HumanFilter> m_humanFilter;  // project key -> latest filtered view
+    QPointer<QNetworkReply> m_filterReply;      // concurrency 1
+    QString m_filterInFlight;                   // "key@mtime" of the request in flight
+    QSet<QString> m_filterDone;                 // "key@mtime" already asked (no respamming)
+    QStringList m_filterQueue;                  // project keys waiting for the slot
+    int m_filterRequests = 0;
+    QString compatEndpoint() const;             // "" when no OpenAI-compatible URL is configured
     QVariantList m_briefing;
     QString m_briefingSource;
     QSet<QString> m_pinnedMetrics;

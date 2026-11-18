@@ -756,6 +756,79 @@ OpenAiSseEvent parseOpenAiSseLine(const QByteArray &raw)
     return ev;
 }
 
+QByteArray buildFilterPrompt(const QString &model, const QString &goal, const QVariantList &params,
+                             const QStringList &recentActions, const QString &latestTurn)
+{
+    static const QString kSys = QStringLiteral(
+        "You filter a coding agent's latest turn for the human who directs it. Drop boilerplate, routine "
+        "steps (reading files, running builds, re-stating the plan) and anything off the human's direction. "
+        "Keep only what matches the human's goal, their pinned parameters and terms, and what they are "
+        "inspecting right now. Reply in exactly this format, plain English, no other text:\n"
+        "STATE: one line under 14 words, what matters now\n"
+        "FORM: chart if the turn holds a genuine comparison of two or more measured arms, else summary\n"
+        "POINTS:\n- up to 5 key points, each under 25 words, concrete (numbers, files, decisions)");
+    QString ctx;
+    ctx += QStringLiteral("Human direction (goal): ") + (goal.trimmed().isEmpty() ? QStringLiteral("(none stated)") : goal.trimmed());
+    QStringList pinned;
+    for (const QVariant &v : params) {
+        const QVariantMap m = v.toMap();
+        const QString name = m.value(QStringLiteral("name")).toString();
+        if (name.isEmpty())
+            continue;
+        const QString value = m.value(QStringLiteral("value")).toString();
+        pinned << (value.isEmpty() ? name : name + QLatin1Char('=') + value);
+    }
+    ctx += QStringLiteral("\nPinned params and terms: ") + (pinned.isEmpty() ? QStringLiteral("(none)") : pinned.join(QStringLiteral(", ")));
+    ctx += QStringLiteral("\nWhat the human is inspecting now (recent actions, newest last):");
+    if (recentActions.isEmpty())
+        ctx += QStringLiteral(" (none)");
+    for (const QString &a : recentActions)
+        ctx += QStringLiteral("\n- ") + a;
+    QString turn = latestTurn.trimmed();
+    if (turn.size() > 6000)
+        turn = turn.left(6000) + QChar(0x2026);
+    ctx += QStringLiteral("\nLatest turn:\n") + turn;
+    return buildOpenAiCompatRequest(model, kSys, ctx, QStringLiteral("Filter the latest turn for this human."),
+                                    QStringLiteral("low"));
+}
+
+HumanFilterReply parseFilterReply(const QString &reply)
+{
+    HumanFilterReply r;
+    QStringList points;
+    bool inPoints = false;
+    static const QRegularExpression label(QStringLiteral("^[*_#\\s]*(STATE|FORM|POINTS)[*_\\s]*:[*_\\s]*(.*)$"),
+                                          QRegularExpression::CaseInsensitiveOption);
+    static const QRegularExpression bullet(QStringLiteral("^\\s*(?:[-*•]|\\d+[.)])\\s+"));
+    for (const QString &raw : reply.split(QLatin1Char('\n'))) {
+        const QString l = raw.trimmed();
+        if (l.isEmpty())
+            continue;
+        const auto m = label.match(l);
+        if (m.hasMatch()) {
+            const QString key = m.captured(1).toUpper();
+            const QString val = m.captured(2).trimmed().remove(QStringLiteral("**"));
+            inPoints = key == QLatin1String("POINTS");
+            if (key == QLatin1String("STATE"))
+                r.stateLine = val.simplified();
+            else if (key == QLatin1String("FORM"))
+                r.form = val.toLower().contains(QLatin1String("chart")) ? QStringLiteral("chart") : QStringLiteral("summary");
+            else if (!val.isEmpty())
+                points << val;
+            continue;
+        }
+        if (inPoints) {
+            QString p = l;
+            p.remove(bullet);
+            p = p.remove(QStringLiteral("**")).simplified();
+            if (!p.isEmpty() && points.size() < 5)
+                points << p;
+        }
+    }
+    r.summary = points.join(QLatin1Char('\n'));
+    return r;
+}
+
 QStringList quickHelperArgs(const QString &sessionId, const QString &model, const QString &effort)
 {
     return {QStringLiteral("-p"),
@@ -1125,6 +1198,8 @@ void Backend::setFocusedProject(const QString &key)
     m_fresh.remove(key);  // opening a project reads its new turns
     publish();
     emit projectsChanged();  // focusedProject itself changed, even when the list did not
+    if (!key.isEmpty())
+        filterForHuman(key);  // no-op unless live with an OpenAI-compatible endpoint
 }
 
 void Backend::mockAppendTurn(const QString &key, const Turn &t)
@@ -1458,7 +1533,32 @@ QVariantMap Backend::projectMap(const Project &p) const
     m[QStringLiteral("fresh")] = m_fresh.value(p.key);
     m[QStringLiteral("spark")] = p.ex.spark;
     m[QStringLiteral("sparkBest")] = p.ex.sparkBest;
-    m[QStringLiteral("artifacts")] = p.ex.artifacts;
+    // The human-interest pass, while it still describes this transcript: its state line leads the
+    // island (a blocker question still wins) and its key points replace the local summary text.
+    QVariantList artifacts = p.ex.artifacts;
+    QString summary;
+    QString stateLine;
+    if (const auto f = m_humanFilter.constFind(p.key); f != m_humanFilter.cend() && f->mtime == p.mtime) {
+        summary = f->summary;
+        stateLine = f->stateLine;
+        if (!stateLine.isEmpty() && !is.blocker)
+            m[QStringLiteral("lastLine")] = stateLine;
+        if (!summary.isEmpty())
+            for (QVariant &v : artifacts) {
+                QVariantMap a = v.toMap();
+                if (a.value(QStringLiteral("kind")).toString() != QLatin1String("summary"))
+                    continue;
+                a[QStringLiteral("text")] = summary;
+                a[QStringLiteral("points")] = summary.split(QLatin1Char('\n'), Qt::SkipEmptyParts);
+                a[QStringLiteral("filtered")] = true;
+                v = a;
+                break;
+            }
+        m[QStringLiteral("formHint")] = f->form;
+    }
+    m[QStringLiteral("summary")] = summary;
+    m[QStringLiteral("stateLine")] = stateLine;
+    m[QStringLiteral("artifacts")] = artifacts;
     m[QStringLiteral("prose")] = p.ex.prose;
     m[QStringLiteral("thinking")] = p.ex.thinking;
 
@@ -1701,6 +1801,12 @@ QString Backend::contextFor(const QString &projectKey, int artifactIndex) const
                     ctx += QStringLiteral("\nTable:\n| ") + hdr.join(QStringLiteral(" | ")) + QStringLiteral(" |");
                 for (int r = 0; r < rows.size() && r < 40; ++r)
                     ctx += QStringLiteral("\n| ") + rows[r].toStringList().join(QStringLiteral(" | ")) + QStringLiteral(" |");
+            } else if (kind == QLatin1String("summary")) {
+                const auto f = m_humanFilter.constFind(p.key);
+                const QString text = f != m_humanFilter.cend() && f->mtime == p.mtime && !f->summary.isEmpty()
+                    ? f->summary
+                    : a.value(QStringLiteral("text")).toString();
+                ctx += QStringLiteral("\nKey points:\n") + text.left(2500);
             } else if (kind == QLatin1String("diff")) {
                 const QVariantList lines = a.value(QStringLiteral("lines")).toList();
                 QStringList out;
@@ -2856,6 +2962,9 @@ void Backend::applyScan(const QList<SessionInfo> &sessions, const QHash<QString,
             next.prepend(old);
     m_projects = next;
     publish();
+    // The human-interest pass for the project on screen (else the newest one); async, deduped.
+    if (m_mode == Mode::Live && !m_projects.isEmpty())
+        filterForHuman(m_focusedProject.isEmpty() ? m_projects.first().key : m_focusedProject);
     // applyMs excludes the publish() slice, which is accounted on its own.
     const double ms = clock.nsecsElapsed() / 1e6;
     m_stall.applyMs += ms - (m_stall.publishMs - publishBefore);
@@ -2921,6 +3030,107 @@ void Backend::pollBoard()
     const double ms = clock.nsecsElapsed() / 1e6;  // dispatch only
     m_stall.boardMs += ms;
     noteStall(ms);
+}
+
+// --- Human-interest filter -------------------------------------------------------------------
+
+QString Backend::compatEndpoint() const
+{
+    QString base = m_openaiCompatUrl;
+    if (base.isEmpty() && m_mode == Mode::Live)
+        base = qEnvironmentVariable("LAPIS_OPENAI_COMPAT_URL").trimmed();
+    if (base.isEmpty())
+        return {};
+    while (base.endsWith(QLatin1Char('/')))
+        base.chop(1);
+    return base.endsWith(QLatin1String("/chat/completions")) ? base : base + QStringLiteral("/chat/completions");
+}
+
+void Backend::filterForHuman(const QString &projectKey)
+{
+    if (m_mode != Mode::Live || projectKey.isEmpty())
+        return;
+    const QString endpoint = compatEndpoint();
+    if (endpoint.isEmpty())
+        return;
+    const Project *p = find(projectKey);
+    if (!p || (p->ex.prose.trimmed().isEmpty() && p->ex.recentTurns.isEmpty()))
+        return;
+    // Redacted (infinity) projects never leave the process.
+    if (std::any_of(p->sessions.cbegin(), p->sessions.cend(), [](const SessionInfo &s) { return s.redacted; }))
+        return;
+    const QString tag = QStringLiteral("%1@%2").arg(projectKey).arg(p->mtime);
+    if (tag == m_filterInFlight || m_filterDone.contains(tag))
+        return;
+    if (m_filterReply) {  // concurrency 1: wait for the slot
+        m_filterQueue.removeAll(projectKey);
+        m_filterQueue << projectKey;
+        return;
+    }
+    QString model = m_openaiCompatModel;
+    if (model.isEmpty())
+        model = QStringLiteral("qwen3.8-flash-next");
+    QString apiKey = m_openaiCompatKey;
+    if (apiKey.isEmpty())
+        apiKey = qEnvironmentVariable("LAPIS_OPENAI_COMPAT_KEY").trimmed();
+    QString latest = p->ex.prose.trimmed();
+    if (!p->ex.recentTurns.isEmpty()) {
+        // The human's last words frame the turn; fall back to the turn summaries without prose.
+        for (qsizetype i = p->ex.recentTurns.size() - 1; i >= 0; --i)
+            if (p->ex.recentTurns[i].startsWith(QLatin1String("User: "))) {
+                latest = p->ex.recentTurns[i] + QStringLiteral("\n\nAssistant: ") + latest;
+                break;
+            }
+        if (p->ex.prose.trimmed().isEmpty())
+            latest = p->ex.recentTurns.join(QLatin1Char('\n'));
+    }
+    const QByteArray payload = buildFilterPrompt(model, p->ex.goal, p->ex.params, m_recentActions, latest);
+    if (m_filterDone.size() > 512)
+        m_filterDone.clear();
+    m_filterDone.insert(tag);
+    m_filterInFlight = tag;
+    ++m_filterRequests;
+    const qint64 mtime = p->mtime;
+
+    QNetworkRequest req{QUrl(endpoint)};
+    req.setTransferTimeout(20000);
+    req.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json"));
+    req.setRawHeader("Accept", "text/event-stream");
+    if (!apiKey.isEmpty())
+        req.setRawHeader("Authorization", QByteArray("Bearer ") + apiKey.toUtf8());
+    QNetworkReply *reply = m_nam.post(req, payload);
+    m_filterReply = reply;
+    auto buf = std::make_shared<QByteArray>();
+    auto acc = std::make_shared<QString>();
+    connect(reply, &QNetworkReply::readyRead, this, [this, reply, buf, acc] {
+        if (reply != m_filterReply)
+            return;
+        *buf += reply->readAll();
+        qsizetype nl;
+        while ((nl = buf->indexOf('\n')) >= 0) {
+            const QByteArray line = buf->left(nl);
+            buf->remove(0, nl + 1);
+            const OpenAiSseEvent ev = parseOpenAiSseLine(line);
+            if (ev.kind == OpenAiSseEvent::Delta && !ev.text.isEmpty())
+                *acc += ev.text;
+        }
+    });
+    connect(reply, &QNetworkReply::finished, this, [this, reply, acc, projectKey, mtime] {
+        if (reply == m_filterReply)
+            m_filterReply.clear();
+        m_filterInFlight.clear();
+        reply->deleteLater();
+        if (reply->error() == QNetworkReply::NoError) {
+            const HumanFilterReply r = parseFilterReply(*acc);
+            if (!r.stateLine.isEmpty() || !r.summary.isEmpty()) {
+                m_humanFilter.insert(projectKey, HumanFilter{mtime, r.stateLine, r.summary, r.form});
+                publish();
+            }
+        }
+        // Next project waiting for the slot, if any.
+        while (!m_filterQueue.isEmpty() && !m_filterReply)
+            filterForHuman(m_filterQueue.takeFirst());
+    });
 }
 
 // --- Morning Briefing ------------------------------------------------------------------------

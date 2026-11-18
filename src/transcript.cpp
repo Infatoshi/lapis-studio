@@ -714,6 +714,14 @@ QVariantMap chartFromTable(const QVariantMap &table)
     }
     if (!line && QSet<QString>(labels.begin(), labels.end()).size() != labels.size())
         return {};  // repeated labels (a sweep): the table says it better than bars
+    // A chart needs at least two distinct measured points; identical values are filler, not a comparison.
+    {
+        QSet<double> distinct;
+        for (const QVariant &v : values)
+            distinct.insert(v.toDouble());
+        if (distinct.size() < 2)
+            return {};
+    }
     QStringList valueText;
     for (const QVariant &v : values)
         valueText << withUnit(v.toDouble(), bestUnit.unit == QLatin1String("x") ? QStringLiteral("x") : QString());
@@ -874,6 +882,72 @@ QStringList mediaPathsIn(const QString &text)
 
 QString mediaKindForExt(const QString &ext) { return mediaKind(ext); }
 
+QStringList distillKeyPoints(const QString &prose, int maxPoints)
+{
+    QStringList bullets;
+    QStringList paragraphs;
+    QString para;
+    bool inFence = false;
+    static const QRegularExpression bulletRe(QStringLiteral("^\\s*(?:[-*•]|\\d+[.)])\\s+(.+)$"));
+    static const QRegularExpression emph(QStringLiteral("\\*\\*|__|`"));
+    auto clean = [](QString s) {
+        s.remove(emph);
+        return stripMarkup(s).simplified();
+    };
+    auto endPara = [&]() {
+        if (!para.trimmed().isEmpty())
+            paragraphs << clean(para);
+        para.clear();
+    };
+    for (const QString &raw : prose.split(QLatin1Char('\n'))) {
+        const QString l = raw.trimmed();
+        if (l.startsWith(QLatin1String("```"))) {
+            inFence = !inFence;
+            endPara();
+            continue;
+        }
+        if (inFence || l.startsWith(QLatin1Char('|')) || l.startsWith(QLatin1Char('#'))) {
+            endPara();
+            continue;
+        }
+        if (l.isEmpty()) {
+            endPara();
+            continue;
+        }
+        const auto m = bulletRe.match(l);
+        if (m.hasMatch()) {
+            endPara();
+            const QString b = clean(m.captured(1));
+            if (!b.isEmpty())
+                bullets << b;
+            continue;
+        }
+        para += QLatin1Char(' ') + l;
+    }
+    endPara();
+    QStringList points;
+    if (bullets.size() >= 2) {
+        points = bullets.mid(0, maxPoints);
+    } else {
+        // Sentences from the opening paragraphs, plus a lone bullet if there was one.
+        static const QRegularExpression sentenceEnd(QStringLiteral("(?<=[.!?])\\s+(?=[A-Z0-9\"'(])"));
+        for (const QString &p : std::as_const(paragraphs)) {
+            for (const QString &s : p.split(sentenceEnd, Qt::SkipEmptyParts)) {
+                if (points.size() >= maxPoints)
+                    break;
+                if (countWords(s) >= 3)
+                    points << s.trimmed();
+            }
+        }
+        points += bullets;
+        points = points.mid(0, maxPoints);
+    }
+    for (QString &p : points)
+        if (p.size() > 240)
+            p = p.left(239).trimmed() + QChar(0x2026);
+    return points;
+}
+
 Extracted extractArtifacts(const QList<Turn> &turns, PathCheck pathExists)
 {
     if (!pathExists)
@@ -965,6 +1039,9 @@ Extracted extractArtifacts(const QList<Turn> &turns, PathCheck pathExists)
         ex.goal = clampWords(first, 7);
     }
 
+    // Artifacts [proseStart, proseEnd) came from the newest assistant turn that wrote prose.
+    qsizetype proseStart = -1;
+    qsizetype proseEnd = -1;
     int scanned = 0;
     for (qsizetype ti = turns.size() - 1; ti >= 0 && scanned < 60; --ti) {
         const Turn &t = turns[ti];
@@ -980,12 +1057,16 @@ Extracted extractArtifacts(const QList<Turn> &turns, PathCheck pathExists)
         }
         if (t.role != QLatin1String("assistant"))
             continue;
+        if (proseStart >= 0 && proseEnd < 0)
+            proseEnd = ex.artifacts.size();  // the newest written turn has flushed
         struct Flush {
             std::function<void()> f;
             ~Flush() { f(); }
         } flushAtEnd{flushTurn};
-        if (ex.prose.isEmpty() && !t.text.isEmpty())
+        if (ex.prose.isEmpty() && !t.text.isEmpty()) {
             ex.prose = t.text;
+            proseStart = ex.artifacts.size();
+        }
         if (ex.thinking.isEmpty() && !t.thinking.isEmpty())
             ex.thinking = t.thinking;
 
@@ -1068,6 +1149,41 @@ Extracted extractArtifacts(const QList<Turn> &turns, PathCheck pathExists)
                 }
                 add(a, QStringLiteral("file:") + path);
             }
+        }
+    }
+
+    if (proseStart >= 0 && proseEnd < 0)
+        proseEnd = ex.artifacts.size();
+
+    // Form factor: a chart only for a genuine sweep (chartFromTable needs >= 2 distinct measured
+    // points). When the newest write-up is qualitative, architectural or a decision, Stage leads
+    // with its distilled key points instead of forcing a graph out of incidental numbers.
+    if (proseStart >= 0 && countWords(ex.prose) >= 12) {
+        bool sweep = false;
+        bool media = false;
+        for (qsizetype i = proseStart; i < proseEnd && i < ex.artifacts.size(); ++i) {
+            const QString k = ex.artifacts[i].toMap().value(QStringLiteral("kind")).toString();
+            sweep = sweep || k == QLatin1String("chart") || k == QLatin1String("line");
+            media = media || k == QLatin1String("video") || k == QLatin1String("image") || k == QLatin1String("svg")
+                || k == QLatin1String("pdf") || k == QLatin1String("audio");
+        }
+        const QStringList points = distillKeyPoints(ex.prose);
+        if (!sweep && !points.isEmpty()) {
+            static const QRegularExpression heading(QStringLiteral("^#{1,4}\\s+(.+)$"), QRegularExpression::MultilineOption);
+            const auto hm = heading.match(ex.prose);
+            QString title = hm.hasMatch() ? clampWords(stripMarkup(hm.captured(1)).remove(QLatin1String("**")).simplified(), 5)
+                                          : QStringLiteral("Key points");
+            QVariantMap s;
+            s[QStringLiteral("kind")] = QStringLiteral("summary");
+            s[QStringLiteral("title")] = title;
+            s[QStringLiteral("metric")] = QString();
+            s[QStringLiteral("points")] = points;
+            s[QStringLiteral("text")] = points.join(QLatin1Char('\n'));
+            // A visual the turn produced still leads; the key points come right after it.
+            const qsizetype at = media ? std::min(proseEnd, ex.artifacts.size()) : proseStart;
+            ex.artifacts.insert(std::max<qsizetype>(0, at), s);
+            while (ex.artifacts.size() > 12)
+                ex.artifacts.removeLast();
         }
     }
 

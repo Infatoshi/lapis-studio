@@ -52,11 +52,12 @@ Item {
     // Once every artifact has been seen, it suggests the question this artifact invites instead.
     property var seen: []  // artifact indices already shown for this project (StudioApp keeps it)
     readonly property var kindLabels: ({ chart: "Chart", line: "Chart", diff: "Diff", table: "Table", pdf: "PDF",
-                                         video: "Video", image: "Image", svg: "Image", audio: "Audio" })
+                                         video: "Video", image: "Image", svg: "Image", audio: "Audio",
+                                         summary: "Summary" })
     readonly property var nextKind: ({ chart: ["diff", "table"], line: ["diff", "table"], diff: ["table", "chart", "line"],
                                        table: ["pdf", "video", "image", "chart"], pdf: ["video", "image", "chart"],
                                        video: ["chart", "diff"], image: ["chart", "diff"], svg: ["chart", "diff"],
-                                       audio: ["chart", "diff"] })
+                                       audio: ["chart", "diff"], summary: ["diff", "chart", "line", "table"] })
     function promptFor(a) {
         if (!a)
             return "What is this session doing?";
@@ -70,6 +71,7 @@ Item {
         case "image":
         case "svg": return "What does this visual show?";
         case "audio": return "What is in this recording?";
+        case "summary": return "What should we decide next?";
         }
         return "What should we try next?";
     }
@@ -238,6 +240,7 @@ Item {
                 case "svg": return imageC;
                 case "video": return mediaC;
                 case "audio": return mediaC;
+                case "summary": return summaryC;
                 default: return p.current ? emptyC : null;
                 }
             }
@@ -249,6 +252,68 @@ Item {
         Component { id: pdfC; PdfView { artifact: p.artifact; backend: p.backend; live: p.live } }
         Component { id: imageC; ImageView { artifact: p.artifact; live: p.live } }
         Component { id: mediaC; MediaView { artifact: p.artifact; backend: p.backend; live: p.live } }
+        // Qualitative turns: the distilled key points as clean, centered text on black.
+        Component {
+            id: summaryC
+            Flickable {
+                id: sum
+                objectName: "summaryView"
+                clip: true
+                contentWidth: width
+                contentHeight: col.height + 24
+                boundsBehavior: Flickable.StopAtBounds
+                readonly property var points: {
+                    const a = p.artifact;
+                    if (!a)
+                        return [];
+                    if (a.points && a.points.length)
+                        return a.points;
+                    return (a.text || "").split("\n").filter(s => s.trim().length > 0);
+                }
+                readonly property real maxY: Math.max(0, contentHeight - height)
+                function scrollBy(d) {
+                    contentY = Math.max(0, Math.min(maxY, contentY + d * 34 * 4));
+                }
+                function scrollPixels(px) {  // gamepad right stick: smooth, unanimated
+                    contentY = Math.max(0, Math.min(maxY, contentY + px));
+                }
+                Column {
+                    id: col
+                    width: Math.min(sum.width, 780)
+                    x: Math.round((sum.width - width) / 2)
+                    y: 8
+                    spacing: 18
+                    Repeater {
+                        model: sum.points
+                        Item {
+                            required property string modelData
+                            width: col.width
+                            height: line.height
+                            Rectangle {
+                                width: 6; height: 6; radius: 3
+                                x: 0
+                                y: Math.round(line.font.pixelSize * 0.62)
+                                color: Theme.gold
+                                visible: sum.points.length > 1
+                            }
+                            Text {
+                                id: line
+                                objectName: "summaryText"
+                                x: sum.points.length > 1 ? 22 : 0
+                                width: parent.width - x
+                                text: parent.modelData
+                                textFormat: Text.PlainText
+                                wrapMode: Text.Wrap
+                                color: Theme.text
+                                font.family: Theme.sans
+                                font.pixelSize: Theme.px(19)
+                                lineHeight: 1.45
+                            }
+                        }
+                    }
+                }
+            }
+        }
         Component {
             id: emptyC
             Item {

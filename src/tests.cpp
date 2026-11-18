@@ -18,6 +18,8 @@
 #include <QWheelEvent>
 #include <QGuiApplication>
 #include <QQmlApplicationEngine>
+#include <QQmlComponent>
+#include <QQmlEngine>
 #include <QQuickItem>
 #include <QQuickWindow>
 
@@ -2673,6 +2675,163 @@ void openAiCompatUnitTests()
           "openai-compat: recordAction keeps last 12 actions for intent inference");
 }
 
+Turn mkTurn(const QString &role, const QString &text)
+{
+    Turn t;
+    t.role = role;
+    t.text = text;
+    return t;
+}
+
+void formFactorTests()
+{
+    // Qualitative / architectural write-up with incidental numbers: no forced chart, a summary leads.
+    {
+        const QList<Turn> turns = {
+            mkTurn("user", "should the scheduler own retries or the worker?"),
+            mkTurn("assistant",
+                   "## Retry ownership\n"
+                   "I recommend the scheduler owns retries, because it already tracks job state.\n\n"
+                   "- The worker stays stateless, so restarts take about 2 s instead of a re-sync.\n"
+                   "- Backoff lives in one place (src/sched.cpp), not in 3 worker copies.\n"
+                   "- **Decision:** keep idempotency keys on the worker side.\n\n"
+                   "| option | owner |\n|---|---|\n| A | scheduler |\n")};
+        const Extracted ex = extractArtifacts(turns, noFiles);
+        const QVariantMap s = ex.artifacts.value(0).toMap();
+        check(firstOfKind(ex.artifacts, "chart").isEmpty() && firstOfKind(ex.artifacts, "line").isEmpty(),
+              "form: qualitative turn emits no chart from incidental numbers");
+        check(s.value("kind").toString() == "summary" && s.value("metric").toString().isEmpty()
+                  && s.value("title").toString() == "Retry ownership",
+              "form: qualitative turn leads with a summary artifact",
+              s.value("kind").toString() + " / " + s.value("title").toString());
+        const QStringList pts = s.value("points").toStringList();
+        check(pts.size() == 3 && pts.value(0).startsWith("The worker stays stateless") && pts.value(2).startsWith("Decision: keep")
+                  && s.value("text").toString() == pts.join('\n'),
+              "form: summary text is the distilled key points (bullets, markdown stripped)", pts.join(" | "));
+    }
+    // Plain prose, no bullets: the opening sentences become the points.
+    {
+        const QStringList pts = distillKeyPoints(
+            "The cache layer is the bottleneck here. Moving it behind the queue removes the lock. "
+            "We should ship that first and measure after.\n```cpp\nint x = 1;\n```");
+        check(pts.size() == 3 && pts.value(0) == "The cache layer is the bottleneck here." && !pts.join(' ').contains("int x"),
+              "form: prose distills to its sentences, code dropped", pts.join(" | "));
+    }
+    // A one-row table is not a sweep, and neither is a table whose arms all measure the same.
+    {
+        const QVariantMap one = tableFromMarkdown({"| arm | ms |", "|---|---|", "| base | 38 |"});
+        check(chartFromTable(one).isEmpty(), "form: a 1-bar table never becomes a chart");
+        const QVariantMap flat = tableFromMarkdown({"| arm | ms |", "|---|---|", "| a | 38 |", "| b | 38 |"});
+        check(chartFromTable(flat).isEmpty(), "form: identical values are filler, not a comparison");
+    }
+    // A genuine >= 2-arm sweep still charts, and leads (no summary pushed in front of it).
+    {
+        const QList<Turn> turns = {
+            mkTurn("user", "sweep the decode tile"),
+            mkTurn("assistant",
+                   "The 128-reg tile wins clearly over the baseline across every decode run we tried today.\n\n"
+                   "| tile | tok/s |\n|---|---|\n| base | 11.2 |\n| 128-reg | 29.6 |\n")};
+        const Extracted ex = extractArtifacts(turns, noFiles);
+        check(ex.artifacts.value(0).toMap().value("kind").toString() == "chart"
+                  && firstOfKind(ex.artifacts, "summary").isEmpty(),
+              "form: a 2-arm sweep keeps its chart and gets no summary",
+              ex.artifacts.value(0).toMap().value("kind").toString());
+    }
+    // Newest turn qualitative, older turn a sweep: the summary leads, the chart is still there.
+    {
+        const QList<Turn> turns = {
+            mkTurn("user", "sweep the decode tile"),
+            mkTurn("assistant", "| tile | tok/s |\n|---|---|\n| base | 11.2 |\n| 128-reg | 29.6 |\n"),
+            mkTurn("user", "what next?"),
+            mkTurn("assistant", "Next we should fold the scale lookup into the dequant loop, then re-run the sweep on the 65B model.")};
+        const Extracted ex = extractArtifacts(turns, noFiles);
+        check(ex.artifacts.value(0).toMap().value("kind").toString() == "summary" && !firstOfKind(ex.artifacts, "chart").isEmpty(),
+              "form: a qualitative newest turn leads with a summary, the older chart stays");
+    }
+
+    // Human-interest filter prompt: direction, pinned params and current focus all reach the model.
+    {
+        Backend b(Backend::Mode::Mock);
+        b.recordAction(QStringLiteral("opened pill BLOCK_M=128"));
+        b.recordAction(QStringLiteral("scrolled diff src/tile.cu"));
+        const QVariantList params = {QVariantMap{{"name", "BLOCK_M"}, {"value", "128"}, {"kind", "param"}},
+                                     QVariantMap{{"name", "DCP"}, {"value", "4"}, {"kind", "param"}},
+                                     QVariantMap{{"name", "spills"}, {"kind", "term"}}};
+        const QByteArray body = buildFilterPrompt(QStringLiteral("qwen3.8-flash-next"), QStringLiteral("profile fp4 decode with DCP=4"),
+                                                  params, b.recentActions(), QStringLiteral("Ran the build. 128-reg removed all spills."));
+        const QJsonObject req = QJsonDocument::fromJson(body).object();
+        const QJsonArray msgs = req.value("messages").toArray();
+        const QString sys = msgs.at(0).toObject().value("content").toString();
+        const QString ctx = msgs.at(1).toObject().value("content").toString();
+        check(req.value("model").toString() == "qwen3.8-flash-next" && req.value("stream").toBool(),
+              "filter: request targets qwen3.8-flash-next, streamed");
+        check(ctx.contains("Human direction (goal): profile fp4 decode with DCP=4"), "filter: prompt carries the human goal", ctx.left(200));
+        check(ctx.contains("BLOCK_M=128") && ctx.contains("DCP=4") && ctx.contains("spills"),
+              "filter: prompt carries pinned params and terms", ctx);
+        check(ctx.contains("- opened pill BLOCK_M=128") && ctx.contains("- scrolled diff src/tile.cu"),
+              "filter: prompt carries the human's recent actions (m_recentActions)", ctx);
+        check(ctx.contains("128-reg removed all spills"), "filter: prompt carries the latest turn");
+        check(sys.contains("boilerplate") && sys.contains("FORM: chart") && sys.contains("summary"),
+              "filter: system asks to drop boilerplate and pick chart vs summary");
+
+        const HumanFilterReply r = parseFilterReply(
+            "**STATE:** 128-reg removed every spill at DCP=4\nFORM: summary\nPOINTS:\n- Spills went to zero\n* **BLOCK_M=128** is the keeper\n");
+        check(r.stateLine == "128-reg removed every spill at DCP=4" && r.form == "summary"
+                  && r.summary == "Spills went to zero\nBLOCK_M=128 is the keeper",
+              "filter: reply parsed into state line, form and points", r.stateLine + " / " + r.form + " / " + r.summary);
+        // Mock mode never hits the network, even with a URL configured.
+        b.setOpenaiCompatUrl(QStringLiteral("http://127.0.0.1:9/v1"));
+        b.filterForHuman(QStringLiteral("anything"));
+        check(b.filterRequests() == 0 && b.spawnCount() == 0, "filter: mock mode sends nothing");
+    }
+
+    // Stage renders kind "summary" as centered text, and the right stick scrolls it.
+    {
+        QQmlEngine engine;
+        QQmlComponent comp(&engine);
+        comp.loadFromModule("Studio", "Stage");
+        QStringList pts;
+        for (int i = 0; i < 14; ++i)
+            pts << QStringLiteral("Point %1: the scheduler owns retries so the worker stays stateless and restarts fast.").arg(i);
+        const QVariantMap art{{"kind", "summary"}, {"title", "Retry ownership"}, {"metric", ""},
+                              {"text", pts.join('\n')}, {"points", pts}};
+        std::unique_ptr<QObject> obj(comp.createWithInitialProperties(
+            {{"width", 1600}, {"height", 700}, {"artifact", art}, {"artifacts", QVariantList{art}}, {"artifactCount", 1}}));
+        check(obj != nullptr, "summary ui: Stage loads", comp.errorString());
+        auto *stage = qobject_cast<QQuickItem *>(obj.get());
+        if (stage) {
+            QCoreApplication::processEvents();
+            const QList<QQuickItem *> views = findItems(stage, "summaryView");
+            QQuickItem *view = views.value(0);
+            const QList<QQuickItem *> texts = view ? findItems(view, "summaryText") : QList<QQuickItem *>();
+            check(view && stage->property("kind").toString() == "summary", "summary ui: kind summary loads the summary view");
+            check(texts.size() == 14 && texts.value(0)->property("text").toString().startsWith("Point 0")
+                      && texts.value(0)->property("wrapMode").toInt() == 4 /* Text.Wrap */,
+                  "summary ui: every key point is a wrapped text line", QString::number(texts.size()));
+            QQuickItem *col = texts.isEmpty() ? nullptr : texts.value(0)->parentItem()->parentItem();
+            if (view && col) {
+                const double left = col->x();
+                const double right = view->width() - col->x() - col->width();
+                check(col->width() <= 780.5 && qAbs(left - right) < 1.5, "summary ui: text column <= 780 px and centered",
+                      QStringLiteral("w %1 l %2 r %3").arg(col->width()).arg(left).arg(right));
+                const QFont f = texts.value(0)->property("font").value<QFont>();
+                check(f.family() == QStringLiteral("Avenir Next") && texts.value(0)->property("lineHeight").toDouble() > 1.3,
+                      "summary ui: Theme.sans with generous line height", f.family());
+                const double y0 = view->property("contentY").toDouble();
+                QMetaObject::invokeMethod(stage, "scrollPixels", Q_ARG(QVariant, QVariant(120.0)));
+                const double y1 = view->property("contentY").toDouble();
+                QMetaObject::invokeMethod(stage, "scrollBy", Q_ARG(QVariant, QVariant(-1)));
+                const double y2 = view->property("contentY").toDouble();
+                check(y0 == 0 && qAbs(y1 - 120) < 0.5 && y2 == 0, "summary ui: scrollPixels / scrollBy scroll the summary",
+                      QStringLiteral("%1 -> %2 -> %3").arg(y0).arg(y1).arg(y2));
+            }
+            const QVariantMap pred = stage->property("predictedAction").toMap();
+            check(pred.value("actionKind").toString() == "prompt" && !pred.value("promptSuggestion").toString().isEmpty(),
+                  "summary ui: Tab predictor has a prompt for a summary");
+        }
+    }
+}
+
 }  // namespace
 
 int runTests()
@@ -2680,6 +2839,7 @@ int runTests()
     unitTests();
     gamepadUnitTests();
     openAiCompatUnitTests();
+    formFactorTests();
     uiTests();
     gamepadUiTests();
     std::printf("%d passed, %d failed\n", g_pass, g_fail);
