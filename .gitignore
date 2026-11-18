@@ -1,0 +1,10 @@
+build/
+*.mp4
+frames/
+agent.*
+BRIEF*
+REPORT*
+*.pid
+*.exit_code
+runner.log
+.DS_Store
