@@ -5,6 +5,7 @@
 #include <QElapsedTimer>
 #include <QTimer>
 
+#import <CoreGraphics/CoreGraphics.h>
 #import <Foundation/Foundation.h>
 #import <GameController/GameController.h>
 
@@ -169,6 +170,22 @@ void Gamepad::setEnabled(bool on)
         setConnected(false, QString());
     }
     emit enabledChanged();
+}
+
+void Gamepad::triggerVoiceKey(bool down)
+{
+    if (!m_enabled)
+        return;
+    ++g_platformCalls;
+    // Phonon listens via CGEventTap for kCGEventFlagsChanged with kCGEventFlagMaskSecondaryFn (fn/Globe).
+    CGEventRef ev = CGEventCreate(nullptr);
+    if (!ev)
+        return;
+    CGEventSetType(ev, kCGEventFlagsChanged);
+    CGEventSetIntegerValueField(ev, kCGKeyboardEventKeycode, 0x3F);
+    CGEventSetFlags(ev, down ? kCGEventFlagMaskSecondaryFn : 0);
+    CGEventPost(kCGHIDEventTap, ev);
+    CFRelease(ev);
 }
 
 }  // namespace studio

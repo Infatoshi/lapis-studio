@@ -7,9 +7,134 @@
 
 namespace studio {
 
+namespace {
+struct InputMeta {
+    const char *id;
+    const char *label;
+    const char *group;
+};
+const InputMeta kInputs[] = {
+    {"l2", "L2 Trigger", "Triggers & Bumpers"},
+    {"r2", "R2 Trigger", "Triggers & Bumpers"},
+    {"l1", "L1 Bumper", "Triggers & Bumpers"},
+    {"r1", "R1 Bumper", "Triggers & Bumpers"},
+    {"a", "✕ Cross", "Face Buttons"},
+    {"b", "○ Circle", "Face Buttons"},
+    {"x", "□ Square", "Face Buttons"},
+    {"y", "△ Triangle", "Face Buttons"},
+    {"l3", "L3 Stick Click", "Sticks & System"},
+    {"r3", "R3 Stick Click", "Sticks & System"},
+    {"menu", "Options ☰", "Sticks & System"},
+    {"options", "Share / Touchpad", "Sticks & System"},
+};
+
+struct ActionMeta {
+    const char *id;
+    const char *label;
+    const char *desc;
+};
+const ActionMeta kActions[] = {
+    {"voice_hold", "Phonon Voice (Hold)", "Hold to dictate with Phonon, release to insert"},
+    {"send", "Send / Submit", "Send prompt in composer or confirm dialog"},
+    {"confirm", "Interact / Confirm", "Zoom into island/stage or focus composer"},
+    {"back", "Back / Zoom Out", "Step back or close current overlay"},
+    {"secondary", "Write-up / Picker", "Toggle write-up or open model & effort picker"},
+    {"accept_prediction", "Tab / Prediction", "Accept Tab next-action prediction"},
+    {"step_prev", "Previous Slide / Island", "Step to previous island, artifact, or page"},
+    {"step_next", "Next Slide / Island", "Step to next island, artifact, or page"},
+    {"zoom_in", "Zoom In (+10%)", "Increase UI / detail zoom by 10%"},
+    {"zoom_out", "Zoom Out (-10%)", "Decrease UI / detail zoom by 10%"},
+    {"zoom_reset", "Reset Zoom (1.00x)", "Reset UI / detail zoom back to 1.00x"},
+    {"toggle_settings", "Settings & Controls", "Open Settings / Controller Mapping"},
+    {"toggle_new_session", "New Session", "Open New Session dialog"},
+    {"none", "Unbound", "No action"},
+};
+}  // namespace
+
+QHash<QString, QString> GamepadState::defaultBindings()
+{
+    return {
+        {QStringLiteral("l2"), QStringLiteral("voice_hold")},
+        {QStringLiteral("r2"), QStringLiteral("send")},
+        {QStringLiteral("l1"), QStringLiteral("step_prev")},
+        {QStringLiteral("r1"), QStringLiteral("step_next")},
+        {QStringLiteral("a"), QStringLiteral("confirm")},
+        {QStringLiteral("b"), QStringLiteral("back")},
+        {QStringLiteral("x"), QStringLiteral("secondary")},
+        {QStringLiteral("y"), QStringLiteral("accept_prediction")},
+        {QStringLiteral("l3"), QStringLiteral("zoom_reset")},
+        {QStringLiteral("r3"), QStringLiteral("zoom_in")},
+        {QStringLiteral("menu"), QStringLiteral("toggle_settings")},
+        {QStringLiteral("options"), QStringLiteral("toggle_new_session")},
+    };
+}
+
+QStringList GamepadState::validInputs()
+{
+    QStringList out;
+    for (const InputMeta &m : kInputs)
+        out << QString::fromLatin1(m.id);
+    return out;
+}
+
+QStringList GamepadState::validActions()
+{
+    QStringList out;
+    for (const ActionMeta &m : kActions)
+        out << QString::fromLatin1(m.id);
+    return out;
+}
+
+void GamepadState::setBindings(const QHash<QString, QString> &bindings)
+{
+    m_bindings = defaultBindings();
+    const QStringList acts = validActions();
+    for (auto it = bindings.cbegin(); it != bindings.cend(); ++it) {
+        if (m_bindings.contains(it.key()) && acts.contains(it.value()))
+            m_bindings.insert(it.key(), it.value());
+    }
+}
+
+void GamepadState::emitMappedAction(const QString &inputId, bool down, QList<GamepadAction> &out) const
+{
+    const QString act = m_bindings.value(inputId, QStringLiteral("none"));
+    if (act == QLatin1String("voice_hold")) {
+        out.append({GamepadAction::VoiceHold, 0, 0, down ? 1.0 : 0.0, {}});
+        return;
+    }
+    if (!down)
+        return;
+    if (act == QLatin1String("send"))
+        out.append(GamepadAction::make(GamepadAction::Send));
+    else if (act == QLatin1String("confirm"))
+        out.append(GamepadAction::make(GamepadAction::Confirm));
+    else if (act == QLatin1String("back"))
+        out.append(GamepadAction::make(GamepadAction::Back));
+    else if (act == QLatin1String("secondary"))
+        out.append(GamepadAction::make(GamepadAction::Secondary));
+    else if (act == QLatin1String("accept_prediction"))
+        out.append(GamepadAction::make(GamepadAction::AcceptPrediction));
+    else if (act == QLatin1String("step_prev"))
+        out.append(GamepadAction::make(GamepadAction::Step, -1));
+    else if (act == QLatin1String("step_next"))
+        out.append(GamepadAction::make(GamepadAction::Step, 1));
+    else if (act == QLatin1String("zoom_in"))
+        out.append(GamepadAction::make(GamepadAction::Zoom, 0, 0, kZoomStep));
+    else if (act == QLatin1String("zoom_out"))
+        out.append(GamepadAction::make(GamepadAction::Zoom, 0, 0, -kZoomStep));
+    else if (act == QLatin1String("zoom_reset"))
+        out.append(GamepadAction::make(GamepadAction::ZoomReset));
+    else if (act == QLatin1String("toggle_settings"))
+        out.append(GamepadAction::make(GamepadAction::ToggleSettings));
+    else if (act == QLatin1String("toggle_new_session"))
+        out.append(GamepadAction::make(GamepadAction::ToggleNewSession));
+}
+
 void GamepadState::reset()
 {
+    const QHash<QString, QString> keepBindings = m_bindings;
     *this = GamepadState();
+    m_bindings = keepBindings;
 }
 
 // The direction the user holds, as one discrete screen step. The d-pad wins over the stick;
@@ -61,40 +186,89 @@ QList<GamepadAction> GamepadState::process(const GamepadSnapshot &s, qint64 nowM
         m_navDy = dy;
         m_navFromStick = s.dpadX == 0 && s.dpadY == 0;
         m_nextRepeatMs = nowMs + kRepeatDelayMs;
-        out.append({GamepadAction::Nav, dx, dy, 0});
+        out.append(GamepadAction::make(GamepadAction::Nav, dx, dy));
     } else if (nowMs >= m_nextRepeatMs) {
         // On the nominal 110 ms grid; a stalled poll fires once and re-bases instead of bursting.
         m_nextRepeatMs += kRepeatIntervalMs;
         if (m_nextRepeatMs <= nowMs)
             m_nextRepeatMs = nowMs + kRepeatIntervalMs;
-        out.append({GamepadAction::Nav, dx, dy, 0});
+        out.append(GamepadAction::make(GamepadAction::Nav, dx, dy));
     }
 
-    // Face, shoulder and system buttons: edge-triggered on press.
+    // Face, shoulder, stick-click and system buttons.
     auto pressed = [](bool now, bool before) { return now && !before; };
-    if (pressed(s.a, p.a)) out.append({GamepadAction::Confirm});
-    if (pressed(s.b, p.b)) out.append({GamepadAction::Back});
-    if (pressed(s.y, p.y)) out.append({GamepadAction::AcceptPrediction});
-    if (pressed(s.x, p.x) || pressed(s.l3, p.l3) || pressed(s.r3, p.r3)) out.append({GamepadAction::Secondary});
-    if (pressed(s.l1, p.l1)) out.append({GamepadAction::Step, -1, 0, 0});
-    if (pressed(s.r1, p.r1)) out.append({GamepadAction::Step, 1, 0, 0});
-    if (pressed(s.menu, p.menu)) out.append({GamepadAction::ToggleSettings});
-    if ((pressed(s.options, p.options) || pressed(s.touchpad, p.touchpad)) && !p.options && !p.touchpad)
-        out.append({GamepadAction::ToggleNewSession});
+    auto released = [](bool now, bool before) { return !now && before; };
 
-    // Analog triggers: press past 0.55, re-arm below 0.45.
+    bool l2EdgeOn = false, l2EdgeOff = false;
     if (!m_l2 && s.l2 > kTriggerPress) {
         m_l2 = true;
-        out.append({GamepadAction::Zoom, 0, 0, -kZoomStep});
+        l2EdgeOn = true;
     } else if (m_l2 && s.l2 < kTriggerRelease) {
         m_l2 = false;
+        l2EdgeOff = true;
     }
+    bool r2EdgeOn = false, r2EdgeOff = false;
     if (!m_r2 && s.r2 > kTriggerPress) {
         m_r2 = true;
-        out.append({GamepadAction::Zoom, 0, 0, kZoomStep});
+        r2EdgeOn = true;
     } else if (m_r2 && s.r2 < kTriggerRelease) {
         m_r2 = false;
+        r2EdgeOff = true;
     }
+
+    const bool shareOrPadNow = s.options || s.touchpad;
+    const bool shareOrPadPrev = p.options || p.touchpad;
+
+    if (m_capture) {
+        const QPair<const char *, bool> checks[] = {
+            {"a", pressed(s.a, p.a)},
+            {"b", pressed(s.b, p.b)},
+            {"x", pressed(s.x, p.x)},
+            {"y", pressed(s.y, p.y)},
+            {"l1", pressed(s.l1, p.l1)},
+            {"r1", pressed(s.r1, p.r1)},
+            {"l2", l2EdgeOn},
+            {"r2", r2EdgeOn},
+            {"l3", pressed(s.l3, p.l3)},
+            {"r3", pressed(s.r3, p.r3)},
+            {"menu", pressed(s.menu, p.menu)},
+            {"options", pressed(shareOrPadNow, shareOrPadPrev)},
+        };
+        for (const auto &c : checks) {
+            if (c.second) {
+                out.append({GamepadAction::RawCaptured, 0, 0, 0, QString::fromLatin1(c.first)});
+                break;
+            }
+        }
+        m_prev = s;
+        return out;
+    }
+
+    auto handleDigital = [&](const char *id, bool now, bool before) {
+        if (pressed(now, before))
+            emitMappedAction(QString::fromLatin1(id), true, out);
+        else if (released(now, before))
+            emitMappedAction(QString::fromLatin1(id), false, out);
+    };
+    handleDigital("a", s.a, p.a);
+    handleDigital("b", s.b, p.b);
+    handleDigital("x", s.x, p.x);
+    handleDigital("y", s.y, p.y);
+    handleDigital("l1", s.l1, p.l1);
+    handleDigital("r1", s.r1, p.r1);
+    handleDigital("l3", s.l3, p.l3);
+    handleDigital("r3", s.r3, p.r3);
+    handleDigital("menu", s.menu, p.menu);
+    handleDigital("options", shareOrPadNow, shareOrPadPrev);
+
+    if (l2EdgeOn)
+        emitMappedAction(QStringLiteral("l2"), true, out);
+    else if (l2EdgeOff)
+        emitMappedAction(QStringLiteral("l2"), false, out);
+    if (r2EdgeOn)
+        emitMappedAction(QStringLiteral("r2"), true, out);
+    else if (r2EdgeOff)
+        emitMappedAction(QStringLiteral("r2"), false, out);
 
     // Right stick: continuous scroll, quadratic past the deadzone, one delta per 8 ms tick
     // scaled by the real elapsed time (capped so a stalled poll never jumps a page).
@@ -106,13 +280,79 @@ QList<GamepadAction> GamepadState::process(const GamepadSnapshot &s, qint64 nowM
         if (dt >= kScrollTickMs) {
             const double t = std::min(1.0, (ar - kScrollDeadzone) / (1.0 - kScrollDeadzone));
             const double px = t * t * kScrollPxPerSec * double(std::min<qint64>(dt, 50)) / 1000.0;
-            out.append({GamepadAction::Scroll, 0, 0, s.ry > 0 ? -px : px});  // stick up reads upward
+            out.append(GamepadAction::make(GamepadAction::Scroll, 0, 0, s.ry > 0 ? -px : px));  // stick up reads upward
             m_lastScrollMs = nowMs;
             m_scrolling = true;
         }
     }
 
     m_prev = s;
+    return out;
+}
+
+void Gamepad::setCaptureMode(bool on)
+{
+    if (m_state.captureMode() == on)
+        return;
+    m_state.setCaptureMode(on);
+    emit captureModeChanged();
+}
+
+void Gamepad::setBindingsMap(const QHash<QString, QString> &map)
+{
+    m_state.setBindings(map);
+    emit bindingsChanged();
+}
+
+QString Gamepad::actionFor(const QString &inputId) const
+{
+    return m_state.bindings().value(inputId, QStringLiteral("none"));
+}
+
+QString Gamepad::actionLabel(const QString &actionId) const
+{
+    for (const ActionMeta &m : kActions)
+        if (QLatin1String(m.id) == actionId)
+            return QString::fromUtf8(m.label);
+    return actionId;
+}
+
+QString Gamepad::inputLabel(const QString &inputId) const
+{
+    for (const InputMeta &m : kInputs)
+        if (QLatin1String(m.id) == inputId)
+            return QString::fromUtf8(m.label);
+    return inputId;
+}
+
+QVariantList Gamepad::bindingSlots() const
+{
+    QVariantList out;
+    const QHash<QString, QString> map = m_state.bindings();
+    for (const InputMeta &m : kInputs) {
+        const QString id = QString::fromLatin1(m.id);
+        const QString act = map.value(id, QStringLiteral("none"));
+        out << QVariantMap{
+            {QStringLiteral("id"), id},
+            {QStringLiteral("label"), QString::fromUtf8(m.label)},
+            {QStringLiteral("group"), QString::fromUtf8(m.group)},
+            {QStringLiteral("action"), act},
+            {QStringLiteral("actionLabel"), actionLabel(act)},
+        };
+    }
+    return out;
+}
+
+QVariantList Gamepad::availableActions() const
+{
+    QVariantList out;
+    for (const ActionMeta &m : kActions) {
+        out << QVariantMap{
+            {QStringLiteral("id"), QString::fromLatin1(m.id)},
+            {QStringLiteral("label"), QString::fromUtf8(m.label)},
+            {QStringLiteral("desc"), QString::fromUtf8(m.desc)},
+        };
+    }
     return out;
 }
 
@@ -127,9 +367,26 @@ void Gamepad::processSnapshot(const Snapshot &s, qint64 nowMs)
         case GamepadAction::Secondary: emit secondary(); break;
         case GamepadAction::Step: emit step(a.dx); break;
         case GamepadAction::Zoom: emit zoomStep(a.value); break;
+        case GamepadAction::ZoomReset: emit zoomReset(); break;
         case GamepadAction::ToggleSettings: emit toggleSettings(); break;
         case GamepadAction::ToggleNewSession: emit toggleNewSession(); break;
         case GamepadAction::Scroll: emit scrollDelta(a.value); break;
+        case GamepadAction::Send: emit sendPressed(); break;
+        case GamepadAction::VoiceHold: {
+            const bool active = a.value > 0.5;
+            if (m_voiceActive != active) {
+                m_voiceActive = active;
+                if (m_enabled)
+                    triggerVoiceKey(active);
+                emit voiceActiveChanged();
+                emit voiceHold(active);
+            }
+            break;
+        }
+        case GamepadAction::RawCaptured:
+            setCaptureMode(false);
+            emit rawInputCaptured(a.inputId);
+            break;
         }
     }
 }
@@ -138,6 +395,13 @@ void Gamepad::setConnected(bool on, const QString &name)
 {
     if (on == m_connected && name == m_name)
         return;
+    if (!on && m_voiceActive) {
+        m_voiceActive = false;
+        if (m_enabled)
+            triggerVoiceKey(false);
+        emit voiceActiveChanged();
+        emit voiceHold(false);
+    }
     m_connected = on;
     m_name = on ? name : QString();
     m_state.reset();

@@ -761,6 +761,12 @@ Backend::~Backend()
         m_compatReply->deleteLater();
         m_compatReply.clear();
     }
+    if (m_suggestReply) {
+        m_suggestReply->disconnect(this);
+        m_suggestReply->abort();
+        m_suggestReply->deleteLater();
+        m_suggestReply.clear();
+    }
     shutdownChannels();
     if (m_traceProc && m_traceProc->state() != QProcess::NotRunning) {
         m_traceProc->kill();
@@ -1029,7 +1035,32 @@ void Backend::loadPrefs()
     if (!compatModel.isEmpty())
         m_openaiCompatModel = compatModel;
     m_openaiCompatKey = o.value(QLatin1String("openaiCompatKey")).toString().trimmed();
+    QHash<QString, QString> padMap = GamepadState::defaultBindings();
+    const QJsonObject padObj = o.value(QLatin1String("gamepadBindings")).toObject();
+    for (auto it = padObj.begin(); it != padObj.end(); ++it)
+        padMap.insert(it.key(), it.value().toString());
+    m_gamepad.setBindingsMap(padMap);
     emit prefsChanged();
+}
+
+void Backend::setGamepadBinding(const QString &inputId, const QString &actionId)
+{
+    if (!GamepadState::validInputs().contains(inputId) || !GamepadState::validActions().contains(actionId))
+        return;
+    QHash<QString, QString> map = m_gamepad.bindingsMap();
+    if (map.value(inputId) == actionId)
+        return;
+    map.insert(inputId, actionId);
+    m_gamepad.setBindingsMap(map);
+    emit prefsChanged();
+    m_prefsSave.start();
+}
+
+void Backend::resetGamepadBindings()
+{
+    m_gamepad.setBindingsMap(GamepadState::defaultBindings());
+    emit prefsChanged();
+    m_prefsSave.start();
 }
 
 void Backend::setOpenaiCompatUrl(const QString &url)
@@ -1076,6 +1107,16 @@ bool Backend::savePrefs()
         o.insert(QStringLiteral("openaiCompatModel"), m_openaiCompatModel);
     if (!m_openaiCompatKey.isEmpty())
         o.insert(QStringLiteral("openaiCompatKey"), m_openaiCompatKey);
+    {
+        const QHash<QString, QString> padMap = m_gamepad.bindingsMap();
+        const QHash<QString, QString> defMap = GamepadState::defaultBindings();
+        if (padMap != defMap) {
+            QJsonObject padObj;
+            for (const QString &k : GamepadState::validInputs())
+                padObj.insert(k, padMap.value(k));
+            o.insert(QStringLiteral("gamepadBindings"), padObj);
+        }
+    }
     QSaveFile f(m_prefsPath);  // temp file + rename: a crash never leaves half a file
     if (!f.open(QIODevice::WriteOnly))
         return false;
@@ -1161,6 +1202,16 @@ QVariantMap Backend::projectMap(const Project &p) const
     m[QStringLiteral("dots")] = dots;
     m[QStringLiteral("sessionCount")] = int(p.sessions.size());
     m[QStringLiteral("redacted")] = redacted;
+    QString primaryCat;
+    bool activeInLapis = false;
+    for (const SessionInfo &s : p.sessions) {
+        if (primaryCat.isEmpty() && !s.category.isEmpty())
+            primaryCat = s.category;
+        if (m_selectedAgentIds.contains(s.id))
+            activeInLapis = true;
+    }
+    m[QStringLiteral("category")] = primaryCat;
+    m[QStringLiteral("isActiveInLapis")] = activeInLapis;
     // Never a blank island: with no metric to show (redacted infinity work, prose-only sessions),
     // the island says whether it is live and for how long.
     QString headline = p.ex.headline;
@@ -1718,6 +1769,12 @@ void Backend::askOpenAiCompat(const QString &projectKey, int artifactIndex, cons
         m_compatReply->deleteLater();
         m_compatReply.clear();
     }
+    if (m_suggestReply) {
+        m_suggestReply->disconnect(this);
+        m_suggestReply->abort();
+        m_suggestReply->deleteLater();
+        m_suggestReply.clear();
+    }
     m_compatBuf.clear();
     m_quickChannel = channelKeyFor(m_chatModel, m_chatEffort);
 
@@ -1981,6 +2038,71 @@ void Backend::requestSuggestion(const QString &projectKey, int artifactIndex)
     m_suggestion.clear();
     if (m_mode == Mode::Mock) {
         m_mockSuggestT = 0;
+        return;
+    }
+    // Try fast OpenAI-compatible provider first (mirroring Lapis IDE's provider chain) before CLI.
+    QString base = m_openaiCompatUrl;
+    if (base.isEmpty())
+        base = qEnvironmentVariable("LAPIS_OPENAI_COMPAT_URL").trimmed();
+    if (!base.isEmpty()) {
+        while (base.endsWith(QLatin1Char('/')))
+            base.chop(1);
+        const QString endpoint = base.endsWith(QLatin1String("/chat/completions"))
+                                     ? base
+                                     : base + QStringLiteral("/chat/completions");
+        QString model = m_openaiCompatModel;
+        if (model.isEmpty())
+            model = qEnvironmentVariable("LAPIS_OPENAI_COMPAT_MODEL").trimmed();
+        if (model.isEmpty())
+            model = QStringLiteral("qwen3.8-flash-next");
+        QString apiKey = m_openaiCompatKey;
+        if (apiKey.isEmpty())
+            apiKey = qEnvironmentVariable("LAPIS_OPENAI_COMPAT_KEY").trimmed();
+        if (m_suggestReply) {
+            m_suggestReply->disconnect(this);
+            m_suggestReply->abort();
+            m_suggestReply->deleteLater();
+            m_suggestReply.clear();
+        }
+        static const QString kSuggestSys = QStringLiteral(
+            "Predict the user's most likely next prompt in one short sentence under 12 words, "
+            "matching their current mode (question, approval, correction, or next step).");
+        const QByteArray payload = buildOpenAiCompatRequest(
+            model, kSuggestSys, contextFor(projectKey, artifactIndex),
+            QStringLiteral("Suggest the next prompt only."), QStringLiteral("low"));
+        QNetworkRequest req{QUrl(endpoint)};
+        req.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json"));
+        req.setRawHeader("Accept", "text/event-stream");
+        if (!apiKey.isEmpty())
+            req.setRawHeader("Authorization", QByteArray("Bearer ") + apiKey.toUtf8());
+        QNetworkReply *reply = m_nam.post(req, payload);
+        m_suggestReply = reply;
+        auto buf = std::make_shared<QByteArray>();
+        auto acc = std::make_shared<QString>();
+        connect(reply, &QNetworkReply::readyRead, this, [this, reply, buf, acc, key] {
+            if (reply != m_suggestReply)
+                return;
+            *buf += reply->readAll();
+            qsizetype nl;
+            while ((nl = buf->indexOf('\n')) >= 0) {
+                const QByteArray line = buf->left(nl);
+                buf->remove(0, nl + 1);
+                const OpenAiSseEvent ev = parseOpenAiSseLine(line);
+                if (ev.kind == OpenAiSseEvent::Delta && !ev.text.isEmpty())
+                    *acc += ev.text;
+            }
+        });
+        connect(reply, &QNetworkReply::finished, this, [this, reply, acc, key] {
+            if (reply == m_suggestReply)
+                m_suggestReply.clear();
+            const QString s = oneLine(*acc, 12);
+            reply->deleteLater();
+            if (!s.isEmpty() && m_suggestPendingKey == key) {
+                m_suggestion = s;
+                m_suggestionKey = key;
+                emit suggestionChanged();
+            }
+        });
         return;
     }
     // A second thread on the warm codex app-server, so a suggestion never interleaves with an answer.
@@ -2293,9 +2415,20 @@ void Backend::refresh()
         return;
     const QJsonObject ws = QJsonDocument::fromJson(f.readAll()).object();
     QHash<QString, QString> categories;
-    for (const QJsonValue &c : ws.value(QLatin1String("categories")).toArray())
-        categories.insert(c.toObject().value(QLatin1String("id")).toString(),
-                          c.toObject().value(QLatin1String("name")).toString());
+    const QString activeCatId = ws.value(QLatin1String("activeCategory")).toString();
+    QStringList selectedIds;
+    for (const QJsonValue &c : ws.value(QLatin1String("categories")).toArray()) {
+        const QJsonObject co = c.toObject();
+        const QString cid = co.value(QLatin1String("id")).toString();
+        const QString cname = co.value(QLatin1String("name")).toString();
+        categories.insert(cid, cname);
+        if (cid == activeCatId)
+            m_activeCategory = cname;
+        const QString sel = co.value(QLatin1String("selected")).toString();
+        if (!sel.isEmpty())
+            selectedIds << sel;
+    }
+    m_selectedAgentIds = selectedIds;
     QHash<QString, SessionInfo> previous;
     for (const Project &p : m_projects)
         for (const SessionInfo &s : p.sessions)

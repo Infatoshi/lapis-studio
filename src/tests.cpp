@@ -1741,9 +1741,12 @@ struct PadLog {
         QObject::connect(g, &Gamepad::secondary, g, [this] { evs.append({"secondary", 0, 0, 0, now}); });
         QObject::connect(g, &Gamepad::step, g, [this](int d) { evs.append({"step", d, 0, 0, now}); });
         QObject::connect(g, &Gamepad::zoomStep, g, [this](double d) { evs.append({"zoom", 0, 0, d, now}); });
+        QObject::connect(g, &Gamepad::zoomReset, g, [this] { evs.append({"zoomReset", 0, 0, 0, now}); });
         QObject::connect(g, &Gamepad::toggleSettings, g, [this] { evs.append({"settings", 0, 0, 0, now}); });
         QObject::connect(g, &Gamepad::toggleNewSession, g, [this] { evs.append({"newSession", 0, 0, 0, now}); });
         QObject::connect(g, &Gamepad::scrollDelta, g, [this](double d) { evs.append({"scroll", 0, 0, d, now}); });
+        QObject::connect(g, &Gamepad::voiceHold, g, [this](bool on) { evs.append({"voice", on ? 1 : 0, 0, 0, now}); });
+        QObject::connect(g, &Gamepad::sendPressed, g, [this] { evs.append({"send", 0, 0, 0, now}); });
     }
     void feed(Gamepad *g, const GamepadSnapshot &s, qint64 t)
     {
@@ -1877,7 +1880,7 @@ void gamepadUnitTests()
         press([](S &s) { s.menu = true; });
         press([](S &s) { s.options = true; });
         press([](S &s) { s.touchpad = true; });
-        check(log.names() == "confirm,back,tab,secondary,secondary,secondary,step,step,settings,newSession,newSession",
+        check(log.names() == "confirm,back,tab,secondary,zoomReset,zoom,step,step,settings,newSession,newSession",
               "pad: ✕ ○ △ □ L3 R3 L1 R1 ☰ share touchpad map once per press", log.names());
         check(log.evs.value(6).a == -1 && log.evs.value(7).a == 1, "pad: L1 steps -1, R1 steps +1");
         log.evs.clear();
@@ -1888,7 +1891,7 @@ void gamepadUnitTests()
         log.feed(&g, s, t + 8);
         check(log.count("newSession") == 1, "pad: share + touchpad together toggle the dialog once", log.names());
     }
-    // Triggers: > 0.55 presses, < 0.45 re-arms.
+    // Triggers: > 0.55 presses, < 0.45 re-arms. L2 = Phonon hold/release, R2 = Send.
     {
         Gamepad g;
         PadLog log;
@@ -1896,15 +1899,14 @@ void gamepadUnitTests()
         S s;
         s.r2 = 0.5;
         log.feed(&g, s, 0);
-        check(log.evs.isEmpty(), "pad: R2 at 0.50 does not zoom");
+        check(log.evs.isEmpty(), "pad: R2 at 0.50 does not fire");
         s.r2 = 0.6;
         log.hold(&g, s, 8, 400);
         s.r2 = 0.5;
         log.feed(&g, s, 408);
         s.r2 = 0.7;
         log.feed(&g, s, 416);
-        check(log.count("zoom") == 1 && qFuzzyCompare(log.evs[0].v, 0.10), "pad: R2 zooms +0.10 once, hysteresis holds at 0.50",
-              log.names());
+        check(log.count("send") == 1, "pad: R2 fires send once, hysteresis holds at 0.50", log.names());
         s.r2 = 0.4;
         log.feed(&g, s, 424);
         s.r2 = 0.6;
@@ -1912,8 +1914,48 @@ void gamepadUnitTests()
         s = S();
         s.l2 = 1.0;
         log.feed(&g, s, 440);
-        check(log.count("zoom") == 3 && qFuzzyCompare(log.evs[2].v, -0.10), "pad: R2 re-arms under 0.45; L2 zooms -0.10",
+        check(g.voiceActive(), "pad: L2 hold activates Phonon voiceActive");
+        s.l2 = 0.0;
+        log.feed(&g, s, 448);
+        check(!g.voiceActive() && log.count("send") == 2 && log.count("voice") == 2
+                  && log.evs[2].a == 1 && log.evs[3].a == 0,
+              "pad: R2 re-arms under 0.45; L2 fires voiceHold(true) on press and false on release",
               log.names());
+    }
+    // Remapping + capture mode + prefs persistence.
+    {
+        Gamepad g;
+        QString captured;
+        QObject::connect(&g, &Gamepad::rawInputCaptured, &g, [&](const QString &id) { captured = id; });
+        g.setCaptureMode(true);
+        S s;
+        s.y = true;
+        g.processSnapshot(s, 0);
+        check(captured == "y" && !g.captureMode(), "pad: captureMode captures raw input and disarms", captured);
+
+        QTemporaryDir tmp;
+        const QString path = tmp.path() + "/pad_prefs.json";
+        {
+            Backend b(Backend::Mode::Mock);
+            b.setPrefsPath(path);
+            b.setGamepadBinding(QStringLiteral("l2"), QStringLiteral("zoom_out"));
+            b.setGamepadBinding(QStringLiteral("x"), QStringLiteral("voice_hold"));
+            check(b.gamepad()->actionFor(QStringLiteral("l2")) == "zoom_out"
+                      && b.gamepad()->actionFor(QStringLiteral("x")) == "voice_hold",
+                  "pad: setGamepadBinding updates live map");
+            check(b.savePrefs(), "pad: savePrefs writes custom gamepadBindings");
+        }
+        {
+            Backend r(Backend::Mode::Mock);
+            r.setPrefsPath(path);
+            check(r.gamepad()->actionFor(QStringLiteral("l2")) == "zoom_out"
+                      && r.gamepad()->actionFor(QStringLiteral("x")) == "voice_hold",
+                  "pad: custom gamepadBindings round-trip from studio_prefs.json");
+            r.resetGamepadBindings();
+            check(r.gamepad()->actionFor(QStringLiteral("l2")) == "voice_hold"
+                      && r.gamepad()->actionFor(QStringLiteral("r2")) == "send",
+                  "pad: resetGamepadBindings restores defaults");
+        }
     }
     // Right stick: 0.20 deadzone, one delta per 8 ms tick, quadratic speed, stick up scrolls up.
     {
@@ -2061,13 +2103,15 @@ void gamepadUiTests()
     tap([](S &s) { s.b = true; });
     check(!prop(settings, "open").toBool(), "pad ui: ○ closes settings");
 
-    // L2 / R2: uiScale -/+ 0.10 anywhere.
-    tap([](S &s) { s.r2 = 1.0; });
-    check(qAbs(backend.uiScale() - 1.10) < 1e-6, "pad ui: R2 zooms in to 1.10x", QString::number(backend.uiScale()));
-    tap([](S &s) { s.l2 = 1.0; });
-    tap([](S &s) { s.l2 = 1.0; });
-    check(qAbs(backend.uiScale() - 0.90) < 1e-6, "pad ui: L2 twice zooms out to 0.90x", QString::number(backend.uiScale()));
-    backend.setUiScale(1.0);
+    // R3 / L3: uiScale +0.10 and reset to 1.00x anywhere; L2 triggers Phonon voiceActive.
+    tap([](S &s) { s.r3 = true; });
+    check(qAbs(backend.uiScale() - 1.10) < 1e-6, "pad ui: R3 zooms in to 1.10x", QString::number(backend.uiScale()));
+    tap([](S &s) { s.l3 = true; });
+    check(qAbs(backend.uiScale() - 1.00) < 1e-6, "pad ui: L3 resets zoom to 1.00x", QString::number(backend.uiScale()));
+    pad->processSnapshot([]() { S s; s.l2 = 1.0; return s; }(), t += 20);
+    check(pad->voiceActive(), "pad ui: L2 hold sets voiceActive");
+    pad->processSnapshot(S(), t += 20);
+    check(!pad->voiceActive(), "pad ui: L2 release clears voiceActive");
     settle(30);
 
     // Share / touchpad: the new-session dialog; stick changes folder / harness; ○ closes.

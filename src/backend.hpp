@@ -160,6 +160,7 @@ class Backend : public QObject {
     Q_PROPERTY(double quickElapsed READ quickElapsed NOTIFY quickTick)
     Q_PROPERTY(int quickThinkingTokens READ quickThinkingTokens NOTIFY quickChanged)
     Q_PROPERTY(QString focusedProject READ focusedProject WRITE setFocusedProject NOTIFY projectsChanged)
+    Q_PROPERTY(QString activeCategory READ activeCategory NOTIFY projectsChanged)
     Q_PROPERTY(QString openaiCompatUrl READ openaiCompatUrl WRITE setOpenaiCompatUrl NOTIFY prefsChanged)
     Q_PROPERTY(QString openaiCompatModel READ openaiCompatModel WRITE setOpenaiCompatModel NOTIFY prefsChanged)
     // PS4 DualShock 4 / extended gamepad. Always present; only main()'s live window enables it.
@@ -266,6 +267,9 @@ public:
     QString openaiCompatModel() const { return m_openaiCompatModel; }
     void setOpenaiCompatUrl(const QString &url);
     void setOpenaiCompatModel(const QString &model);
+    Q_INVOKABLE void setGamepadBinding(const QString &inputId, const QString &actionId);
+    Q_INVOKABLE void resetGamepadBindings();
+    QString activeCategory() const { return m_activeCategory; }
 
     // The prompt preamble for quick asks and traces: on-screen artifact, last turns, files, tools, write-up.
     QString contextFor(const QString &projectKey, int artifactIndex) const;
@@ -444,7 +448,10 @@ private:
     QString m_openaiCompatKey;
     QNetworkAccessManager m_nam;
     QPointer<QNetworkReply> m_compatReply;
+    QPointer<QNetworkReply> m_suggestReply;
     QByteArray m_compatBuf;
+    QString m_activeCategory;
+    QStringList m_selectedAgentIds;
     Gamepad m_gamepad;
 
     QString m_quickQuestion, m_quickAnswer;

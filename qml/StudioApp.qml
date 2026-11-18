@@ -481,7 +481,12 @@ FocusScope {
     readonly property bool padConnected: gamepad ? gamepad.connected : false
     function padNav(dx, dy) {
         poke();
-        if (onboarding.open) {
+        if (controllerMap.open) {
+            if (dy !== 0 && controllerMap.slots.length > 0)
+                controllerMap.row = (controllerMap.row + dy + controllerMap.slots.length) % controllerMap.slots.length;
+            else if (dx !== 0)
+                controllerMap.cycleAction(dx);
+        } else if (onboarding.open) {
             onboarding.choice = Math.max(0, Math.min(onboarding.cards.length - 1, onboarding.choice + dx + dy));
         } else if (dialog.open) {
             if (dx !== 0) dialog.cycleHarness(dx); else dialog.cycleFolder(dy);
@@ -511,7 +516,8 @@ FocusScope {
     }
     function padConfirm() {
         poke();
-        if (onboarding.open) onboarding.confirm();
+        if (controllerMap.open) controllerMap.startCapture();
+        else if (onboarding.open) onboarding.confirm();
         else if (dialog.open) dialog.start();
         else if (settings.open) settings.hide();
         else if (answers.pickerOpen) answers.pickerOpen = false;  // the composer keeps focus
@@ -524,7 +530,8 @@ FocusScope {
     function padBack() {
         poke();
         if (onboarding.open) return;  // a mode has to be picked once
-        if (dialog.open) dialog.hide();
+        if (controllerMap.open) controllerMap.hide();
+        else if (dialog.open) dialog.hide();
         else if (settings.open) settings.hide();
         else if (answers.pickerOpen) answers.pickerOpen = false;
         else if (answers.inputFocused) answers.escapeInput();
@@ -596,6 +603,21 @@ FocusScope {
         if (proseOpen && lens > 0) prose.scrollPixels(dy);
         else if (lens === 2) stage.scrollPixels(dy);
     }
+    function padVoiceHold(active) {
+        poke();
+        if (active && !onboarding.open && !dialog.open && !settings.open && !controllerMap.open && lens > 0) {
+            if (!answers.inputFocused)
+                answers.focusInput("");
+        }
+    }
+    function padSend() {
+        poke();
+        if (controllerMap.open) controllerMap.startCapture();
+        else if (onboarding.open) onboarding.confirm();
+        else if (dialog.open) dialog.start();
+        else if (answers.inputFocused) answers.send(0);
+        else if (lens > 0) answers.focusInput("");
+    }
     Connections {
         target: app.gamepad
         function onNav(dx, dy) { app.padNav(dx, dy); }
@@ -605,9 +627,12 @@ FocusScope {
         function onSecondary() { app.padSecondary(); }
         function onStep(d) { app.padStep(d); }
         function onZoomStep(d) { app.padZoom(d); }
+        function onZoomReset() { if (app.backend) app.backend.resetZoom(); }
         function onToggleSettings() { app.padSettings(); }
         function onToggleNewSession() { app.padNewSession(); }
         function onScrollDelta(dy) { app.padScroll(dy); }
+        function onVoiceHold(active) { app.padVoiceHold(active); }
+        function onSendPressed() { app.padSend(); }
     }
 
     Rectangle {
@@ -996,6 +1021,43 @@ FocusScope {
         anchors.fill: parent
         backend: app.backend
         onClosed: app.takeFocus()
+        onOpenControllerMap: {
+            settings.hide();
+            controllerMap.show();
+        }
+    }
+
+    ControllerMapOverlay {
+        id: controllerMap
+        anchors.fill: parent
+        backend: app.backend
+        onClosed: settings.show()
+    }
+
+    // Phonon voice-typing live badge while L2 (or remapped voice_hold) is held.
+    Rectangle {
+        anchors.horizontalCenter: parent.horizontalCenter
+        anchors.top: parent.top
+        anchors.topMargin: 16
+        width: voiceRow.implicitWidth + 24
+        height: 30
+        radius: 15
+        color: "#1b1408"
+        border.width: 1
+        border.color: Theme.gold
+        visible: app.gamepad && app.gamepad.voiceActive
+        Row {
+            id: voiceRow
+            anchors.centerIn: parent
+            spacing: 8
+            Rectangle { width: 8; height: 8; radius: 4; color: Theme.gold; anchors.verticalCenter: parent.verticalCenter }
+            Text {
+                text: "Phonon listening…"
+                color: Theme.gold
+                font.family: Theme.mono
+                font.pixelSize: 12
+            }
+        }
     }
 
     // First launch only: shown while backend.firstLaunch is true (never in offscreen modes,

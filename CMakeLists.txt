@@ -53,6 +53,7 @@ qt_add_qml_module(lapis_studio
     qml/PredictorRing.qml
     qml/TermZoomBar.qml
     qml/SettingsOverlay.qml
+    qml/ControllerMapOverlay.qml
     qml/OnboardingModal.qml
 )
 

@@ -10,6 +10,7 @@ FocusScope {
     property bool open: false
     property int row: 0
     signal closed()
+    signal openControllerMap()
 
     readonly property string mode: backend ? backend.navMode : "controller"
     readonly property var modes: [
@@ -36,9 +37,9 @@ FocusScope {
     readonly property bool padConnected: gamepad ? gamepad.connected : false
     readonly property string padName: gamepad && gamepad.controllerName.length > 0 ? gamepad.controllerName : "Gamepad"
     readonly property var padBinds: [
-        ["✕", "confirm"], ["○", "back"], ["△", "tab"], ["□", "prose"],
-        ["L1 R1", "slide"], ["L2 R2", "zoom"], ["☰", "settings"], ["pad", "new session"],
-        ["L ✥", "move"], ["R ↕", "scroll"]]
+        ["L2", "voice"], ["R2", "send"], ["✕", "confirm"], ["○", "back"],
+        ["△", "tab"], ["□", "prose"], ["L1 R1", "slide"], ["R3", "zoom +"],
+        ["L3", "zoom 1x"], ["☰", "settings"]]
 
     function show() {
         row = 0;
@@ -90,6 +91,8 @@ FocusScope {
             change(-1);
         } else if (k === Qt.Key_Return || k === Qt.Key_Enter) {
             hide();
+        } else if (k === Qt.Key_C) {
+            openControllerMap();
         }
         e.accepted = true;
     }
@@ -365,16 +368,41 @@ FocusScope {
 
             // PS4 Controller: only while a pad is connected (the window enables it; offscreen never).
             Item { width: 1; height: 14; visible: root.padConnected }
-            Text {
-                objectName: "settingsPadHeader"
+            Item {
+                width: parent.width
+                height: 24
                 visible: root.padConnected
-                text: "PS4 Controller  ·  " + root.padName
-                color: Theme.dim
-                font.family: Theme.sans
-                font.pixelSize: 14
-                font.weight: Font.Medium
-                font.letterSpacing: 1.6
-                font.capitalization: Font.AllUppercase
+                Text {
+                    objectName: "settingsPadHeader"
+                    anchors.left: parent.left
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: "PS4 Controller  ·  " + root.padName
+                    color: Theme.dim
+                    font.family: Theme.sans
+                    font.pixelSize: 14
+                    font.weight: Font.Medium
+                    font.letterSpacing: 1.6
+                    font.capitalization: Font.AllUppercase
+                }
+                Rectangle {
+                    anchors.right: parent.right
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: mapBtnText.implicitWidth + 20
+                    height: 24
+                    radius: 12
+                    color: "#15120d"
+                    border.width: 1
+                    border.color: Theme.line
+                    Text {
+                        id: mapBtnText
+                        anchors.centerIn: parent
+                        text: "Customize Mapping (C)"
+                        color: Theme.gold
+                        font.family: Theme.mono
+                        font.pixelSize: 11
+                    }
+                    TapHandler { onTapped: root.openControllerMap() }
+                }
             }
             Grid {
                 objectName: "settingsPadBinds"

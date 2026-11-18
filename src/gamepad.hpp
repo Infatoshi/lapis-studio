@@ -9,9 +9,12 @@
 //                 every offscreen mode leaves it disabled, so --test / --bench-fps stay hermetic.
 #pragma once
 
+#include <QHash>
 #include <QList>
 #include <QObject>
 #include <QString>
+#include <QVariantList>
+#include <QVariantMap>
 
 #include <memory>
 
@@ -35,10 +38,30 @@ struct GamepadSnapshot {
 };
 
 struct GamepadAction {
-    enum Kind { Nav, Confirm, Back, AcceptPrediction, Secondary, Step, Zoom, ToggleSettings, ToggleNewSession, Scroll };
+    enum Kind {
+        Nav,
+        Confirm,
+        Back,
+        AcceptPrediction,
+        Secondary,
+        Step,
+        Zoom,
+        ZoomReset,
+        ToggleSettings,
+        ToggleNewSession,
+        Scroll,
+        VoiceHold,
+        Send,
+        RawCaptured
+    };
     Kind kind;
     int dx = 0, dy = 0;   // Nav: screen direction (dy +1 = down); Step: dx = -1 / +1
-    double value = 0;     // Zoom: uiScale delta; Scroll: pixels (+ = content moves down the page)
+    double value = 0;     // Zoom: uiScale delta; Scroll: pixels; VoiceHold: 1.0 down / 0.0 up
+    QString inputId = {}; // RawCaptured: physical slot id ("a", "l2", ...)
+    static GamepadAction make(Kind k, int dx = 0, int dy = 0, double v = 0, const QString &in = {})
+    {
+        return {k, dx, dy, v, in};
+    }
 };
 
 class GamepadState {
@@ -54,12 +77,26 @@ public:
     static constexpr double kScrollPxPerSec = 2000;  // full deflection
     static constexpr double kZoomStep = 0.10;
 
+    static QHash<QString, QString> defaultBindings();
+    static QStringList validInputs();
+    static QStringList validActions();
+
+    GamepadState() : m_bindings(defaultBindings()) {}
+
+    void setBindings(const QHash<QString, QString> &bindings);
+    const QHash<QString, QString> &bindings() const { return m_bindings; }
+    void setCaptureMode(bool on) { m_capture = on; }
+    bool captureMode() const { return m_capture; }
+
     QList<GamepadAction> process(const GamepadSnapshot &s, qint64 nowMs);
     void reset();
 
 private:
     void navDirection(const GamepadSnapshot &s, int *dx, int *dy) const;
+    void emitMappedAction(const QString &inputId, bool pressed, QList<GamepadAction> &out) const;
 
+    QHash<QString, QString> m_bindings;
+    bool m_capture = false;
     GamepadSnapshot m_prev;
     int m_navDx = 0, m_navDy = 0;
     bool m_navFromStick = false;
@@ -74,6 +111,10 @@ class Gamepad : public QObject {
     Q_PROPERTY(bool connected READ connected NOTIFY connectedChanged)
     Q_PROPERTY(QString controllerName READ controllerName NOTIFY connectedChanged)
     Q_PROPERTY(bool enabled READ enabled NOTIFY enabledChanged)
+    Q_PROPERTY(bool captureMode READ captureMode WRITE setCaptureMode NOTIFY captureModeChanged)
+    Q_PROPERTY(bool voiceActive READ voiceActive NOTIFY voiceActiveChanged)
+    Q_PROPERTY(QVariantList bindingSlots READ bindingSlots NOTIFY bindingsChanged)
+    Q_PROPERTY(QVariantList availableActions READ availableActions CONSTANT)
 
 public:
     using Snapshot = GamepadSnapshot;
@@ -84,8 +125,20 @@ public:
     bool connected() const { return m_connected; }
     QString controllerName() const { return m_name; }
     bool enabled() const { return m_enabled; }
+    bool captureMode() const { return m_state.captureMode(); }
+    bool voiceActive() const { return m_voiceActive; }
     // Interactive live window only: starts watching GCController connect / disconnect.
     void setEnabled(bool on);
+    void setCaptureMode(bool on);
+
+    // Remapping API (persisted by Backend).
+    QHash<QString, QString> bindingsMap() const { return m_state.bindings(); }
+    void setBindingsMap(const QHash<QString, QString> &map);
+    Q_INVOKABLE QString actionFor(const QString &inputId) const;
+    Q_INVOKABLE QString actionLabel(const QString &actionId) const;
+    Q_INVOKABLE QString inputLabel(const QString &inputId) const;
+    QVariantList bindingSlots() const;
+    QVariantList availableActions() const;
 
     // Feed one poll (the platform layer calls this every 8 ms; tests call it directly).
     void processSnapshot(const Snapshot &s, qint64 nowMs);
@@ -98,6 +151,9 @@ public:
 signals:
     void connectedChanged();
     void enabledChanged();
+    void captureModeChanged();
+    void voiceActiveChanged();
+    void bindingsChanged();
     void nav(int dx, int dy);
     void confirm();
     void back();
@@ -105,15 +161,21 @@ signals:
     void secondary();
     void step(int delta);
     void zoomStep(double delta);
+    void zoomReset();
     void toggleSettings();
     void toggleNewSession();
     void scrollDelta(double dy);
+    void voiceHold(bool active);
+    void sendPressed();
+    void rawInputCaptured(const QString &inputId);
 
 private:
+    void triggerVoiceKey(bool down);
     struct Platform;
     GamepadState m_state;
     bool m_connected = false;
     bool m_enabled = false;
+    bool m_voiceActive = false;
     QString m_name;
     std::unique_ptr<Platform> m_platform;
     friend struct Platform;
