@@ -40,34 +40,6 @@ Item {
         scale: root.lift
         Behavior on scale { SpringAnimation { spring: Theme.springK; damping: Theme.springDamping; epsilon: 0.0005 } }
 
-        // Radiating border waves: two rounded rects, half a beat apart, grow out of the card's
-        // edge and fade 0.35 -> 0. Geometry never changes (fixed card-sized rects under a Scale
-        // transform), so the border is tessellated once; each frame moves two matrices and two
-        // opacities, driven by the Constellation's one shared clock (no per-island animations).
-        Repeater {
-            model: root.attention && root.pulse >= 0 ? 2 : 0
-            Rectangle {
-                required property int index
-                objectName: "islandWave"
-                readonly property real t: (root.pulse + index * 0.5) % 1
-                readonly property real reach: 3 + 22 * (1 - (1 - t) * (1 - t))  // px out from the edge, OutQuad
-                width: body.width
-                height: body.height
-                radius: 26
-                color: "transparent"
-                border.width: 1.5
-                border.color: Theme.gold
-                opacity: 0.35 * (1 - t)
-                antialiasing: true
-                transform: Scale {
-                    origin.x: body.width / 2
-                    origin.y: body.height / 2
-                    xScale: 1 + 2 * reach / Math.max(1, body.width)
-                    yScale: 1 + 2 * reach / Math.max(1, body.height)
-                }
-            }
-        }
-
         Rectangle {
             anchors.fill: parent
             radius: 26
@@ -116,6 +88,27 @@ Item {
                     color: Theme.gold
                     font.family: Theme.mono
                     font.pixelSize: Theme.px(14)
+                }
+            }
+            // Active blinking dot.
+            Item {
+                width: 14
+                height: 14
+                anchors.verticalCenter: parent.verticalCenter
+                Rectangle {
+                    id: halo
+                    objectName: "islandHalo"
+                    anchors.centerIn: parent
+                    width: 14; height: 14; radius: 7
+                    color: Theme.gold
+                    scale: 1 + 1.4 * Math.max(0, root.pulse)
+                    opacity: 0.45 * (1 - Math.max(0, root.pulse))
+                    visible: root.active && root.pulse >= 0 && root.pulse < 0.999
+                }
+                Rectangle {
+                    anchors.centerIn: parent
+                    width: 10; height: 10; radius: 5
+                    color: root.active ? Theme.gold : (root.proj && root.proj.status === "finished" ? Theme.copper : Theme.faint)
                 }
             }
         }

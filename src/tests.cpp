@@ -1029,41 +1029,12 @@ void uiTests()
         const QRectF is(isl.value(sel)->x(), isl.value(sel)->y(), isl.value(sel)->width(), isl.value(sel)->height());
         check(qAbs(ring->x() - (is.x() - 9)) < 1 && qAbs(ring->y() - (is.y() - 9)) < 1,
               "spring: rapid hops settle exactly on the selected island", QString::number(sel));
-        // Radiating border waves: two per island that wants attention, half a beat apart, all on
-        // one shared clock; no pulse dot, no uptime, no sparkbar.
+        // Active blinking dot on islands; no border waves, no uptime, no sparkbar.
         {
             settle(120);
-            const auto waves = findItems(win->contentItem(), "islandWave");
-            QMap<QQuickItem *, QList<qreal>> byIsland;
-            for (QQuickItem *w : waves)
-                byIsland[w->parentItem()] << w->property("t").toReal();
-            bool pairs = byIsland.size() >= 2, staggered = true, lockstep = true;
-            qreal first = -1;
-            for (const QList<qreal> &ts : std::as_const(byIsland)) {
-                pairs = pairs && ts.size() == 2;
-                if (ts.size() != 2)
-                    continue;
-                staggered = staggered && qAbs(qAbs(ts[1] - ts[0]) - 0.5) < 0.01;
-                const qreal lo = qMin(ts[0], ts[1]);
-                if (first < 0)
-                    first = lo;
-                lockstep = lockstep && qAbs(lo - first) < 1e-6;
-            }
-            check(pairs && staggered && lockstep, "waves: attention islands emit 2 staggered waves on one shared clock",
-                  QStringLiteral("%1 islands, %2 waves").arg(byIsland.size()).arg(waves.size()));
-            qreal maxOp = 0;
-            bool gold = true;
-            for (QQuickItem *w : waves) {
-                maxOp = qMax(maxOp, w->opacity());
-                gold = gold && w->property("border").value<QObject *>()->property("color").value<QColor>() == QColor("#e09f3e");
-            }
-            check(maxOp <= 0.35 + 1e-6 && maxOp > 0.05 && gold, "waves: gold #e09f3e, opacity fades from 0.35",
-                  QString::number(maxOp));
-            const qreal ta = waves.isEmpty() ? 0 : waves.first()->property("t").toReal();
-            settle(200);
-            const qreal tb = waves.isEmpty() ? 0 : waves.first()->property("t").toReal();
-            check(qAbs(tb - ta) > 0.01, "waves: the wave clock runs", QStringLiteral("%1 -> %2").arg(ta).arg(tb));
-            check(findItems(win->contentItem(), "islandHalo").isEmpty(), "waves: the tiny pulse dot is gone");
+            check(findItems(win->contentItem(), "islandWave").isEmpty(), "dot: border waves removed");
+            const auto halos = findItems(win->contentItem(), "islandHalo");
+            check(!halos.isEmpty(), "dot: active islands show the blinking pulse dot", QString::number(halos.size()));
             QStringList lines;
             for (QQuickItem *t : findItems(win->contentItem(), "islandLast"))
                 if (t->isVisible())
