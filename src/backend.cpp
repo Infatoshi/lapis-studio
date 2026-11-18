@@ -1686,13 +1686,31 @@ QString Backend::contextFor(const QString &projectKey, int artifactIndex) const
         QString ctx = QStringLiteral("Project: %1 (%2).").arg(p.name, tildePath(expandHome(p.dir)));
         const QVariantMap a = p.ex.artifacts.value(artifactIndex).toMap();
         if (!a.isEmpty()) {
+            const QString kind = a.value(QStringLiteral("kind")).toString();
             ctx += QStringLiteral(" On screen: %1 \"%2\" (%3).")
-                       .arg(a.value(QStringLiteral("kind")).toString(), a.value(QStringLiteral("title")).toString(),
+                       .arg(kind, a.value(QStringLiteral("title")).toString(),
                             a.value(QStringLiteral("metric")).toString());
             const QStringList labels = a.value(QStringLiteral("labels")).toStringList();
             const QStringList vt = a.value(QStringLiteral("valueText")).toStringList();
             for (int i = 0; i < labels.size() && i < 12; ++i)
                 ctx += QStringLiteral(" %1=%2").arg(labels[i], vt.value(i));
+            if (kind == QLatin1String("table")) {
+                const QStringList hdr = a.value(QStringLiteral("header")).toStringList();
+                const QVariantList rows = a.value(QStringLiteral("rows")).toList();
+                if (!hdr.isEmpty())
+                    ctx += QStringLiteral("\nTable:\n| ") + hdr.join(QStringLiteral(" | ")) + QStringLiteral(" |");
+                for (int r = 0; r < rows.size() && r < 40; ++r)
+                    ctx += QStringLiteral("\n| ") + rows[r].toStringList().join(QStringLiteral(" | ")) + QStringLiteral(" |");
+            } else if (kind == QLatin1String("diff")) {
+                const QVariantList lines = a.value(QStringLiteral("lines")).toList();
+                QStringList out;
+                for (int i = 0; i < lines.size() && i < 60; ++i)
+                    out << lines[i].toMap().value(QStringLiteral("text")).toString();
+                if (!out.isEmpty())
+                    ctx += QStringLiteral("\nDiff:\n") + out.join(QLatin1Char('\n')).left(2500);
+            } else if (a.contains(QLatin1String("path"))) {
+                ctx += QStringLiteral("\nFile: ") + tildePath(a.value(QStringLiteral("path")).toString());
+            }
         }
         if (!p.ex.artifacts.isEmpty()) {
             QStringList all;

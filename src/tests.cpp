@@ -365,6 +365,21 @@ void unitTests()
         check(ctx.contains("Recent tool calls:") && ctx.contains("Bash: ./serve.sh --dcp 4"), "context: tool calls", ctx);
         check(ctx.contains("On screen: chart") && ctx.contains("Agent's latest write-up:"),
               "context: artifact and write-up kept", ctx);
+        QString tblCtx;
+        for (const QVariant &pv : b.projects()) {
+            const QVariantMap pm = pv.toMap();
+            const QVariantList arts = pm.value("artifacts").toList();
+            for (int ai = 0; ai < arts.size(); ++ai) {
+                if (arts[ai].toMap().value("kind") == "table") {
+                    tblCtx = b.contextFor(pm.value("key").toString(), ai);
+                    break;
+                }
+            }
+            if (!tblCtx.isEmpty())
+                break;
+        }
+        check(tblCtx.contains("Table:") && tblCtx.contains("|"),
+              "context: on-screen table headers and rows included", tblCtx.left(180));
         check(ctx.contains("Artifacts the session produced"), "context: artifact list", ctx);
     }
 
