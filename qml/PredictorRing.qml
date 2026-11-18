@@ -1,8 +1,9 @@
 import QtQuick
 
 // The Tab next-action predictor: a warm-gold ring around the predicted target plus a
-// "label  ⇥ Tab" pill ("label  R1 Tab" with a controller). The pulse runs only while the ring is shown and the user is idle, so it
-// costs nothing while hidden or while keys are flying.
+// "label  ⇥ Tab" pill ("label  R1" with a controller: one input's glyph, never both). The pulse
+// runs only while the ring is shown and the user is idle, so it costs nothing while hidden or
+// while keys are flying.
 Item {
     id: root
     objectName: "predictorRing"
@@ -13,7 +14,8 @@ Item {
     property bool shown: false
     property bool idle: true
     property string badgeSide: "top"  // "top" | "bottom" | "left" | "right"
-    // The key chip: "⇥ Tab" on the keyboard, the bound button ("R1 Tab") in controller hints.
+    // The key chip: "⇥ Tab" on the keyboard, only the bound button ("R1") in controller hints;
+    // empty (no chip) when the accept action has no button.
     property string keyHint: "⇥ Tab"
 
     readonly property bool active: shown && target.width > 0 && target.height > 0
@@ -127,6 +129,7 @@ Item {
                 anchors.verticalCenter: parent.verticalCenter
             }
             Rectangle {
+                visible: root.keyHint.length > 0
                 width: tabKey.implicitWidth + 14
                 height: 22
                 radius: 6

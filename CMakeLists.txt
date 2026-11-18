@@ -56,6 +56,7 @@ qt_add_qml_module(lapis_studio
     qml/SettingsOverlay.qml
     qml/ControllerMapOverlay.qml
     qml/OnboardingModal.qml
+    qml/MorningBriefingOverlay.qml
 )
 
 target_compile_options(lapis_studio PRIVATE -Wall -Wextra)

@@ -307,12 +307,191 @@ QString elapsedLabel(qint64 ms)
     return h % 24 ? QStringLiteral("%1d %2h").arg(h / 24).arg(h % 24) : QStringLiteral("%1d").arg(h / 24);
 }
 
-QString statusMetric(const QString &status, qint64 elapsedMs)
+namespace {
+// Sentences of prose, in order: code fences, markdown tables, headings and TLDR lines dropped;
+// a blank line, list item or line ending in punctuation ends a sentence.
+QStringList sentencesOf(const QString &raw)
 {
-    const QString word = status == QLatin1String("working") || status == QLatin1String("needs-ok")
-        ? QStringLiteral("live")
-        : status == QLatin1String("finished") ? QStringLiteral("done") : QStringLiteral("idle");
-    return elapsedMs > 0 ? word + QStringLiteral(" · ") + elapsedLabel(elapsedMs) : word;
+    QString s = raw;
+    static const QRegularExpression fence(QStringLiteral("```[\\s\\S]*?(```|$)"));
+    s.remove(fence);
+    static const QRegularExpression noise(QStringLiteral("[*`]+|^>\\s*"));
+    static const QRegularExpression bullet(QStringLiteral("^([-+]|\\d+[.)])\\s+"));
+    static const QRegularExpression split(QStringLiteral("(?<=[.!?])\\s+(?=[A-Z0-9\"'(])"));
+    QStringList paras;
+    QString cur;
+    auto flush = [&] {
+        if (!cur.trimmed().isEmpty())
+            paras << cur.simplified();
+        cur.clear();
+    };
+    for (QString line : s.split(QLatin1Char('\n'))) {
+        line = line.trimmed();
+        if (line.startsWith(QLatin1Char('|')) || line.startsWith(QLatin1Char('#')) || line.startsWith(QLatin1String("TLDR"))
+            || line.startsWith(QLatin1String("---"))) {
+            flush();
+            continue;
+        }
+        if (line.isEmpty() || bullet.match(line).hasMatch())
+            flush();
+        line.remove(bullet);
+        if (line.contains(QLatin1Char('<')))
+            line = stripMarkup(line);
+        line.replace(noise, QString());
+        cur += QLatin1Char(' ') + line;
+    }
+    flush();
+    QStringList out;
+    for (const QString &p : std::as_const(paras))
+        for (const QString &part : p.split(split, Qt::SkipEmptyParts)) {
+            const QString t = part.trimmed();
+            if (t.size() > 3)
+                out << t;
+        }
+    return out;
+}
+// One short line: <= maxWords words, a trailing period dropped, an ellipsis when cut.
+QString shortLine(const QString &s, int maxWords)
+{
+    const QString c = clampWords(s, maxWords);
+    QString out = c.size() < s.simplified().size() ? c + QChar(0x2026) : c;
+    if (out.endsWith(QLatin1Char('.')) && !out.endsWith(QLatin1String("..")))
+        out.chop(1);
+    return out;
+}
+QString lastAssistantTurn(const QStringList &recent)
+{
+    for (qsizetype i = recent.size() - 1; i >= 0; --i)
+        if (recent[i].startsWith(QLatin1String("Assistant: ")))
+            return recent[i].mid(11);
+    return QString();
+}
+}  // namespace
+
+IslandState islandState(const Extracted &ex, const QString &status)
+{
+    IslandState st;
+    if (!ex.jobName.isEmpty())
+        st.now = ex.jobName;
+    else if (!ex.goal.isEmpty())
+        st.now = shortLine(sentencesOf(ex.goal).value(0, ex.goal), 9);
+    // The latest assistant word: the full write-up when there is one, else the clipped turn.
+    const QString latest = !ex.prose.isEmpty() ? ex.prose : lastAssistantTurn(ex.recentTurns);
+    const QStringList sents = sentencesOf(latest);
+    QString question;
+    for (qsizetype i = sents.size() - 1; i >= 0 && question.isEmpty(); --i)
+        if (sents[i].endsWith(QLatin1Char('?')))
+            question = sents[i];
+    // A blocker only when the newest turn is the agent's (a question already answered is not one).
+    const bool agentSpokeLast = ex.recentTurns.isEmpty() || ex.recentTurns.last().startsWith(QLatin1String("Assistant: "));
+    // The island stays sparse (<= 9 words a line); the briefing gets the longer cut.
+    QString full;
+    if (status == QLatin1String("needs-ok") || (!question.isEmpty() && agentSpokeLast)) {
+        st.blocker = true;
+        full = !question.isEmpty() ? question : QStringLiteral("Waiting on your OK to continue");
+    } else if (!sents.isEmpty()) {
+        full = sents.first();
+    } else if (!ex.toolCalls.isEmpty()) {
+        full = QStringLiteral("Last step: ") + ex.toolCalls.last();
+    }
+    st.last = shortLine(full, 9);
+    st.lastLong = shortLine(full, 16);
+    if (st.now.isEmpty() && !st.blocker) {
+        st.now = st.last;
+        st.last.clear();
+    }
+    return st;
+}
+
+QVariantList localBriefing(const QVariantList &projects)
+{
+    struct Row {
+        int rank;
+        int fresh;
+        int index;
+        QVariantMap m;
+    };
+    QList<Row> rows;
+    for (int i = 0; i < projects.size(); ++i) {
+        const QVariantMap p = projects[i].toMap();
+        const QString status = p.value(QStringLiteral("status")).toString();
+        const int fresh = p.value(QStringLiteral("fresh")).toInt();
+        const bool blocker = p.value(QStringLiteral("blocker")).toBool() || status == QLatin1String("needs-ok");
+        const bool active = p.value(QStringLiteral("active")).toBool();
+        if (!blocker && !active && fresh <= 0)
+            continue;  // unchanged and idle: not in the briefing
+        const QString name = p.value(QStringLiteral("name")).toString();
+        const QString now = p.value(QStringLiteral("nowLine")).toString();
+        const QString last = p.contains(QStringLiteral("lastLong")) ? p.value(QStringLiteral("lastLong")).toString()
+                                                                     : p.value(QStringLiteral("lastLine")).toString();
+        const QString happened = !blocker && !last.isEmpty() ? last : (!now.isEmpty() ? now : QStringLiteral("Work in progress"));
+        // Proof: the metric the transcript states (parts the line already says are dropped), else
+        // the newest artifact, plus the new-turn count.
+        QStringList parts;
+        for (const QString &h : p.value(QStringLiteral("headline")).toString().split(QStringLiteral(" · "), Qt::SkipEmptyParts))
+            if (!happened.contains(h.trimmed()))
+                parts << h.trimmed();
+        QString proof = parts.join(QStringLiteral(" · "));
+        const QVariantList arts = p.value(QStringLiteral("artifacts")).toList();
+        if (proof.isEmpty() && p.value(QStringLiteral("headline")).toString().isEmpty() && !arts.isEmpty())
+            proof = arts.first().toMap().value(QStringLiteral("title")).toString();
+        if (fresh > 0)
+            proof += (proof.isEmpty() ? QString() : QStringLiteral(" · ")) + QStringLiteral("%1 new turn%2").arg(fresh).arg(fresh == 1 ? "" : "s");
+        QString line1 = proof.isEmpty() ? happened : happened + QStringLiteral(" · ") + proof;
+        QString line2;
+        if (blocker)
+            line2 = QStringLiteral("Decide: ") + (last.isEmpty() ? QStringLiteral("give the OK to continue") : last);
+        else if (!arts.isEmpty())
+            line2 = QStringLiteral("Review the ") + arts.first().toMap().value(QStringLiteral("title")).toString().toLower();
+        else if (active)
+            line2 = QStringLiteral("Check in on ") + (now.isEmpty() ? name : now.left(1).toLower() + now.mid(1));
+        else
+            line2 = QStringLiteral("Read the latest turn");
+        QVariantMap m;
+        m[QStringLiteral("key")] = p.value(QStringLiteral("key"));
+        m[QStringLiteral("name")] = name;
+        m[QStringLiteral("index")] = i;
+        m[QStringLiteral("line1")] = line1;
+        m[QStringLiteral("line2")] = line2;
+        m[QStringLiteral("blocker")] = blocker;
+        rows.append({blocker ? 0 : (fresh > 0 ? 1 : 2), fresh, i, m});
+    }
+    std::stable_sort(rows.begin(), rows.end(), [](const Row &a, const Row &b) {
+        return a.rank != b.rank ? a.rank < b.rank : a.fresh > b.fresh;
+    });
+    QVariantList out;
+    for (const Row &r : rows)
+        out << r.m;
+    return out;
+}
+
+int mergeBriefingReply(QVariantList &rows, const QString &reply)
+{
+    int merged = 0;
+    for (const QString &raw : reply.split(QLatin1Char('\n'), Qt::SkipEmptyParts)) {
+        QString l = raw.trimmed();
+        while (l.startsWith(QLatin1Char('-')) || l.startsWith(QLatin1Char('*')))
+            l = l.mid(1).trimmed();
+        const QStringList parts = l.split(QLatin1Char('|'));
+        if (parts.size() < 3)
+            continue;
+        const QString key = parts[0].trimmed();
+        const QString l1 = shortLine(parts[1].trimmed(), 22);
+        const QString l2 = shortLine(parts.mid(2).join(QLatin1Char('|')).trimmed(), 16);
+        if (key.isEmpty() || l1.isEmpty() || l2.isEmpty())
+            continue;
+        for (QVariant &v : rows) {
+            QVariantMap m = v.toMap();
+            if (m.value(QStringLiteral("key")).toString() != key)
+                continue;
+            m[QStringLiteral("line1")] = l1;
+            m[QStringLiteral("line2")] = l2;
+            v = m;
+            ++merged;
+            break;
+        }
+    }
+    return merged;
 }
 
 // --- helper command lines -----------------------------------------------------------------
@@ -1255,17 +1434,15 @@ QVariantMap Backend::projectMap(const Project &p) const
     }
     m[QStringLiteral("category")] = primaryCat;
     m[QStringLiteral("isActiveInLapis")] = activeInLapis;
-    // Never a blank island: with no metric to show (redacted infinity work, prose-only sessions),
-    // the island says whether it is live and for how long.
-    QString headline = p.ex.headline;
-    if (headline.isEmpty() && !p.sessions.isEmpty()) {
-        qint64 started = 0;
-        for (const SessionInfo &s : p.sessions)
-            if (s.started > started)  // the newest tab: how long the current push has run
-                started = s.started;
-        headline = statusMetric(status, started > 0 ? QDateTime::currentMSecsSinceEpoch() - started : 0);
-    }
-    m[QStringLiteral("headline")] = headline;
+    // The metric stays in the map (Stage, briefing proof) but the island shows it only when pinned;
+    // the island itself speaks plain English: what the agent is on, and its latest step or blocker.
+    m[QStringLiteral("headline")] = p.ex.headline;
+    m[QStringLiteral("metricPinned")] = m_pinnedMetrics.contains(p.key);
+    const IslandState is = islandState(p.ex, status);
+    m[QStringLiteral("nowLine")] = is.now;
+    m[QStringLiteral("lastLine")] = is.last;
+    m[QStringLiteral("lastLong")] = is.lastLong;
+    m[QStringLiteral("blocker")] = is.blocker;
     // Plain-English job name: for pushes running over 15 min, or a folder / tab name that does
     // not read as English, the island and Stage header say what the agent is doing right now.
     qint64 started = 0;
@@ -2726,6 +2903,109 @@ void Backend::pollBoard()
     const double ms = clock.nsecsElapsed() / 1e6;  // dispatch only
     m_stall.boardMs += ms;
     noteStall(ms);
+}
+
+// --- Morning Briefing ------------------------------------------------------------------------
+
+void Backend::toggleMetricPin(const QString &projectKey)
+{
+    if (m_pinnedMetrics.contains(projectKey))
+        m_pinnedMetrics.remove(projectKey);
+    else
+        m_pinnedMetrics.insert(projectKey);
+    publish();
+}
+
+void Backend::requestBriefing()
+{
+    if (m_briefingReply) {
+        m_briefingReply->disconnect(this);
+        m_briefingReply->abort();
+        m_briefingReply->deleteLater();
+        m_briefingReply.clear();
+    }
+    // The local lines land at once, so the overlay never opens empty or waits on the network.
+    m_briefing = localBriefing(m_projectList);
+    m_briefingSource = QStringLiteral("local");
+    QString base = m_openaiCompatUrl;
+    if (base.isEmpty() && m_mode == Mode::Live)
+        base = qEnvironmentVariable("LAPIS_OPENAI_COMPAT_URL").trimmed();
+    if (m_mode != Mode::Live || base.isEmpty() || m_briefing.isEmpty()) {
+        emit briefingChanged();
+        return;
+    }
+    while (base.endsWith(QLatin1Char('/')))
+        base.chop(1);
+    const QString endpoint = base.endsWith(QLatin1String("/chat/completions")) ? base : base + QStringLiteral("/chat/completions");
+    QString model = m_openaiCompatModel;
+    if (model.isEmpty())
+        model = QStringLiteral("qwen3.8-flash-next");
+    QString apiKey = m_openaiCompatKey;
+    if (apiKey.isEmpty())
+        apiKey = qEnvironmentVariable("LAPIS_OPENAI_COMPAT_KEY").trimmed();
+
+    // Context: per changed project, its state lines, proof and latest turn. Redacted (infinity)
+    // projects never leave the process: they keep their local lines.
+    QString ctx;
+    for (const QVariant &v : std::as_const(m_briefing)) {
+        const QVariantMap row = v.toMap();
+        const QVariantMap p = m_projectList.value(row.value(QStringLiteral("index")).toInt()).toMap();
+        if (p.value(QStringLiteral("redacted")).toBool())
+            continue;
+        const QString key = row.value(QStringLiteral("key")).toString();
+        ctx += QStringLiteral("\n### key: %1 (%2), status %3\n").arg(key, p.value(QStringLiteral("name")).toString(),
+                                                                     p.value(QStringLiteral("status")).toString());
+        ctx += QStringLiteral("Now: %1\nLatest: %2\nMetric: %3\nNew turns: %4\n")
+                   .arg(p.value(QStringLiteral("nowLine")).toString(), p.value(QStringLiteral("lastLine")).toString(),
+                        p.value(QStringLiteral("headline")).toString())
+                   .arg(p.value(QStringLiteral("fresh")).toInt());
+        for (const Project &pr : std::as_const(m_projects))
+            if (pr.key == key && !pr.ex.recentTurns.isEmpty())
+                ctx += QStringLiteral("Last turns:\n") + pr.ex.recentTurns.mid(std::max<qsizetype>(0, pr.ex.recentTurns.size() - 2)).join(QLatin1Char('\n')) + QLatin1Char('\n');
+    }
+    if (ctx.isEmpty()) {
+        emit briefingChanged();
+        return;
+    }
+    static const QString kSys = QStringLiteral(
+        "You write a morning briefing for an engineer returning to several coding-agent projects. "
+        "For each project output exactly one line: key | what happened, with concrete proof (a number, "
+        "file or artifact) | the single next action, imperative, doable by controller or voice. "
+        "Each part under 18 words, plain English, no markdown, no extra lines.");
+    const QByteArray payload = buildOpenAiCompatRequest(model, kSys, ctx, QStringLiteral("Write the briefing."), QStringLiteral("low"));
+    QNetworkRequest req{QUrl(endpoint)};
+    req.setTransferTimeout(20000);  // a dead endpoint leaves the local lines, never a spinner
+    req.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json"));
+    req.setRawHeader("Accept", "text/event-stream");
+    if (!apiKey.isEmpty())
+        req.setRawHeader("Authorization", QByteArray("Bearer ") + apiKey.toUtf8());
+    QNetworkReply *reply = m_nam.post(req, payload);
+    m_briefingReply = reply;
+    auto buf = std::make_shared<QByteArray>();
+    auto acc = std::make_shared<QString>();
+    connect(reply, &QNetworkReply::readyRead, this, [this, reply, buf, acc] {
+        if (reply != m_briefingReply)
+            return;
+        *buf += reply->readAll();
+        qsizetype nl;
+        while ((nl = buf->indexOf('\n')) >= 0) {
+            const QByteArray line = buf->left(nl);
+            buf->remove(0, nl + 1);
+            const OpenAiSseEvent ev = parseOpenAiSseLine(line);
+            if (ev.kind == OpenAiSseEvent::Delta && !ev.text.isEmpty())
+                *acc += ev.text;
+        }
+    });
+    connect(reply, &QNetworkReply::finished, this, [this, reply, acc, model] {
+        if (reply != m_briefingReply)
+            return;
+        m_briefingReply.clear();
+        reply->deleteLater();
+        if (reply->error() == QNetworkReply::NoError && mergeBriefingReply(m_briefing, *acc) > 0)
+            m_briefingSource = model;
+        emit briefingChanged();
+    });
+    emit briefingChanged();  // local lines now, busy until the model answers
 }
 
 }  // namespace studio

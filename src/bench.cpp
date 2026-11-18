@@ -641,11 +641,11 @@ int benchFpsMetal(const QString &shotDir)
     key(Qt::Key_Escape);
     idle(60);
 
-    // E. Idle Constellation (the shared halo pulse is the only motion).
+    // E. Idle Constellation (the shared border-wave clock is the only motion).
     Samples still;
     for (int f = 0; f < 240; ++f)
         frame(&still, {});
-    row("E constellation idle (halo pulse)", still);
+    row("E constellation idle (border waves)", still);
 
     double worst = 0;
     for (const Samples *s : {&hop, &zoom, &slides, &cards, &still})

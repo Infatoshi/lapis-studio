@@ -105,9 +105,13 @@ Item {
         return Qt.rect(x, pager.y, i === artifactIndex ? 20 : 7, 7);
     }
 
-    // What the focus cursor wraps, in this item's coordinates: the selected term pill while the
-    // keyboard is in the pill row, else the artifact viewer of the settled pane.
+    // What the focus cursor wraps, in this item's coordinates: the open term pill while its card is
+    // down (clicked or Cmd+P), the selected pill while the keyboard is in the row, else the
+    // artifact viewer of the settled pane. Never the artifact while a card is open: the big
+    // artifact ring would cross the card's text.
     function cursorRect() {
+        if (termBar.expanded >= 0)
+            return termBar.pillRect(termBar.expanded);
         if (termBar.active)
             return termBar.pillRect(termBar.selected);
         return pane.viewerRect();

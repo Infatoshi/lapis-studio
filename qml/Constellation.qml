@@ -172,19 +172,23 @@ Item {
         Behavior on y { enabled: root.recede < 0.01; NumberAnimation { duration: Theme.hopMs; easing.type: Easing.OutExpo } }
     }
 
-    // One shared pulse clock for every live island's halo (was one pair of infinite animations
-    // per active island). It runs only while the Constellation is on screen and settled.
-    readonly property bool anyActive: {
-        for (let i = 0; i < count; ++i)
-            if (projects[i] && projects[i].active)
+    // One shared, linear wave clock for every island that wants attention (each island derives
+    // its two staggered waves from it). It runs only while such an island exists and the
+    // Constellation is on screen and settled; at rest it costs nothing.
+    readonly property bool anyAttention: {
+        for (let i = 0; i < count; ++i) {
+            const p = projects[i];
+            if (p && (p.active || p.status === "needs-ok" || (p.fresh || 0) > 0))
                 return true;
+        }
         return false;
     }
     property real pulse: 0
-    SequentialAnimation on pulse {
-        running: root.anyActive && root.visible && root.recede < 0.01
+    NumberAnimation on pulse {
+        running: root.anyAttention && root.visible && root.recede < 0.01
         loops: Animation.Infinite
-        NumberAnimation { from: 0; to: 1; duration: 1400; easing.type: Easing.OutCubic }
-        NumberAnimation { from: 1; to: 1; duration: 400 }
+        from: 0
+        to: 1
+        duration: 2400
     }
 }

@@ -174,11 +174,64 @@ void unitTests()
               && elapsedLabel((3 * 60 + 12) * 60000LL) == "3h 12m" && elapsedLabel(2 * 3600000LL) == "2h"
               && elapsedLabel((5 * 24 + 3) * 3600000LL) == "5d 3h",
           "status: elapsed labels");
-    check(statusMetric("working", (3 * 60 + 12) * 60000LL) == "live · 3h 12m", "status: live metric",
-          statusMetric("working", (3 * 60 + 12) * 60000LL));
-    check(statusMetric("needs-ok", 42 * 60000) == "live · 42m" && statusMetric("finished", 5 * 3600000LL) == "done · 5h"
-              && statusMetric("idle", 0) == "idle",
-          "status: done / idle metrics");
+    // Island state: plain-English lines, never an uptime or a metric.
+    {
+        Extracted ex;
+        ex.jobName = "Sweeping sm120 FP4 tile sizes";
+        ex.headline = "29.6 tok/s · 2.63x";
+        ex.prose = "**128-reg** won the decode sweep at 29.6 tok/s. Spills dropped to zero.\n\nTLDR: done";
+        ex.recentTurns = {"User: sweep the tiles", "Assistant: 128-reg won the decode sweep at 29.6 tok/s."};
+        const IslandState w = islandState(ex, "working");
+        check(w.now == "Sweeping sm120 FP4 tile sizes" && w.last == "128-reg won the decode sweep at 29.6 tok/s" && !w.blocker,
+              "island: job line + latest completed step", w.now + " / " + w.last);
+        check(!w.now.contains("live ·") && !w.last.contains("3h"), "island: no uptime in the state lines");
+        ex.prose = "Both arms are ready. Should I run the 65B sweep overnight?";
+        ex.recentTurns.last() = "Assistant: Both arms are ready. Should I run the 65B sweep overnight?";
+        const IslandState q = islandState(ex, "working");
+        check(q.blocker && q.last == "Should I run the 65B sweep overnight?", "island: a trailing agent question is a gold blocker", q.last);
+        ex.recentTurns << "User: yes";
+        check(!islandState(ex, "working").blocker, "island: an answered question is not a blocker");
+        ex.prose.clear();
+        ex.recentTurns.clear();
+        const IslandState n = islandState(ex, "needs-ok");
+        check(n.blocker && n.last == "Waiting on your OK to continue", "island: needs-ok without a question still blocks", n.last);
+        Extracted bare;
+        bare.goal = "Profile fp4 decode with DCP=4. Then write it up.";
+        bare.toolCalls = {"Bash: ./bench.sh --dcp 4"};
+        const IslandState b = islandState(bare, "idle");
+        check(b.now == "Profile fp4 decode with DCP=4" && b.last == "Last step: Bash: ./bench.sh --dcp 4",
+              "island: goal line + last tool receipt when no write-up", b.now + " / " + b.last);
+    }
+    // Morning Briefing, local fallback + model merge.
+    {
+        auto proj = [](const QString &key, const QString &status, bool active, int fresh, bool blocker, const QString &last) {
+            return QVariantMap{{"key", key}, {"name", key}, {"status", status}, {"active", active}, {"fresh", fresh},
+                               {"blocker", blocker}, {"nowLine", "Tuning " + key}, {"lastLine", last},
+                               {"headline", key == "a" ? "2.63x" : ""},
+                               {"artifacts", key == "b" ? QVariantList{QVariantMap{{"title", "Spill Report"}}} : QVariantList{}}};
+        };
+        const QVariantList ps{proj("idle", "idle", false, 0, false, "Nothing new"),
+                              proj("a", "working", true, 0, false, "128-reg won the sweep"),
+                              proj("b", "idle", false, 3, false, "Spills dropped to zero"),
+                              proj("c", "needs-ok", true, 0, true, "Should I ship it?")};
+        QVariantList rows = localBriefing(ps);
+        QStringList order;
+        for (const QVariant &v : rows)
+            order << v.toMap().value("key").toString();
+        check(order == QStringList({"c", "b", "a"}), "briefing: only changed / active projects, blockers first", order.join(','));
+        const QVariantMap c = rows.value(0).toMap(), b = rows.value(1).toMap(), a = rows.value(2).toMap();
+        check(c.value("line2").toString() == "Decide: Should I ship it?" && c.value("blocker").toBool() && c.value("index").toInt() == 3,
+              "briefing: a blocker's next action is the decision", c.value("line2").toString());
+        check(b.value("line1").toString() == "Spills dropped to zero · Spill Report · 3 new turns"
+                  && b.value("line2").toString() == "Review the spill report",
+              "briefing: line 1 carries proof, line 2 one action", b.value("line1").toString() + " / " + b.value("line2").toString());
+        check(a.value("line1").toString() == "128-reg won the sweep · 2.63x" && a.value("line2").toString() == "Check in on tuning a",
+              "briefing: live project with its metric as proof", a.value("line1").toString() + " / " + a.value("line2").toString());
+        const int n = mergeBriefingReply(rows, "- a | 128-reg hit 29.6 tok/s, 2.63x over base | Approve the 128-reg config\nnonsense line\nzz | x | y");
+        check(n == 1 && rows.value(2).toMap().value("line2").toString() == "Approve the 128-reg config"
+                  && rows.value(0).toMap().value("line1").toString() == c.value("line1").toString(),
+              "briefing: model lines merge by key, the rest keep local lines", QString::number(n));
+    }
 
     // Stripped helper command lines.
     {
@@ -889,7 +942,9 @@ void uiTests()
     check(findItems(win->contentItem(), "island").size() == 5, "ui: five fixture islands");
     {
         const int w = visibleWords(win);
-        check(w < 45, "ui: constellation stays sparse", QString::number(w));
+        // Each island now carries two plain-English state lines (job + latest step, <= 9 words
+        // each) instead of a sparkbar and a metric, so the budget is per island: <= 17 words.
+        check(w < 90, "ui: constellation stays sparse", QString::number(w));
     }
     scanBanned(win, "constellation");
 
@@ -957,20 +1012,64 @@ void uiTests()
         const QRectF is(isl.value(sel)->x(), isl.value(sel)->y(), isl.value(sel)->width(), isl.value(sel)->height());
         check(qAbs(ring->x() - (is.x() - 9)) < 1 && qAbs(ring->y() - (is.y() - 9)) < 1,
               "spring: rapid hops settle exactly on the selected island", QString::number(sel));
-        // One shared halo clock: every live island's halo pulses in lockstep.
-        const auto halos = findItems(win->contentItem(), "islandHalo");
-        QList<QQuickItem *> live;
-        for (int tries = 0; tries < 20 && live.size() < 2; ++tries) {  // the clock rests 400 ms per beat
-            settle(50);
-            live.clear();
-            for (QQuickItem *h : halos)
-                if (h->isVisible())
-                    live << h;
+        // Radiating border waves: two per island that wants attention, half a beat apart, all on
+        // one shared clock; no pulse dot, no uptime, no sparkbar.
+        {
+            settle(120);
+            const auto waves = findItems(win->contentItem(), "islandWave");
+            QMap<QQuickItem *, QList<qreal>> byIsland;
+            for (QQuickItem *w : waves)
+                byIsland[w->parentItem()] << w->property("t").toReal();
+            bool pairs = byIsland.size() >= 2, staggered = true, lockstep = true;
+            qreal first = -1;
+            for (const QList<qreal> &ts : std::as_const(byIsland)) {
+                pairs = pairs && ts.size() == 2;
+                if (ts.size() != 2)
+                    continue;
+                staggered = staggered && qAbs(qAbs(ts[1] - ts[0]) - 0.5) < 0.01;
+                const qreal lo = qMin(ts[0], ts[1]);
+                if (first < 0)
+                    first = lo;
+                lockstep = lockstep && qAbs(lo - first) < 1e-6;
+            }
+            check(pairs && staggered && lockstep, "waves: attention islands emit 2 staggered waves on one shared clock",
+                  QStringLiteral("%1 islands, %2 waves").arg(byIsland.size()).arg(waves.size()));
+            qreal maxOp = 0;
+            bool gold = true;
+            for (QQuickItem *w : waves) {
+                maxOp = qMax(maxOp, w->opacity());
+                gold = gold && w->property("border").value<QObject *>()->property("color").value<QColor>() == QColor("#e09f3e");
+            }
+            check(maxOp <= 0.35 + 1e-6 && maxOp > 0.05 && gold, "waves: gold #e09f3e, opacity fades from 0.35",
+                  QString::number(maxOp));
+            const qreal ta = waves.isEmpty() ? 0 : waves.first()->property("t").toReal();
+            settle(200);
+            const qreal tb = waves.isEmpty() ? 0 : waves.first()->property("t").toReal();
+            check(qAbs(tb - ta) > 0.01, "waves: the wave clock runs", QStringLiteral("%1 -> %2").arg(ta).arg(tb));
+            check(findItems(win->contentItem(), "islandHalo").isEmpty(), "waves: the tiny pulse dot is gone");
+            QStringList lines;
+            for (QQuickItem *t : findItems(win->contentItem(), "islandLast"))
+                if (t->isVisible())
+                    lines << t->property("text").toString();
+            bool noUptime = true;
+            for (QQuickItem *t : findItems(win->contentItem(), "island")) {
+                for (QQuickItem *m : findItems(t, "islandMetric"))
+                    noUptime = noUptime && !m->isVisible();
+            }
+            check(!lines.isEmpty() && noUptime, "island: latest-step lines shown, metrics hidden unless pinned", lines.join(" | "));
+            std::printf("info  island state lines: %s\n", qPrintable(lines.join(" | ")));
+            const QString k0 = backend.projects().value(0).toMap().value("key").toString();
+            backend.toggleMetricPin(k0);
+            settle(30);
+            QQuickItem *m0 = nullptr;
+            for (QQuickItem *it : findItems(win->contentItem(), "island"))
+                if (it->property("proj").toMap().value("key").toString() == k0)
+                    m0 = findItems(it, "islandMetric").value(0);
+            const bool hasMetric = !backend.projects().value(0).toMap().value("headline").toString().isEmpty();
+            check(!hasMetric || (m0 && m0->isVisible()), "island: a pinned metric shows", hasMetric ? "metric" : "no metric");
+            backend.toggleMetricPin(k0);
+            settle(30);
         }
-        bool lockstep = live.size() >= 2;
-        for (QQuickItem *h : live)
-            lockstep = lockstep && h->scale() == live.first()->scale();
-        check(lockstep, "spring: active islands share one halo pulse clock", QString::number(live.size()));
         // +N fresh badge: a background turn on an island that is not open.
         {
             Turn t;
@@ -1162,6 +1261,46 @@ void uiTests()
         settle(1400);  // scale pill fades
     }
 
+    // Morning Briefing: B on the Constellation; changed / active projects only, two lines each.
+    {
+        QObject *mb = win->findChild<QObject *>("morningBriefing");
+        check(mb && !mb->property("open").toBool(), "briefing: closed by default (no auto-trigger offscreen)");
+        sendKey(win, Qt::Key_B, Qt::NoModifier, "b");
+        settle(250);
+        const auto rows = findItems(win->contentItem(), "briefingRow");
+        int expected = 0;
+        for (const QVariant &v : backend.projects()) {
+            const QVariantMap p = v.toMap();
+            expected += p.value("active").toBool() || p.value("fresh").toInt() > 0 || p.value("status").toString() == "needs-ok"
+                        || p.value("blocker").toBool();
+        }
+        check(mb && mb->property("open").toBool() && backend.briefingSource() == "local" && !backend.briefingBusy(),
+              "briefing: B opens it; mock uses the local latest-turn summary", backend.briefingSource());
+        check(!rows.isEmpty() && rows.size() == std::min(expected, 8), "briefing: one row per changed / active project",
+              QStringLiteral("%1 rows, %2 expected").arg(rows.size()).arg(expected));
+        bool twoLines = true;
+        QStringList shown;
+        for (QQuickItem *r : rows) {
+            QQuickItem *l1 = findItems(r, "briefingLine1").value(0), *l2 = findItems(r, "briefingLine2").value(0);
+            const QString a = l1 ? stripMarkup(l1->property("text").toString()) : QString();
+            const QString b = l2 ? l2->property("text").toString() : QString();
+            twoLines = twoLines && a.size() > 6 && b.size() > 4 && l1->property("lineCount").toInt() == 1
+                       && l2->property("lineCount").toInt() == 1;
+            shown << a + " // " + b;
+        }
+        check(twoLines, "briefing: each row is exactly two non-empty lines", shown.join(" | "));
+        std::printf("info  briefing: %s\n", qPrintable(shown.join(" | ")));
+        check(forbiddenPixels(win->grabWindow()) == 0, "briefing: zero blue/green pixels");
+        sendKey(win, Qt::Key_Down);
+        settle(30);
+        check(mb && mb->property("row").toInt() == (rows.size() > 1 ? 1 : 0) && app->property("lens").toInt() == 0,
+              "briefing: Down moves the row, keys stay in the overlay");
+        sendKey(win, Qt::Key_Escape);
+        settle(250);
+        check(mb && !mb->property("open").toBool() && app->property("lens").toInt() == 0, "briefing: Esc closes it");
+        settle(300);
+    }
+
     // Tab predictor on the Constellation: gold ring + "Open Stage ⇥ Tab" on the predicted island.
     {
         settle(700);  // idle: the ring breathes in
@@ -1221,9 +1360,15 @@ void uiTests()
     {
         settle(700);
         QQuickItem *key = firstItem(win, "tabBadgeKey");
-        check(backend.navMode() == "controller" && key && key->property("text").toString() == "R1 Tab",
-              "hints: Controller mode badge names the bound button (R1 Tab), not ⇥",
+        check(backend.navMode() == "controller" && key && key->property("text").toString() == "R1",
+              "hints: Controller mode badge shows only the bound button (R1), no Tab or ⇥",
               key ? key->property("text").toString() : "none");
+        backend.setNavMode("vim");
+        settle(50);
+        check(key && key->property("text").toString() == "⇥ Tab", "hints: keyboard mode badge reads ⇥ Tab",
+              key ? key->property("text").toString() : "none");
+        backend.setNavMode("controller");
+        settle(700);
         QQuickItem *ring = firstItem(win, "focusCursorRing");
         QQuickItem *hint = firstItem(win, "focusCursorHintText");
         const auto isl = findItems(win->contentItem(), "island");
@@ -1417,6 +1562,51 @@ void uiTests()
         QMetaObject::invokeMethod(app, "takeFocus");
         settle(100);
         check(app->property("lens").toInt() == 2, "pills: still on the Stage afterwards");
+    }
+    // Regression: with a term card down, the focus cursor must never draw the big Stage ring
+    // (or its halo) through the card. Both ways in: a click-style open and Cmd+P.
+    {
+        QObject *bar = firstItem(win, "termZoomBar");
+        QQuickItem *card = firstItem(win, "paramCard");
+        QQuickItem *ring = firstItem(win, "focusCursorRing");
+        auto ringScene = [&] {
+            // The ring plus its landing halo (4 px) plus the 2 px stroke: everything it draws.
+            return ring->mapRectToScene(QRectF(0, 0, ring->width(), ring->height())).adjusted(-6, -6, 6, 6);
+        };
+        auto cardScene = [&] { return card->mapRectToScene(QRectF(0, 0, card->width(), card->height())); };
+        auto pillScene = [&](int i) {
+            QQuickItem *p = findItems(win->contentItem(), "paramPill").value(i);
+            return p ? p->mapRectToScene(QRectF(0, 0, p->width(), p->height())) : QRectF();
+        };
+        if (bar && card && ring) {
+            settle(500);
+            const QRectF before = ringScene();
+            bar->setProperty("expanded", 0);  // what a click on the first pill does
+            settle(600);
+            const QRectF rr = ringScene(), cr = cardScene();
+            check(card->isVisible() && !rr.intersects(cr), "cursor: clicked term card is clear of the focus ring",
+                  QStringLiteral("ring %1,%2 %3x%4 card %5,%6 %7x%8").arg(rr.x()).arg(rr.y()).arg(rr.width()).arg(rr.height())
+                      .arg(cr.x()).arg(cr.y()).arg(cr.width()).arg(cr.height()));
+            check(rr.contains(pillScene(0)) && rr.height() < before.height() / 2,
+                  "cursor: wraps the open pill, not the artifact behind the card");
+            QColor bg = card->property("color").value<QColor>();
+            check(bg == QColor("#0b0a08") && bg.alpha() == 255 && card->z() >= 60,
+                  "pills: card is opaque #0b0a08 at z 60", bg.name() + " z " + QString::number(card->z()));
+            bar->setProperty("expanded", -1);
+            settle(300);
+            sendKey(win, Qt::Key_P, Qt::ControlModifier);
+            sendKey(win, Qt::Key_Right);
+            settle(600);
+            const QRectF rk = ringScene(), ck = cardScene();
+            check(card->isVisible() && !rk.intersects(ck), "cursor: Cmd+P term card is clear of the focus ring");
+            sendKey(win, Qt::Key_Escape);
+            settle(300);
+            QMetaObject::invokeMethod(app, "takeFocus");
+            settle(300);
+            check(!card->isVisible() && app->property("lens").toInt() == 2, "pills: card closed, still on the Stage");
+        } else {
+            check(false, "cursor: term bar, card and ring exist");
+        }
     }
     if (auto *title = firstItem(win, "stageTitle")) {
         const QFont f = title->property("font").value<QFont>();
@@ -2219,6 +2409,15 @@ void gamepadUiTests()
         tap([](S &s) { s.b = true; });
         settle(400);
         check(prop(app, "lens").toInt() == 0, "pad ui: ○ zooms back out to the constellation");
+    }
+    {
+        QObject *mb = win->findChild<QObject *>("morningBriefing");
+        tap([](S &s) { s.r2 = 1.0; });
+        settle(200);
+        check(mb && prop(mb, "open").toBool(), "pad ui: R2 on the constellation opens the Morning Briefing");
+        tap([](S &s) { s.b = true; });
+        settle(200);
+        check(mb && !prop(mb, "open").toBool() && prop(app, "lens").toInt() == 0, "pad ui: ○ closes the briefing");
     }
     // □ on the constellation opens Settings on the Default Model row; ☰ toggles Settings.
     tap([](S &s) { s.x = true; });

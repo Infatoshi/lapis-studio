@@ -18,6 +18,7 @@ Item {
     property real cardReveal: 1   // 0..1, the Stage drives it from its dim curve (crossfade, no overlap)
     property bool padHints: false // controller glyphs instead of keys (StudioApp decides)
     property var padGlyphs: ({})
+    readonly property int cardGap: 20
     function padHint(action, word) {
         const g = padGlyphs[action];
         return g !== undefined && g.length > 0 ? g + " " + word : "";
@@ -126,13 +127,15 @@ Item {
         readonly property var p: root.expanded >= 0 && root.expanded < root.count ? root.shown[root.expanded] : null
         readonly property Item anchorPill: root.expanded >= 0 && root.expanded < pillRep.count ? pillRep.itemAt(root.expanded) : null
         visible: p !== null
-        z: 20
+        z: 60
         x: anchorPill ? Math.max(0, Math.min(root.width - width, anchorPill.x)) : 0
-        y: root.height + 8
+        // 20 px under the row: the focus cursor wraps the open pill (ring pad 12 + halo 4 below a
+        // pill that ends 4 px above the row's bottom), so no ring line ever crosses the card.
+        y: root.height + root.cardGap
         width: Math.min(root.width, Math.max(420, cardCol.implicitWidth + 44))
         height: cardCol.implicitHeight + 32
         radius: 18
-        color: "#000000"
+        color: "#0b0a08"  // opaque: the artifact under it never shows through the text
         border.width: 1.5
         border.color: Theme.gold
         opacity: root.cardReveal

@@ -34,6 +34,7 @@ FocusScope {
         ScriptAction { script: app.idle = true }
     }
     function poke() {
+        lastInputMs = Date.now();
         idle = false;
         idleTimer.restart();
     }
@@ -56,7 +57,7 @@ FocusScope {
 
     // The view in charge supplies the prediction: the composer while it has focus, else the lens.
     readonly property var predictedAction: {
-        if (settings.open || onboarding.open || dialog.open)
+        if (settings.open || onboarding.open || dialog.open || briefing.open)
             return null;
         if (answers.inputFocused)
             return answers.predictedAction;
@@ -320,7 +321,7 @@ FocusScope {
             e.accepted = true;
             return;
         }
-        if (settings.open)
+        if (settings.open || briefing.open)
             return;
         if (ctrl && e.key === Qt.Key_M) {
             if (lens > 0) {
@@ -398,6 +399,12 @@ FocusScope {
         }
         if (ctrl)
             return;
+        // B on the Constellation: the Morning Briefing (changed / active projects, two lines each).
+        if (lens === 0 && plainKey && e.key === Qt.Key_B) {
+            briefing.show();
+            e.accepted = true;
+            return;
+        }
         if (navMode === "vim" && e.key === Qt.Key_G && !(e.modifiers & (Qt.AltModifier | Qt.MetaModifier))) {
             const last = (e.modifiers & Qt.ShiftModifier) !== 0;
             if (lens === 0 && projects.length > 0) {
@@ -508,6 +515,8 @@ FocusScope {
                 controllerMap.row = (controllerMap.row + dy + controllerMap.slots.length) % controllerMap.slots.length;
             else if (dx !== 0)
                 controllerMap.cycleAction(dx);
+        } else if (briefing.open) {
+            briefing.move(dy !== 0 ? dy : dx);
         } else if (onboarding.open) {
             onboarding.choice = Math.max(0, Math.min(onboarding.cards.length - 1, onboarding.choice + dx + dy));
         } else if (dialog.open) {
@@ -541,6 +550,7 @@ FocusScope {
         poke();
         if (controllerMap.open) controllerMap.startCapture();
         else if (onboarding.open) onboarding.confirm();
+        else if (briefing.open) briefing.confirm();
         else if (dialog.open) dialog.start();
         else if (settings.open) settings.hide();
         else if (answers.pickerOpen) answers.pickerOpen = false;  // the composer keeps focus
@@ -554,6 +564,7 @@ FocusScope {
         poke();
         if (onboarding.open) return;  // a mode has to be picked once
         if (controllerMap.open) controllerMap.hide();
+        else if (briefing.open) briefing.hide();
         else if (dialog.open) dialog.hide();
         else if (settings.open) settings.hide();
         else if (answers.pickerOpen) answers.pickerOpen = false;
@@ -570,7 +581,7 @@ FocusScope {
     }
     function padSecondary() {
         poke();
-        if (onboarding.open || dialog.open)
+        if (onboarding.open || dialog.open || briefing.open)
             return;
         if (settings.open) {
             settings.row = 2;  // Default Model
@@ -587,6 +598,8 @@ FocusScope {
         poke();
         if (onboarding.open) {
             onboarding.choice = Math.max(0, Math.min(onboarding.cards.length - 1, onboarding.choice + d));
+        } else if (briefing.open) {
+            briefing.move(d);
         } else if (dialog.open) {
             dialog.cycleModel(d);
         } else if (settings.open) {
@@ -638,8 +651,10 @@ FocusScope {
         if (controllerMap.open) controllerMap.startCapture();
         else if (onboarding.open) onboarding.confirm();
         else if (dialog.open) dialog.start();
+        else if (briefing.open) briefing.hide();
         else if (answers.inputFocused) answers.send(0);
         else if (lens > 0) answers.focusInput("");
+        else if (!settings.open) briefing.show();  // the Constellation has nothing to send: Morning Briefing
     }
     Connections {
         target: app.gamepad
@@ -924,7 +939,7 @@ FocusScope {
         }
     }
 
-    // Tab predictor ring + "⇥ Tab" (or "R1 Tab") badge, over whichever lens is settled on screen.
+    // Tab predictor ring + "⇥ Tab" (or "R1") badge, over whichever lens is settled on screen.
     PredictorRing {
         id: predictor
         anchors.fill: parent
@@ -937,7 +952,9 @@ FocusScope {
         badgeSide: tid.startsWith("pager:") ? "right" : tid.startsWith("rung:") ? "left"
                    : tid === "newSession" ? "bottom" : "top"
         idle: app.idle
-        keyHint: app.padHints && app.padKey("accept_prediction").length > 0 ? app.padKey("accept_prediction") + " Tab" : "⇥ Tab"
+        // One input at a time: the bound button alone with a controller ("R1"), "⇥ Tab" on keys.
+        // An unbound accept action shows no key chip rather than a keyboard glyph.
+        keyHint: app.padHints ? app.padKey("accept_prediction") : "⇥ Tab"
         shown: p !== null && (app.zoom < 0.001 || app.zoom > 0.999) && !(app.lens === 2 && app.stageSliding)
                && !(app.lens === 2 && (stage.cardOpen || stage.terms.active))
                && !app.proseOpen && (app.lens !== 1 || ladder.opacity > 0.99) && (app.lens !== 2 || stage.opacity > 0.99)
@@ -951,10 +968,10 @@ FocusScope {
         const deps = [zoom, width, height, uiScale, lens, selectedIsland, artifactIndex, constellation.width,
                       constellation.count, answers.inputFocused, answers.hasSelection, answers.inputText,
                       answers.height, answers.pickerOpen, stage.width, stage.height, stage.barH, stage.kind,
-                      stage.terms.active, stage.terms.selected, stage.terms.count];
+                      stage.terms.active, stage.terms.selected, stage.terms.count, stage.terms.expanded];
         if (deps.length === 0 || (navMode === "mouse" && !padConnected))
             return null;
-        if (settings.open || onboarding.open || dialog.open || controllerMap.open)
+        if (settings.open || onboarding.open || dialog.open || controllerMap.open || briefing.open)
             return null;
         if (!(zoom < 0.001 || zoom > 0.999) || (proseOpen && !answers.inputFocused))
             return null;
@@ -972,7 +989,9 @@ FocusScope {
                      hint: confirmKey.length > 0 ? confirmKey + " Expand" : "" };
         }
         if (lens === 2) {
-            if (stage.terms.active)
+            // A term card is down (clicked or Cmd+P): wrap its pill, never the artifact behind the
+            // card, so no ring line crosses the card's text.
+            if (stage.terms.active || stage.terms.expanded >= 0)
                 return { item: stage, r: stage.cursorRect(), radius: 16, round: true, side: "bottom", hint: "" };
             if (!artifact)
                 return null;
@@ -1121,6 +1140,56 @@ FocusScope {
         anchors.fill: parent
         backend: app.backend
         onClosed: settings.show()
+    }
+
+    // --- Morning Briefing ------------------------------------------------------------------------
+    // B / R2 on the Constellation, or by itself when the window comes back after an overnight or
+    // long-idle stretch (live window only: offscreen tests and benches never trigger it).
+    property real lastInputMs: Date.now()
+    readonly property real briefingIdleMs: 4 * 3600 * 1000
+    function maybeAutoBriefing() {
+        if (!backend || !backend.live || briefing.open || settings.open || dialog.open || onboarding.open || controllerMap.open)
+            return;
+        const away = Date.now() - lastInputMs;
+        const overnight = new Date(lastInputMs).toDateString() !== new Date().toDateString() && away > 90 * 60 * 1000;
+        if (away > briefingIdleMs || overnight) {
+            takeFocus();
+            goLens(0);
+            briefing.show();
+        }
+    }
+    Connections {
+        target: Qt.application
+        function onStateChanged() {
+            if (Qt.application.state === Qt.ApplicationActive)
+                app.maybeAutoBriefing();
+            else
+                app.lastInputMs = Math.max(app.lastInputMs, Date.now());  // away from here on
+        }
+    }
+    MorningBriefingOverlay {
+        id: briefing
+        anchors.fill: parent
+        backend: app.backend
+        padHints: app.padHints
+        padGlyphs: app.padGlyphs
+        onClosed: {
+            app.lastInputMs = Date.now();
+            app.takeFocus();
+        }
+        onOpenProject: (i) => app.enterProject(i)
+    }
+    // Quiet hint, Constellation only: where the briefing lives.
+    Text {
+        objectName: "briefingHint"
+        anchors.right: navPill.left
+        anchors.rightMargin: 14
+        anchors.verticalCenter: navPill.verticalCenter
+        visible: navPill.visible && !briefing.open && app.projects.length > 0
+        text: (app.padHints ? (app.padKey("send").length > 0 ? app.padKey("send") : "B") : "B") + " briefing"
+        color: Theme.faint
+        font.family: Theme.mono
+        font.pixelSize: 13
     }
 
     // Phonon voice-typing live badge while L2 (or remapped voice_hold) is held.

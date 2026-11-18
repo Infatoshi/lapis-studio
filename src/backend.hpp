@@ -13,6 +13,7 @@
 #include <QObject>
 #include <QPointer>
 #include <QProcess>
+#include <QSet>
 #include <QTimer>
 #include <QVariantList>
 #include <QVariantMap>
@@ -45,8 +46,25 @@ QString slugFromTitle(const QString &title);
 ProjectId projectIdFor(const QString &directory, const QString &title, const QString &category);
 // "42m", "3h 12m", "2d 4h".
 QString elapsedLabel(qint64 ms);
-// The island metric when a project has nothing to chart: "live · 3h 12m".
-QString statusMetric(const QString &status, qint64 elapsedMs);
+// The island's plain-English 1-to-2-turn state, no metrics and no uptime:
+//   now     what the agent is on ("Sweeping sm120 FP4 tile sizes"), from the job name or goal
+//   last    the latest completed step or receipt, or (blocker) the decision the agent waits on
+//   lastLong  the same step at briefing length (<= 16 words; the island line keeps <= 9)
+struct IslandState {
+    QString now;
+    QString last;
+    QString lastLong;
+    bool blocker = false;
+};
+IslandState islandState(const Extracted &ex, const QString &status);
+
+// Morning Briefing, local fallback: only changed / active projects (needs-ok, fresh turns,
+// live), two lines each. Line 1: what happened + concrete proof. Line 2: one next action.
+// Takes the published project maps; returns [{key, name, index, line1, line2, blocker}].
+QVariantList localBriefing(const QVariantList &projects);
+// Merge a model reply ("key | line1 | line2" per line) over the local briefing; rows the model
+// skipped or mangled keep their local lines. Returns how many rows the model rewrote.
+int mergeBriefingReply(QVariantList &rows, const QString &reply);
 
 // The chat model catalog: every model the inline picker cycles through, with its provider
 // ("anthropic" | "openai" | "google") and the efforts that model accepts (low..xhigh subset).
@@ -170,6 +188,10 @@ class Backend : public QObject {
     Q_PROPERTY(QString openaiCompatModel READ openaiCompatModel WRITE setOpenaiCompatModel NOTIFY prefsChanged)
     // PS4 DualShock 4 / extended gamepad. Always present; only main()'s live window enables it.
     Q_PROPERTY(QObject *gamepad READ gamepadObject CONSTANT)
+    // Morning Briefing: changed / active projects in two lines each (see localBriefing()).
+    Q_PROPERTY(QVariantList briefing READ briefing NOTIFY briefingChanged)
+    Q_PROPERTY(bool briefingBusy READ briefingBusy NOTIFY briefingChanged)
+    Q_PROPERTY(QString briefingSource READ briefingSource NOTIFY briefingChanged)
 
 public:
     enum class Mode { Live, Mock };
@@ -258,6 +280,14 @@ public:
     QString suggestionKey() const { return m_suggestionKey; }
     // Opt-in warm model suggestion for the composer's Tab prediction (codex app-server, own thread).
     Q_INVOKABLE void requestSuggestion(const QString &projectKey, int artifactIndex);
+    // Morning Briefing: the local lines land at once; with an OpenAI-compatible endpoint
+    // configured (live mode) qwen3.8-flash-next rewrites them when it answers.
+    QVariantList briefing() const { return m_briefing; }
+    bool briefingBusy() const { return m_briefingReply != nullptr; }
+    QString briefingSource() const { return m_briefingSource; }
+    Q_INVOKABLE void requestBriefing();
+    // Island metrics stay hidden unless pinned for that project.
+    Q_INVOKABLE void toggleMetricPin(const QString &projectKey);
     // What the latest ask was routed to (tests): model, effort and channel key.
     QString lastAskModel() const { return m_lastAskModel; }
     QString lastAskEffort() const { return m_lastAskEffort; }
@@ -335,6 +365,7 @@ signals:
     void toastChanged();
     void prefsChanged();
     void suggestionChanged();
+    void briefingChanged();
     void sessionStarted(const QString &projectKey);
     void quickTick();
 
@@ -456,6 +487,10 @@ private:
     QNetworkAccessManager m_nam;
     QPointer<QNetworkReply> m_compatReply;
     QPointer<QNetworkReply> m_suggestReply;
+    QPointer<QNetworkReply> m_briefingReply;
+    QVariantList m_briefing;
+    QString m_briefingSource;
+    QSet<QString> m_pinnedMetrics;
     QByteArray m_compatBuf;
     QString m_activeCategory;
     QStringList m_selectedAgentIds;
