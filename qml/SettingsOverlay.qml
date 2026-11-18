@@ -11,14 +11,18 @@ FocusScope {
     property int row: 0
     signal closed()
 
-    readonly property string mode: backend ? backend.navMode : "vim"
+    readonly property string mode: backend ? backend.navMode : "controller"
     readonly property var modes: [
-        { id: "vim", name: "Neovim", tag: "Recommended" },
+        { id: "controller", name: "Controller", tag: "Recommended" },
+        { id: "vim", name: "Neovim", tag: "" },
         { id: "wasd", name: "Gaming", tag: "" },
         { id: "mouse", name: "Mouse", tag: "" }
     ]
     readonly property int rowCount: 5
-    readonly property var keybinds: mode === "vim" ? [
+    readonly property var keybinds: mode === "controller" ? [
+            ["✕", "confirm"], ["○", "back"], ["△", "tab"], ["□", "prose"],
+            ["L1 R1", "slide"], ["L2 R2", "zoom"], ["☰", "settings"], ["pad", "new session"]]
+        : mode === "vim" ? [
             ["h j k l", "move"], ["g  G", "first / last"], ["⏎", "zoom in"], ["esc", "back"],
             ["space", "write-up"], ["⇥ tab", "accept prediction"], ["⌘M", "model & effort"], ["⌘N", "new session"]]
         : mode === "wasd" ? [

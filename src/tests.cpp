@@ -322,9 +322,10 @@ void unitTests()
         const QDateTime mtimeBefore = existedBefore ? realPrefs.lastModified() : QDateTime();
         Backend b(Backend::Mode::Mock);
         check(b.prefsPath().isEmpty(), "prefs: mock backend has no prefs file");
-        check(qFuzzyCompare(b.uiScale(), 1.0) && b.navMode() == "vim", "prefs: defaults 1.0x, Neovim mode");
-        check(Backend::navModes() == QStringList({"vim", "wasd", "mouse"}) && !Backend::navModes().contains("arrows"),
-              "modes: exactly vim | wasd | mouse, no arrows mode", Backend::navModes().join(','));
+        check(qFuzzyCompare(b.uiScale(), 1.0) && b.navMode() == "controller", "prefs: defaults 1.0x, Controller mode");
+        check(Backend::navModes() == QStringList({"controller", "vim", "wasd", "mouse"})
+                  && !Backend::navModes().contains("arrows"),
+              "modes: exactly controller | vim | wasd | mouse, no arrows mode", Backend::navModes().join(','));
         check(!b.firstLaunch(), "onboarding: never shown by default in offscreen/mock modes");
         b.setUiScale(9.0);
         check(qFuzzyCompare(b.uiScale(), 1.60), "prefs: uiScale clamps to 1.60", QString::number(b.uiScale()));
@@ -338,14 +339,17 @@ void unitTests()
         b.resetZoom();
         check(qFuzzyCompare(b.uiScale(), 1.0), "prefs: resetZoom", QString::number(b.uiScale()));
         b.setNavMode("emacs");
-        check(b.navMode() == "vim", "prefs: unknown navMode ignored", b.navMode());
+        check(b.navMode() == "controller", "prefs: unknown navMode ignored", b.navMode());
         b.cycleNavMode();
         const QString m1 = b.navMode();
         b.cycleNavMode();
         const QString m2 = b.navMode();
         b.cycleNavMode();
-        check(m1 == "wasd" && m2 == "mouse" && b.navMode() == "vim", "prefs: Cmd+K cycles vim -> wasd -> mouse -> vim",
-              m1 + "," + m2 + "," + b.navMode());
+        const QString m3 = b.navMode();
+        b.cycleNavMode();
+        check(m1 == "vim" && m2 == "wasd" && m3 == "mouse" && b.navMode() == "controller",
+              "prefs: Cmd+K cycles controller -> vim -> wasd -> mouse -> controller",
+              m1 + "," + m2 + "," + m3 + "," + b.navMode());
         b.setNavMode("arrows");
         check(b.navMode() == "wasd", "modes: 'arrows' is gaming mode (wasd), never its own mode", b.navMode());
         b.setNavMode("vim");
@@ -709,7 +713,8 @@ void unitTests()
         {
             Backend w(Backend::Mode::Mock);
             w.setPrefsPath(path);
-            check(w.firstLaunch() && w.navMode() == "vim", "onboarding: missing prefs file -> first launch, Neovim preselected");
+            check(w.firstLaunch() && w.navMode() == "controller",
+                  "onboarding: missing prefs file -> first launch, Controller preselected");
             w.completeOnboarding("wasd");
             check(!w.firstLaunch() && w.navMode() == "wasd" && QFileInfo::exists(path),
                   "onboarding: confirming writes the prefs file at once");
@@ -815,7 +820,8 @@ void unitTests()
         {
             Backend r(Backend::Mode::Mock);
             r.setPrefsPath(path);
-            check(qFuzzyCompare(r.uiScale(), 1.60) && r.navMode() == "vim", "prefs: bad file values clamped/ignored",
+            check(qFuzzyCompare(r.uiScale(), 1.60) && r.navMode() == "controller",
+                  "prefs: bad file values clamped/ignored",
                   QStringLiteral("%1 %2").arg(r.uiScale()).arg(r.navMode()));
         }
         const QFileInfo after(Backend::defaultPrefsPath());
@@ -998,11 +1004,13 @@ void uiTests()
               pill ? QStringLiteral("%1,%2").arg(pill->x()).arg(pill->y()) : "none");
     }
 
-    // Input modes: vim (default) | wasd | mouse. Arrow keys are a silent fallback, not a mode.
+    // Input modes: controller (default) | vim | wasd | mouse. Arrow keys are a silent fallback, not a mode.
     {
         auto sel = [&] { return app->property("selectedIsland").toInt(); };
         auto letter = [&](int key, const char *t) { sendKey(win, key, Qt::NoModifier, QString::fromLatin1(t)); };
-        check(backend.navMode() == "vim" && sel() == 0, "nav: starts in Neovim mode on island 1");
+        check(backend.navMode() == "controller" && sel() == 0, "nav: starts in Controller mode on island 1");
+        sendKey(win, Qt::Key_K, Qt::ControlModifier);
+        check(backend.navMode() == "vim" && sel() == 0, "nav: Cmd+K -> vim (Neovim)", backend.navMode());
         letter(Qt::Key_D, "d");
         check(sel() == 0, "nav: vim mode ignores wasd letters", QString::number(sel()));
         letter(Qt::Key_L, "l");
@@ -1051,7 +1059,7 @@ void uiTests()
         letter(Qt::Key_D, "d");
         check(sel() == 0, "nav: mouse mode has no letter navigation");
         sendKey(win, Qt::Key_K, Qt::ControlModifier);
-        check(backend.navMode() == "vim" && sel() == 0, "nav: Cmd+K wraps back to vim");
+        check(backend.navMode() == "controller" && sel() == 0, "nav: Cmd+K wraps back to controller");
         settle(700);
     }
 
@@ -1062,14 +1070,16 @@ void uiTests()
         backend.showOnboarding();
         settle(300);
         check(modal && modal->isVisible() && modal->property("choice").toInt() == 0,
-              "onboarding: shows with Neovim Mode (Recommended) pre-selected");
+              "onboarding: shows with Controller Mode (Recommended) pre-selected");
         const auto cards = findItems(win->contentItem(), "onboardingCard");
         QStringList texts;
         visibleWords(win, &texts);
         const QString all = texts.join('\n');
-        check(cards.size() == 3 && all.contains("Neovim Mode") && all.contains("Gaming Mode") && all.contains("Mouse Mode")
-                  && all.contains("Recommended") && !all.contains("Arrow", Qt::CaseInsensitive),
-              "onboarding: exactly three cards, no arrows mode", QString::number(cards.size()));
+        check(cards.size() == 4 && all.contains("Controller Mode") && all.contains("Neovim Mode")
+                  && all.contains("Gaming Mode") && all.contains("Mouse Mode") && all.contains("Recommended")
+                  && !all.contains("Arrow", Qt::CaseInsensitive),
+              "onboarding: four cards (Controller / Neovim / Gaming / Mouse), no arrows mode",
+              QString::number(cards.size()));
         const QImage shot = win->grabWindow();
         check(forbiddenPixels(shot) == 0 && qRed(shot.pixel(4, 4)) == 0 && qGreen(shot.pixel(4, 4)) == 0,
               "onboarding: #000000 + gold, no blue/green");
@@ -1086,8 +1096,8 @@ void uiTests()
         sendKey(win, Qt::Key_W, Qt::NoModifier, "w");
         sendKey(win, Qt::Key_Return);
         settle(300);
-        check(!backend.firstLaunch() && backend.navMode() == "vim" && !modal->isVisible(),
-              "onboarding: Enter confirms Neovim and closes", backend.navMode());
+        check(!backend.firstLaunch() && backend.navMode() == "controller" && !modal->isVisible(),
+              "onboarding: Enter confirms Controller and closes", backend.navMode());
     }
 
     // Cmd+, Command Settings: Mode, UI Scale, Default Model & Effort, keybinds.
@@ -1099,23 +1109,24 @@ void uiTests()
         QStringList texts;
         visibleWords(win, &texts);
         const QString all = texts.join('\n');
-        check(all.contains("Neovim") && all.contains("Gaming") && all.contains("Mouse") && !all.contains("arrows", Qt::CaseInsensitive),
-              "settings: Mode shows Neovim / Gaming / Mouse only");
+        check(all.contains("Controller") && all.contains("Neovim") && all.contains("Gaming") && all.contains("Mouse")
+                  && !all.contains("arrows", Qt::CaseInsensitive),
+              "settings: Mode shows Controller / Neovim / Gaming / Mouse only");
         check(all.contains("UI Scale") && all.contains("1.00x") && all.contains("0.75x – 1.60x") && all.contains("wheel"),
               "settings: UI scale with range and wheel hint");
         check(all.contains("Default Model") && all.contains("Sonnet 5.5") && all.contains("Default Effort"),
               "settings: default model & effort");
-        check(all.contains("h j k l") && all.contains("accept prediction") && all.contains("g  G"),
-              "settings: Neovim keybind cheat-sheet");
+        check(all.contains("confirm") && all.contains("settings"),
+              "settings: Controller keybind cheat-sheet");
         QStringList pairs;
         check(textOverlaps(win, &pairs) == 0, "settings: no overlapping text", pairs.join("; "));
         check(forbiddenPixels(win->grabWindow()) == 0, "settings: no blue/green pixels");
-        sendKey(win, Qt::Key_L, Qt::NoModifier, "l");  // row 0: Mode -> Gaming
+        sendKey(win, Qt::Key_L, Qt::NoModifier, "l");  // row 0: Mode -> Neovim
         settle(50);
-        check(backend.navMode() == "wasd", "settings: l on Mode switches to Gaming", backend.navMode());
+        check(backend.navMode() == "vim", "settings: l on Mode switches to Neovim", backend.navMode());
         texts.clear();
         visibleWords(win, &texts);
-        check(texts.join('\n').contains("w a s d"), "settings: cheat-sheet follows the mode");
+        check(texts.join('\n').contains("h j k l"), "settings: cheat-sheet follows the mode");
         sendKey(win, Qt::Key_H, Qt::NoModifier, "h");
         sendKey(win, Qt::Key_J, Qt::NoModifier, "j");  // row 1: UI scale
         sendKey(win, Qt::Key_L, Qt::NoModifier, "l");
@@ -1129,7 +1140,7 @@ void uiTests()
               "settings: keys stay in the overlay");
         sendKey(win, Qt::Key_Escape);
         settle(250);
-        check(ov && !ov->isVisible() && backend.navMode() == "vim" && backend.chatModel() == "claude-sonnet-5-5"
+        check(ov && !ov->isVisible() && backend.navMode() == "controller" && backend.chatModel() == "claude-sonnet-5-5"
                   && qFuzzyCompare(backend.uiScale(), 1.0),
               "settings: Esc closes; values as set", backend.navMode() + " " + backend.chatModel());
         settle(1400);  // scale pill fades
@@ -1997,9 +2008,9 @@ void gamepadUiTests()
     tap([](S &s) { s.b = true; });
     check(prop(onboarding, "open").toBool(), "pad ui: ○ cannot skip onboarding");
     tap([](S &s) { s.a = true; });
-    check(!prop(onboarding, "open").toBool() && backend.navMode() == "wasd", "pad ui: ✕ confirms onboarding (wasd)",
+    check(!prop(onboarding, "open").toBool() && backend.navMode() == "vim", "pad ui: ✕ confirms onboarding (vim)",
           backend.navMode());
-    backend.setNavMode(QStringLiteral("vim"));
+    backend.setNavMode(QStringLiteral("controller"));
     settle(250);
 
     // Constellation: L1 / R1 and the stick move the island ring, △ accepts the prediction.

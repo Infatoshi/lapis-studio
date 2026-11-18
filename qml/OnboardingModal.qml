@@ -12,7 +12,10 @@ FocusScope {
     signal done()
 
     readonly property var cards: [
-        { id: "vim", name: "Neovim Mode", tag: "Recommended",
+        { id: "controller", name: "Controller Mode", tag: "Recommended",
+          line: "L-stick / d-pad move · ✕ confirm · ○ back · □ write-up · △ tab",
+          keys: "DualShock 4 / gamepad. Keys and ⇥ Tab still work." },
+        { id: "vim", name: "Neovim Mode", tag: "",
           line: "h j k l move · g G first and last · ⏎ zoom · esc back · space write-up",
           keys: "Zero mouse. ⇥ Tab accepts the predicted next step." },
         { id: "wasd", name: "Gaming Mode", tag: "",
@@ -47,7 +50,7 @@ FocusScope {
             choice = Math.min(cards.length - 1, choice + 1);
         else if (k === Qt.Key_Up || k === Qt.Key_K || k === Qt.Key_W || k === Qt.Key_Backtab)
             choice = Math.max(0, choice - 1);
-        else if (k >= Qt.Key_1 && k <= Qt.Key_3)
+        else if (k >= Qt.Key_1 && k <= Qt.Key_4)
             choice = k - Qt.Key_1;
         else if (k === Qt.Key_Return || k === Qt.Key_Enter || k === Qt.Key_E || k === Qt.Key_Space)
             confirm();

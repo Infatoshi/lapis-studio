@@ -16,7 +16,7 @@ FocusScope {
     // UI zoom (0.75..1.60) and input mode ("vim" | "wasd" | "mouse"), persisted by the backend.
     // There is no arrows mode; arrow keys are a silent fallback in every mode.
     readonly property real uiScale: backend ? backend.uiScale : 1.0
-    readonly property string navMode: backend ? backend.navMode : "vim"
+    readonly property string navMode: backend ? backend.navMode : "controller"
 
     // --- Tab next-action predictor -------------------------------------------------------------
     property var visited: []        // project keys zoomed into this session
@@ -923,7 +923,7 @@ FocusScope {
                 font.pixelSize: 13
             }
             Repeater {
-                model: ["vim", "wasd", "mouse"]
+                model: ["controller", "vim", "wasd", "mouse"]
                 Text {
                     required property string modelData
                     objectName: "navOption"

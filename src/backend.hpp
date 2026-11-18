@@ -228,7 +228,7 @@ public:
     Q_INVOKABLE void zoomBy(double factor) { setUiScale(m_uiScale * factor); }
     Q_INVOKABLE void resetZoom() { setUiScale(1.0); }
     Q_INVOKABLE void cycleNavMode();
-    static QStringList navModes() { return {QStringLiteral("vim"), QStringLiteral("wasd"), QStringLiteral("mouse")}; }
+    static QStringList navModes() { return {QStringLiteral("controller"), QStringLiteral("vim"), QStringLiteral("wasd"), QStringLiteral("mouse")}; }
     // True when the interactive launch found no prefs file: the onboarding modal shows.
     bool firstLaunch() const { return m_firstLaunch; }
     Q_INVOKABLE void completeOnboarding(const QString &mode);  // picks the mode and writes the file now
@@ -421,7 +421,7 @@ private:
     QString m_defaultFolder;
     QString m_toast;
     double m_uiScale = 1.0;
-    QString m_navMode = QStringLiteral("vim");
+    QString m_navMode = QStringLiteral("controller");
     bool m_firstLaunch = false;
     QString m_chatModel = QStringLiteral("claude-sonnet-5-5");
     QString m_chatEffort = QStringLiteral("low");
