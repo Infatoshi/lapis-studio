@@ -143,6 +143,11 @@ FocusScope {
         property: "fontScale"
         value: app.uiScale
     }
+    Binding {
+        target: Theme
+        property: "theme"
+        value: backend ? backend.theme : "gold"
+    }
     function zoomBy(f) { if (backend) backend.zoomBy(f); }
     function setZoom(s) { if (backend) backend.uiScale = s; }
 

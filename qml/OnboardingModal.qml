@@ -129,7 +129,7 @@ FocusScope {
                     width: tagText.implicitWidth + 20
                     height: 26
                     radius: 13
-                    color: Qt.rgba(0.878, 0.624, 0.243, 0.16)
+                    color: Theme.goldA(0.16)
                     Text {
                         id: tagText
                         anchors.centerIn: parent

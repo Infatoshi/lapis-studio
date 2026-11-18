@@ -111,7 +111,7 @@ Item {
                         height: 54
                         width: (editing ? editor.contentWidth : label.implicitWidth) + 48
                         radius: 27
-                        color: modelData.pinned ? Qt.rgba(0.878, 0.624, 0.243, 0.12) : "transparent"
+                        color: modelData.pinned ? Theme.goldA(0.12) : "transparent"
                         border.width: 1.5
                         border.color: modelData.pinned ? Theme.gold : Theme.copper
                         opacity: 0

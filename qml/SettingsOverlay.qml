@@ -19,7 +19,11 @@ FocusScope {
         { id: "wasd", name: "Gaming", tag: "" },
         { id: "mouse", name: "Mouse", tag: "" }
     ]
-    readonly property int rowCount: 6
+    readonly property int rowCount: 7
+    readonly property var themes: [
+        { id: "gold", name: "Gold" },
+        { id: "lapis", name: "Lapis Blue" }
+    ]
     readonly property var keybinds: mode === "controller" ? [
             ["✕", "confirm"], ["○", "back"], ["△", "tab"], ["□", "prose"],
             ["L1 R1", "slide"], ["L2 R2", "zoom"], ["☰", "settings"], ["pad", "new session"]]
@@ -82,7 +86,8 @@ FocusScope {
         case 2: backend.cycleModel(d); break;
         case 3: backend.cycleEffort(d); break;
         case 4: backend.modelSuggestions = d > 0; break;
-        case 5: openControllerMap(); break;
+        case 5: backend.theme = d > 0 ? "lapis" : "gold"; break;
+        case 6: openControllerMap(); break;
         }
     }
 
@@ -107,7 +112,7 @@ FocusScope {
         } else if (k === Qt.Key_Left || k === Qt.Key_H || k === Qt.Key_A) {
             change(-1);
         } else if (k === Qt.Key_Return || k === Qt.Key_Enter) {
-            if (row === 5)
+            if (row === 6)
                 openControllerMap();
             else
                 hide();
@@ -134,7 +139,7 @@ FocusScope {
         radius: 28
         color: "#000000"
         border.width: 1.5
-        border.color: Qt.rgba(0.878, 0.624, 0.243, 0.55)
+        border.color: Theme.goldA(0.55)
         MouseArea { anchors.fill: parent }  // clicks inside never close it
 
         Column {
@@ -181,7 +186,7 @@ FocusScope {
                             width: modeName.implicitWidth + (modeTag.visible ? modeTag.implicitWidth + 14 : 0) + 36
                             height: 40
                             radius: 20
-                            color: current ? Qt.rgba(0.878, 0.624, 0.243, 0.14) : "transparent"
+                            color: current ? Theme.goldA(0.14) : "transparent"
                             border.width: 1.5
                             border.color: current ? Theme.gold : Theme.line
                             Row {
@@ -344,8 +349,44 @@ FocusScope {
                 }
             }
 
+            // 5. Accent theme
             SettingRow {
                 index: 5
+                caption: "Theme"
+                Row {
+                    spacing: 12
+                    anchors.verticalCenter: parent.verticalCenter
+                    Repeater {
+                        model: root.themes
+                        Rectangle {
+                            required property var modelData
+                            objectName: "settingsTheme"
+                            readonly property bool current: (root.backend ? root.backend.theme : "gold") === modelData.id
+                            // No colour swatch: gold mode must stay free of blue pixels, and the
+                            // selected pill already shows its accent.
+                            width: themeName.implicitWidth + 36
+                            height: 40
+                            radius: 20
+                            color: current ? Theme.goldA(0.14) : "transparent"
+                            border.width: 1.5
+                            border.color: current ? Theme.gold : Theme.line
+                            Text {
+                                id: themeName
+                                anchors.centerIn: parent
+                                text: parent.modelData.name
+                                color: parent.current ? Theme.gold : Theme.dim
+                                font.family: Theme.sans
+                                font.pixelSize: 18
+                                font.weight: Font.DemiBold
+                            }
+                            TapHandler { onTapped: { root.row = 5; if (root.backend) root.backend.theme = modelData.id; } }
+                        }
+                    }
+                }
+            }
+
+            SettingRow {
+                index: 6
                 caption: "Controller"
                 Row {
                     spacing: 14
@@ -353,19 +394,19 @@ FocusScope {
                         width: ctrlMapLbl.implicitWidth + 28
                         height: 36
                         radius: 18
-                        color: root.row === 5 ? "#1b1408" : "#11100e"
+                        color: root.row === 6 ? "#1b1408" : "#11100e"
                         border.width: 1
-                        border.color: root.row === 5 ? Theme.gold : Theme.line
+                        border.color: root.row === 6 ? Theme.gold : Theme.line
                         Text {
                             id: ctrlMapLbl
                             anchors.centerIn: parent
                             text: "Controller Mapping  →"
-                            color: root.row === 5 ? Theme.gold : Theme.ink
+                            color: root.row === 6 ? Theme.gold : Theme.ink
                             font.family: Theme.sans
                             font.pixelSize: 15
                             font.weight: Font.Medium
                         }
-                        TapHandler { onTapped: { root.row = 5; root.openControllerMap(); } }
+                        TapHandler { onTapped: { root.row = 6; root.openControllerMap(); } }
                     }
                     Text {
                         text: "Remap DualShock 4 buttons, triggers, and sticks (C)"

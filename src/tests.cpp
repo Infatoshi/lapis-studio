@@ -837,6 +837,49 @@ void unitTests()
         }
     }
 
+    // Accent theme persists in studio_prefs.json: gold (default) -> lapis -> gold.
+    {
+        QTemporaryDir tmp;
+        const QString path = tmp.path() + "/studio_prefs.json";
+        auto fileTheme = [&path] {
+            QFile f(path);
+            return f.open(QIODevice::ReadOnly) ? QJsonDocument::fromJson(f.readAll()).object().value("theme").toString()
+                                               : QStringLiteral("<missing>");
+        };
+        {
+            Backend w(Backend::Mode::Mock);
+            check(w.theme() == "gold", "theme: default is gold", w.theme());
+            w.setPrefsPath(path);
+            w.setTheme("teal");
+            check(w.theme() == "gold", "theme: unknown id ignored", w.theme());
+            w.setTheme("lapis");
+            check(w.theme() == "lapis" && w.savePrefs() && fileTheme() == "lapis", "theme: lapis written to prefs",
+                  w.theme() + " / " + fileTheme());
+        }
+        {
+            Backend r(Backend::Mode::Mock);
+            r.setPrefsPath(path);
+            check(r.theme() == "lapis", "theme: lapis survives relaunch", r.theme());
+            r.setTheme("gold");
+            check(r.savePrefs() && fileTheme() == "gold", "theme: back to gold written", fileTheme());
+        }
+        {
+            Backend r(Backend::Mode::Mock);
+            r.setPrefsPath(path);
+            check(r.theme() == "gold", "theme: gold -> lapis -> gold round trip", r.theme());
+        }
+        {
+            QFile f(path);
+            if (f.open(QIODevice::WriteOnly))
+                f.write("{\"theme\": \"neon\"}");
+        }
+        {
+            Backend r(Backend::Mode::Mock);
+            r.setPrefsPath(path);
+            check(r.theme() == "gold", "theme: bad file value falls back to gold", r.theme());
+        }
+    }
+
     // lapis-viz and other media printed by tools become video / image artifacts.
     {
         const QByteArray claude =
@@ -1251,6 +1294,40 @@ void uiTests()
                   && qFuzzyCompare(backend.uiScale(), 1.0),
               "settings: Esc closes; values as set", backend.navMode() + " " + backend.chatModel());
         settle(1400);  // scale pill fades
+    }
+
+    // Settings Theme row: l -> Lapis Blue (blue accents appear), h -> Gold (zero blue again).
+    // Every forbiddenPixels check in this suite assumes gold, so this block must end on gold.
+    {
+        sendKey(win, Qt::Key_Comma, Qt::ControlModifier);
+        settle(250);
+        QQuickItem *ov = firstItem(win, "settingsOverlay");
+        for (int i = 0; i < 5; ++i)
+            sendKey(win, Qt::Key_J, Qt::NoModifier, "j");
+        QStringList texts;
+        visibleWords(win, &texts);
+        check(ov && ov->property("row").toInt() == 5 && texts.join('\n').contains("Lapis Blue"),
+              "theme: Settings shows a Theme row (Gold / Lapis Blue) at row 5");
+        check(forbiddenPixels(win->grabWindow()) == 0, "theme: gold mode shows no blue, not even in the Theme row");
+        sendKey(win, Qt::Key_Right);
+        settle(250);
+        const QImage lapisShot = win->grabWindow();
+        int accent = 0;
+        for (int y = 0; y < lapisShot.height(); ++y)
+            for (int x = 0; x < lapisShot.width(); ++x) {
+                const QRgb c = lapisShot.pixel(x, y);
+                accent += std::abs(qRed(c) - 0x4f) < 10 && std::abs(qGreen(c) - 0x8c) < 10 && std::abs(qBlue(c) - 0xff) < 10;
+            }
+        check(backend.theme() == "lapis" && accent > 20, "theme: → switches to Lapis Blue; #4f8cff accent on screen",
+              QStringLiteral("%1 px").arg(accent));
+        check(qRed(lapisShot.pixel(4, 4)) == 0 && qGreen(lapisShot.pixel(4, 4)) == 0 && qBlue(lapisShot.pixel(4, 4)) == 0,
+              "theme: lapis keeps the #000000 OLED background");
+        sendKey(win, Qt::Key_Left);
+        settle(250);
+        check(backend.theme() == "gold" && forbiddenPixels(win->grabWindow()) == 0,
+              "theme: ← back to Gold; zero blue/green pixels again", backend.theme());
+        sendKey(win, Qt::Key_Escape);
+        settle(250);
     }
 
     // Morning Briefing: B on the Constellation; changed / active projects only, two lines each.
@@ -2680,6 +2757,33 @@ void openAiCompatUnitTests()
     check(b.recentActions().size() == 12 && b.recentActions().first() == "act 3"
               && b.recentActions().last() == "act 14",
           "openai-compat: recordAction keeps last 12 actions for intent inference");
+
+    // KV pre-warm: one token, not streamed, and the same system + pinned-context prefix as an ask.
+    {
+        const QString model = QStringLiteral("qwen3.8-flash-next");
+        const QString ctx = QStringLiteral("Project: lapis (~/dev/lapis).\nLast 2 turns:\nUser: why\nAssistant: KV");
+        const QJsonObject warm = QJsonDocument::fromJson(buildOpenAiWarmRequest(model, kCompatSystemPrompt, ctx)).object();
+        const QJsonObject ask = QJsonDocument::fromJson(
+            buildOpenAiCompatRequest(model, kCompatSystemPrompt, ctx, QStringLiteral("what changed?"), QStringLiteral("low"))).object();
+        const QJsonArray wm = warm.value("messages").toArray();
+        const QJsonArray am = ask.value("messages").toArray();
+        check(warm.value("max_tokens").toInt() == 1 && warm.contains("stream") && !warm.value("stream").toBool(true)
+                  && warm.value("model").toString() == model,
+              "kv warm: max_tokens 1, stream false, same model");
+        check(wm.size() == 2 && am.size() == 3 && wm[0] == am[0] && wm[1] == am[1]
+                  && wm[1].toObject().value("content").toString() == "Pinned context:\n" + ctx,
+              "kv warm: messages are a byte-identical prefix of the ask's");
+        check(!warm.contains("reasoning_effort"), "kv warm: no effort field (nothing is generated)");
+
+        Backend m(Backend::Mode::Mock);
+        m.setOpenaiCompatUrl(QStringLiteral("http://127.0.0.1:9/v1"));
+        const QVariantList ps = m.projects();
+        if (!ps.isEmpty())
+            m.setFocusedProject(ps.first().toMap().value("key").toString());
+        m.warmProjectPrefix(QStringLiteral("anything"));
+        check(m.warmRequests() == 0 && m.spawnCount() == 0, "kv warm: mock mode never sends a warm request",
+              QString::number(m.warmRequests()));
+    }
 }
 
 Turn mkTurn(const QString &role, const QString &text)

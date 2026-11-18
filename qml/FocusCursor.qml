@@ -115,7 +115,7 @@ Item {
         radius: root.round ? height / 2 : ring.radius + 4 * root.grow
         color: "transparent"
         border.width: 1
-        border.color: Qt.rgba(0.878, 0.624, 0.243, 0.22 * root.grow)
+        border.color: Theme.goldA(0.22 * root.grow)
         antialiasing: true
         visible: root.grow > 0.02
     }
@@ -135,7 +135,7 @@ Item {
         radius: 13
         color: "#000000"
         border.width: 1
-        border.color: Qt.rgba(0.878, 0.624, 0.243, 0.6)
+        border.color: Theme.goldA(0.6)
         opacity: 0.4 + 0.6 * root.grow
         Text {
             id: hintText

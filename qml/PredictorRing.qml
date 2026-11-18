@@ -82,7 +82,7 @@ Item {
         radius: root.sRound ? width / 2 : root.sRadius + 10
         color: "transparent"
         border.width: 2
-        border.color: Qt.rgba(0.878, 0.624, 0.243, 0.10 + 0.22 * (1 - root.phase))
+        border.color: Theme.goldA(0.10 + 0.22 * (1 - root.phase))
         antialiasing: true
     }
     Rectangle {
@@ -96,7 +96,7 @@ Item {
         radius: root.sRound ? width / 2 : root.sRadius + 6
         color: "transparent"
         border.width: 2
-        border.color: Qt.rgba(0.878, 0.624, 0.243, 0.70 + 0.30 * root.phase)  // #e09f3e
+        border.color: Theme.goldA(0.70 + 0.30 * root.phase)  // #e09f3e
         antialiasing: true
     }
 
@@ -138,7 +138,7 @@ Item {
                 width: tabKey.implicitWidth + 14
                 height: 22
                 radius: 6
-                color: Qt.rgba(0.878, 0.624, 0.243, 0.16)
+                color: Theme.goldA(0.16)
                 anchors.verticalCenter: parent.verticalCenter
                 Text {
                     id: tabKey

@@ -141,6 +141,12 @@ struct OpenAiSseEvent {
 QByteArray buildOpenAiCompatRequest(const QString &model, const QString &systemPrompt,
                                       const QString &context, const QString &question,
                                       const QString &effort = QString());
+// KV pre-warm: the same system + "Pinned context:" messages as buildOpenAiCompatRequest, so the
+// server prefills (and caches) that prefix; max_tokens 1, not streamed, and no question message.
+QByteArray buildOpenAiWarmRequest(const QString &model, const QString &systemPrompt,
+                                  const QString &context);
+// The quick-ask system prompt shared by asks and warms (byte-identical prefix).
+extern const QString kCompatSystemPrompt;
 OpenAiSseEvent parseOpenAiSseLine(const QByteArray &line);
 
 // Human-interest filter: the request asking the fast model to keep only what matches the human's
@@ -181,6 +187,7 @@ class Backend : public QObject {
     Q_PROPERTY(QString toast READ toast NOTIFY toastChanged)
     Q_PROPERTY(double uiScale READ uiScale WRITE setUiScale NOTIFY prefsChanged)
     Q_PROPERTY(QString navMode READ navMode WRITE setNavMode NOTIFY prefsChanged)
+    Q_PROPERTY(QString theme READ theme WRITE setTheme NOTIFY prefsChanged)
     Q_PROPERTY(bool firstLaunch READ firstLaunch NOTIFY prefsChanged)
     Q_PROPERTY(QString chatModel READ chatModel WRITE setChatModel NOTIFY prefsChanged)
     Q_PROPERTY(QString chatEffort READ chatEffort WRITE setChatEffort NOTIFY prefsChanged)
@@ -266,6 +273,10 @@ public:
     QString navMode() const { return m_navMode; }
     void setUiScale(double s);
     void setNavMode(const QString &mode);
+    // Accent theme: "gold" (default, #e09f3e / #b5653b) | "lapis" (Lapis Blue, #4f8cff / #2d5aa8).
+    QString theme() const { return m_theme; }
+    void setTheme(const QString &theme);  // unknown ids are ignored
+    static QStringList themes() { return {QStringLiteral("gold"), QStringLiteral("lapis")}; }
     Q_INVOKABLE void zoomBy(double factor) { setUiScale(m_uiScale * factor); }
     Q_INVOKABLE void resetZoom() { setUiScale(1.0); }
     Q_INVOKABLE void cycleNavMode();
@@ -304,6 +315,11 @@ public:
     // Async, one request in flight; repeats for the same project + transcript mtime are dropped.
     Q_INVOKABLE void filterForHuman(const QString &projectKey);
     int filterRequests() const { return m_filterRequests; }
+    // Live only, with an OpenAI-compatible endpoint: opening an island prefills the fast model's
+    // KV cache with exactly the prefix the next ask sends (system prompt + contextFor(key, 0)).
+    // Async, fire-and-forget; repeats for the same project + transcript mtime are dropped.
+    Q_INVOKABLE void warmProjectPrefix(const QString &projectKey);
+    int warmRequests() const { return m_warmRequests; }
     // Island metrics stay hidden unless pinned for that project.
     Q_INVOKABLE void toggleMetricPin(const QString &projectKey);
     // What the latest ask was routed to (tests): model, effort and channel key.
@@ -482,6 +498,7 @@ private:
     QString m_toast;
     double m_uiScale = 1.0;
     QString m_navMode = QStringLiteral("controller");
+    QString m_theme = QStringLiteral("gold");
     bool m_firstLaunch = false;
     QString m_chatModel = QStringLiteral("claude-sonnet-5-5");
     QString m_chatEffort = QStringLiteral("low");
@@ -516,6 +533,8 @@ private:
     QSet<QString> m_filterDone;                 // "key@mtime" already asked (no respamming)
     QStringList m_filterQueue;                  // project keys waiting for the slot
     int m_filterRequests = 0;
+    QSet<QString> m_warmDone;                   // "key@mtime" already prefilled
+    int m_warmRequests = 0;
     QString compatEndpoint() const;             // "" when no OpenAI-compatible URL is configured
     QVariantList m_briefing;
     QString m_briefingSource;

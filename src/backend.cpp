@@ -696,12 +696,13 @@ QString channelKeyFor(const QString &model, const QString &effort)
     return {};
 }
 
-QByteArray buildOpenAiCompatRequest(const QString &model, const QString &systemPrompt,
-                                      const QString &context, const QString &question,
-                                      const QString &effort)
+const QString kCompatSystemPrompt = QStringLiteral(
+    "You are Lapis Studio's fast-feedback engineering assistant. "
+    "Answer concisely in plain English, grounded in the pinned context.");
+
+// System prompt + pinned context: the cacheable prefix shared by asks and KV warms.
+static QJsonArray compatPrefixMessages(const QString &systemPrompt, const QString &context)
 {
-    // Keep the shared system prompt and pinned repo/artifact context at the front of `messages`
-    // so prefix-caching backends (e.g. 1600-token KV blocks) reuse prefilled KV across turns.
     QJsonArray msgs;
     if (!systemPrompt.isEmpty())
         msgs << QJsonObject{{QStringLiteral("role"), QStringLiteral("system")},
@@ -709,6 +710,26 @@ QByteArray buildOpenAiCompatRequest(const QString &model, const QString &systemP
     if (!context.isEmpty())
         msgs << QJsonObject{{QStringLiteral("role"), QStringLiteral("user")},
                             {QStringLiteral("content"), QStringLiteral("Pinned context:\n") + context}};
+    return msgs;
+}
+
+QByteArray buildOpenAiWarmRequest(const QString &model, const QString &systemPrompt, const QString &context)
+{
+    QJsonObject body;
+    body.insert(QStringLiteral("model"), model);
+    body.insert(QStringLiteral("stream"), false);
+    body.insert(QStringLiteral("max_tokens"), 1);
+    body.insert(QStringLiteral("messages"), compatPrefixMessages(systemPrompt, context));
+    return QJsonDocument(body).toJson(QJsonDocument::Compact);
+}
+
+QByteArray buildOpenAiCompatRequest(const QString &model, const QString &systemPrompt,
+                                      const QString &context, const QString &question,
+                                      const QString &effort)
+{
+    // Keep the shared system prompt and pinned repo/artifact context at the front of `messages`
+    // so prefix-caching backends (e.g. 1600-token KV blocks) reuse prefilled KV across turns.
+    QJsonArray msgs = compatPrefixMessages(systemPrompt, context);
     msgs << QJsonObject{{QStringLiteral("role"), QStringLiteral("user")},
                         {QStringLiteral("content"), QStringLiteral("Question: ") + question}};
     QJsonObject body;
@@ -1156,6 +1177,17 @@ void Backend::setNavMode(const QString &mode)
         m_prefsSave.start();
 }
 
+void Backend::setTheme(const QString &theme)
+{
+    const QString t = theme.trimmed().toLower();
+    if (!themes().contains(t) || t == m_theme)
+        return;
+    m_theme = t;
+    emit prefsChanged();
+    if (!m_prefsPath.isEmpty())
+        m_prefsSave.start();
+}
+
 void Backend::cycleNavMode()
 {
     const QStringList modes = navModes();
@@ -1198,8 +1230,10 @@ void Backend::setFocusedProject(const QString &key)
     m_fresh.remove(key);  // opening a project reads its new turns
     publish();
     emit projectsChanged();  // focusedProject itself changed, even when the list did not
-    if (!key.isEmpty())
-        filterForHuman(key);  // no-op unless live with an OpenAI-compatible endpoint
+    if (!key.isEmpty()) {
+        warmProjectPrefix(key);  // both no-ops unless live with an OpenAI-compatible endpoint
+        filterForHuman(key);
+    }
 }
 
 void Backend::mockAppendTurn(const QString &key, const Turn &t)
@@ -1312,6 +1346,8 @@ void Backend::loadPrefs()
         nav = QStringLiteral("wasd");  // files written before arrows mode was dropped
     if (navModes().contains(nav))
         m_navMode = nav;
+    const QString theme = o.value(QLatin1String("theme")).toString().trimmed().toLower();
+    m_theme = themes().contains(theme) ? theme : QStringLiteral("gold");
     const QString model = o.value(QLatin1String("defaultModel")).toString();
     if (specFor(model))
         m_chatModel = model;
@@ -1395,6 +1431,7 @@ bool Backend::savePrefs()
     QJsonObject o;
     o.insert(QStringLiteral("uiScale"), m_uiScale);
     o.insert(QStringLiteral("navMode"), m_navMode);
+    o.insert(QStringLiteral("theme"), m_theme);
     o.insert(QStringLiteral("defaultModel"), m_chatModel);
     o.insert(QStringLiteral("defaultEffort"), m_chatEffort);
     o.insert(QStringLiteral("modelSuggestions"), m_modelSuggestions);
@@ -2141,13 +2178,13 @@ void Backend::askOpenAiCompat(const QString &projectKey, int artifactIndex, cons
     m_compatBuf.clear();
     m_quickChannel = channelKeyFor(m_chatModel, m_chatEffort);
 
-    static const QString kSystemPrompt = QStringLiteral(
-        "You are Lapis Studio's fast-feedback engineering assistant. "
-        "Answer concisely in plain English, grounded in the pinned context.");
-    QString ctx = contextFor(projectKey, artifactIndex);
+    // Recent actions ride with the question, not the pinned context, so the context message stays
+    // byte-identical to the one warmProjectPrefix() prefilled when the island opened.
+    const QString ctx = contextFor(projectKey, artifactIndex);
+    QString q = question;
     if (!m_recentActions.isEmpty())
-        ctx += QStringLiteral("\nRecent user actions:\n- ") + m_recentActions.join(QStringLiteral("\n- "));
-    const QByteArray payload = buildOpenAiCompatRequest(model, kSystemPrompt, ctx, question, m_chatEffort);
+        q += QStringLiteral("\n\nRecent user actions:\n- ") + m_recentActions.join(QStringLiteral("\n- "));
+    const QByteArray payload = buildOpenAiCompatRequest(model, kCompatSystemPrompt, ctx, q, m_chatEffort);
 
     QNetworkRequest req{QUrl(endpoint)};
     req.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json"));
@@ -3144,11 +3181,66 @@ void Backend::filterForHuman(const QString &projectKey)
             if (!r.stateLine.isEmpty() || !r.summary.isEmpty()) {
                 m_humanFilter.insert(projectKey, HumanFilter{mtime, r.stateLine, r.summary, r.form});
                 publish();
+                // A summary artifact's context now carries the filtered key points: re-warm.
+                if (projectKey == m_focusedProject)
+                    warmProjectPrefix(projectKey);
             }
         }
         // Next project waiting for the slot, if any.
         while (!m_filterQueue.isEmpty() && !m_filterReply)
             filterForHuman(m_filterQueue.takeFirst());
+    });
+}
+
+// --- KV-cache pre-warm -----------------------------------------------------------------------
+
+void Backend::warmProjectPrefix(const QString &projectKey)
+{
+    if (m_mode != Mode::Live || projectKey.isEmpty())
+        return;
+    const QString endpoint = compatEndpoint();
+    if (endpoint.isEmpty())
+        return;
+    const Project *p = find(projectKey);
+    if (!p)
+        return;
+    // Redacted (infinity) projects never leave the process.
+    if (std::any_of(p->sessions.cbegin(), p->sessions.cend(), [](const SessionInfo &s) { return s.redacted; }))
+        return;
+    const QString ctx = contextFor(projectKey, 0);
+    if (ctx.isEmpty())
+        return;
+    // key@mtime, plus the context hash: the human filter can rewrite a summary artifact's text
+    // without the transcript changing, and that is a different prefix.
+    const QString tag = QStringLiteral("%1@%2@%3").arg(projectKey).arg(p->mtime).arg(qHash(ctx));
+    if (m_warmDone.contains(tag))
+        return;
+    if (m_warmDone.size() > 512)
+        m_warmDone.clear();
+    m_warmDone.insert(tag);
+    ++m_warmRequests;
+
+    QString model = m_openaiCompatModel;
+    if (model.isEmpty())
+        model = qEnvironmentVariable("LAPIS_OPENAI_COMPAT_MODEL").trimmed();
+    if (model.isEmpty())
+        model = QStringLiteral("qwen3.8-flash-next");
+    QString apiKey = m_openaiCompatKey;
+    if (apiKey.isEmpty())
+        apiKey = qEnvironmentVariable("LAPIS_OPENAI_COMPAT_KEY").trimmed();
+
+    QNetworkRequest req{QUrl(endpoint)};
+    req.setTransferTimeout(30000);
+    req.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json"));
+    if (!apiKey.isEmpty())
+        req.setRawHeader("Authorization", QByteArray("Bearer ") + apiKey.toUtf8());
+    QNetworkReply *reply = m_nam.post(req, buildOpenAiWarmRequest(model, kCompatSystemPrompt, ctx));
+    // Fire-and-forget: the server keeps the prefilled KV; the one token is discarded. A failed
+    // warm drops its tag so the next focus retries.
+    connect(reply, &QNetworkReply::finished, this, [this, reply, tag] {
+        if (reply->error() != QNetworkReply::NoError)
+            m_warmDone.remove(tag);
+        reply->deleteLater();
     });
 }
 

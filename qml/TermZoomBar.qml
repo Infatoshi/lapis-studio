@@ -89,7 +89,7 @@ Item {
                 width: pillText.implicitWidth + 34
                 height: 32
                 radius: 16
-                color: open ? Qt.rgba(0.878, 0.624, 0.243, 0.14) : "transparent"
+                color: open ? Theme.goldA(0.14) : "transparent"
                 border.width: sel || open ? 1.5 : 1
                 border.color: sel || open ? Theme.gold : (term ? Theme.faint : Theme.line)
                 Text {

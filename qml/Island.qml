@@ -79,7 +79,7 @@ Item {
                 radius: 12
                 color: "transparent"
                 border.width: 1
-                border.color: Qt.rgba(0.878, 0.624, 0.243, 0.55)
+                border.color: Theme.goldA(0.55)
                 Text {
                     id: freshText
                     objectName: "freshBadgeText"

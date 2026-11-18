@@ -164,7 +164,7 @@ Item {
         radius: 34
         color: "transparent"
         border.width: 1.5
-        border.color: Qt.rgba(0.878, 0.624, 0.243, 0.5)
+        border.color: Theme.goldA(0.5)
         // StudioApp's focus cursor takes over whenever it is on screen (one ring, not two).
         opacity: root.cursorActive ? 0 : 1 - root.recede
         antialiasing: true

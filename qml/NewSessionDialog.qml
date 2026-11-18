@@ -173,7 +173,7 @@ Item {
                     height: 46
                     width: hl.implicitWidth + 40
                     radius: 23
-                    color: on ? Qt.rgba(0.878, 0.624, 0.243, 0.14) : "transparent"
+                    color: on ? Theme.goldA(0.14) : "transparent"
                     border.width: 1.5
                     border.color: on ? Theme.gold : Theme.line
                     Text {

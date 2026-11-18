@@ -94,7 +94,7 @@ FocusScope {
         radius: 28
         color: "#0b0a08"
         border.width: 1.5
-        border.color: Qt.rgba(0.878, 0.624, 0.243, 0.55)
+        border.color: Theme.goldA(0.55)
         MouseArea { anchors.fill: parent }  // clicks inside never close it
 
         Column {

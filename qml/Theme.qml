@@ -2,13 +2,17 @@ pragma Singleton
 import QtQuick
 
 QtObject {
+    // "gold" (default) | "lapis". StudioApp binds it to backend.theme. Only the accent pair
+    // changes: gold #e09f3e / copper #b5653b, or Lapis Blue #4f8cff / #2d5aa8, both on OLED black.
+    property string theme: "gold"
+    readonly property bool lapis: theme === "lapis"
     readonly property color bg: "#000000"
     readonly property color card: "#0d0c0b"
     readonly property color cardHi: "#14120f"
     readonly property color line: "#1d1915"
     readonly property color track: "#1a1714"
-    readonly property color gold: "#e09f3e"
-    readonly property color copper: "#b5653b"
+    readonly property color gold: lapis ? "#4f8cff" : "#e09f3e"    // primary accent
+    readonly property color copper: lapis ? "#2d5aa8" : "#b5653b"  // secondary accent
     readonly property color ink: "#e8d5b5"
     readonly property color text: "#d9cfc3"
     readonly property color dim: "#6e665e"
@@ -29,4 +33,6 @@ QtObject {
     // UI zoom (0.75..1.60): StudioApp binds it to backend.uiScale; text sizes multiply by it.
     property real fontScale: 1.0
     function px(n) { return Math.round(n * fontScale); }
+    // The primary accent at alpha A (tints, rings, borders), so they follow the theme.
+    function goldA(a) { return Qt.rgba(gold.r, gold.g, gold.b, a); }
 }

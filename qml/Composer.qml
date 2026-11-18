@@ -474,7 +474,7 @@ Item {
             radius: 22
             color: Theme.card
             border.width: input.activeFocus ? 1 : 0
-            border.color: Qt.rgba(0.878, 0.624, 0.243, 0.35)
+            border.color: Theme.goldA(0.35)
 
             // "about regs: 128  ×": the next Enter asks about this parameter.
             Rectangle {
@@ -486,7 +486,7 @@ Item {
                 width: visible ? scopeText.implicitWidth + 26 : 0
                 height: 34
                 radius: 17
-                color: Qt.rgba(0.878, 0.624, 0.243, 0.14)
+                color: Theme.goldA(0.14)
                 border.width: 1
                 border.color: Theme.gold
                 Text {
@@ -507,7 +507,7 @@ Item {
                 anchors.verticalCenter: parent.verticalCenter
                 visible: input.text.length === 0 && !input.inputMethodComposing
                 text: root.suggestion.length > 0 ? root.suggestion : "Ask"
-                color: root.suggestion.length > 0 ? Qt.rgba(0.878, 0.624, 0.243, 0.55) : Theme.faint
+                color: root.suggestion.length > 0 ? Theme.goldA(0.55) : Theme.faint
                 elide: Text.ElideRight
                 font.family: Theme.sans
                 font.pixelSize: Theme.px(23)
@@ -672,7 +672,7 @@ Item {
                     ctx.arc(7, 7, 5, 0, Math.PI * 2);
                     ctx.stroke();
                     if (p > 0.01) {
-                        ctx.strokeStyle = "#e09f3e";
+                        ctx.strokeStyle = Theme.gold;
                         ctx.beginPath();
                         ctx.arc(7, 7, 5, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * p);
                         ctx.stroke();
