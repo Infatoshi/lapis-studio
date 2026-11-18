@@ -544,6 +544,22 @@ void unitTests()
         check(tailWords("one two three four five", 3) == QStringLiteral("… three four five")
                   && tailWords("a b", 3) == "a b",
               "thinking: the live line keeps the newest words", tailWords("one two three four five", 3));
+        // Raw tool-call markup never reaches the quick line or the trace.
+        auto clean = [](const char *s) { return stripToolNoise(QString::fromUtf8(s)).simplified(); };
+        const QString a1 = clean(
+            "Checking the kernel.\n<tool_call>{\"name\":\"bash\",\"arguments\":{\"cmd\":\"nvidia-smi\"}}</tool_call>\nIt is 126 tok/s.");
+        check(a1 == "Checking the kernel. It is 126 tok/s.", "noise: <tool_call> block stripped from the answer", a1);
+        const QString a2 = clean("{\"name\": \"read_file\", \"arguments\": {\"path\": \"x\"}}\nThe diff swaps the tile to 128.");
+        check(a2 == "The diff swaps the tile to 128.", "noise: JSON tool-call line dropped", a2);
+        const QString a3 = clean(
+            "Short answer.<|tool_calls_section_begin|><|tool_call_begin|>functions.run:0<|tool_call_argument_begin|>{}<|tool_call_end|><|tool_calls_section_end|>");
+        check(a3 == "Short answer.", "noise: special tool tokens stripped", a3);
+        const QString a4 = clean("Looking.\n<function_calls>\n<invoke name=\"bash\">\n<parameter name=\"cmd\">ls");
+        check(a4 == "Looking.", "noise: an unclosed block mid-stream is cut to the end", a4);
+        const QString a5 = QStringLiteral("Use a {tile} of 128 [see run 3] <- faster");
+        check(stripToolNoise(a5) == a5, "noise: plain prose with braces and brackets is untouched", stripToolNoise(a5));
+        const QString t1 = tailWords(stripToolNoise(QStringLiteral("weighing KV layout\n[tool_call: run_command]\nthen the answer")), 40);
+        check(t1 == "weighing KV layout then the answer", "noise: [tool_call: ...] lines leave the thinking line", t1);
     }
 
     // Honest speed classes in the catalog and picker.
@@ -1201,6 +1217,83 @@ void uiTests()
               p2.value("targetId").toString());
     }
 
+    // Controller hints + the element-aware focus cursor on the Constellation.
+    {
+        settle(700);
+        QQuickItem *key = firstItem(win, "tabBadgeKey");
+        check(backend.navMode() == "controller" && key && key->property("text").toString() == "R1 Tab",
+              "hints: Controller mode badge names the bound button (R1 Tab), not ⇥",
+              key ? key->property("text").toString() : "none");
+        QQuickItem *ring = firstItem(win, "focusCursorRing");
+        QQuickItem *hint = firstItem(win, "focusCursorHintText");
+        const auto isl = findItems(win->contentItem(), "island");
+        auto islandScene = [&](int i) {
+            QQuickItem *it = isl.value(i);
+            return it ? it->parentItem()->mapRectToScene(QRectF(it->x(), it->y(), it->width(), it->height())) : QRectF();
+        };
+        auto ringScene = [&] { return ring->mapRectToScene(QRectF(0, 0, ring->width(), ring->height())); };
+        const int sel = app->property("selectedIsland").toInt();
+        check(ring && ring->isVisible() && firstItem(win, "focusCursor")->opacity() > 0.9, "cursor: visible on the Constellation");
+        if (ring && isl.value(sel)) {
+            const QRectF rr = ringScene(), ir = islandScene(sel);
+            check(qAbs(rr.center().x() - ir.center().x()) < 1.5 && qAbs(rr.center().y() - ir.center().y()) < 1.5 && rr.contains(ir),
+                  "cursor: ring wraps the selected island",
+                  QStringLiteral("ring %1,%2 island %3,%4").arg(rr.center().x()).arg(rr.center().y()).arg(ir.center().x()).arg(ir.center().y()));
+            QObject *pen = ring->property("border").value<QObject *>();
+            check(pen && pen->property("color").value<QColor>() == QColor("#e09f3e"), "cursor: ring border is #e09f3e");
+            check(rr.width() - ir.width() > 20, "cursor: ring opens up around the element once it lands",
+                  QString::number(rr.width() - ir.width()));
+        }
+        check(hint && hint->isVisible() && hint->property("text").toString() == "✕ Expand",
+              "cursor: contextual hint reads ✕ Expand on an island", hint ? hint->property("text").toString() : "none");
+        QQuickItem *fr = firstItem(win, "focusRing");
+        check(fr && fr->opacity() < 0.01, "cursor: the old island ring yields to the cursor (one ring, not two)");
+        {
+            QStringList pairs;
+            check(textOverlaps(win, &pairs) == 0, "cursor: hint chip overlaps no text", pairs.join("; "));
+        }
+        // Spring: critically damped at a fixed 240 Hz step, so a hop never overshoots and lands fast.
+        if (ring && isl.size() > sel + 1) {
+            const double x0 = ringScene().center().x();
+            const double tx = islandScene(sel + 1).center().x();
+            sendKey(win, Qt::Key_Right);
+            QElapsedTimer clock;
+            clock.start();
+            bool overshoot = false;
+            qint64 landed = -1;
+            while (clock.elapsed() < 600) {
+                settle(4);
+                const double x = ringScene().center().x();
+                overshoot = overshoot || (tx > x0 ? x > tx + 0.5 : x < tx - 0.5);
+                if (landed < 0 && qAbs(x - tx) < 1.0)
+                    landed = clock.elapsed();
+            }
+            check(!overshoot, "cursor: spring hop has zero overshoot", QStringLiteral("x0 %1 target %2").arg(x0).arg(tx));
+            check(landed >= 0 && landed <= 400, "cursor: spring hop lands within 1 px in <= 400 ms", QString::number(landed) + " ms");
+            std::printf("info  focus cursor hop landed within 1 px after %lld ms (wall clock, offscreen)\n",
+                        static_cast<long long>(landed));
+            sendKey(win, Qt::Key_Left);
+            settle(500);
+        }
+        // Keyboard modes speak keys: ⇥ Tab, ⏎ / E to expand. Mouse mode has no cursor.
+        backend.setNavMode("vim");
+        settle(50);
+        check(key && key->property("text").toString() == "⇥ Tab", "hints: vim mode badge reads ⇥ Tab",
+              key ? key->property("text").toString() : "none");
+        check(hint && hint->property("text").toString() == "⏎ Expand", "cursor: vim hint reads ⏎ Expand",
+              hint ? hint->property("text").toString() : "none");
+        backend.setNavMode("wasd");
+        settle(50);
+        check(hint && hint->property("text").toString() == "E Expand", "cursor: wasd hint reads E Expand",
+              hint ? hint->property("text").toString() : "none");
+        backend.setNavMode("mouse");
+        settle(300);
+        check(firstItem(win, "focusCursor")->opacity() < 0.05 && fr && fr->opacity() > 0.9,
+              "cursor: mouse mode hides the cursor, the plain island ring returns");
+        backend.setNavMode("controller");
+        settle(300);
+    }
+
     // UI zoom: plain wheel on the Constellation, Cmd +/-/0, the 1.2 s pill, islands and text grow.
     {
         QQuickItem *isl0 = findItems(win->contentItem(), "island").value(0);
@@ -1337,6 +1430,50 @@ void uiTests()
         check(QFontInfo(mono).family() == "Menlo", "ui: Menlo resolves", QFontInfo(mono).family());
     }
     check(firstItem(win, "chartView") != nullptr, "ui: first artifact is a chart");
+    {
+        // On the Stage the cursor wraps the artifact and offers ✕ Prompt; the composer speaks pad.
+        settle(500);
+        QQuickItem *hint = firstItem(win, "focusCursorHintText");
+        check(hint && hint->isVisible() && hint->property("text").toString() == "✕ Prompt",
+              "cursor: Stage hint reads ✕ Prompt", hint ? hint->property("text").toString() : "none");
+        QQuickItem *ring = firstItem(win, "focusCursorRing");
+        QQuickItem *chart = firstItem(win, "chartView");
+        if (ring && chart) {
+            const QRectF rr = ring->mapRectToScene(QRectF(0, 0, ring->width(), ring->height()));
+            const QRectF cr = chart->mapRectToScene(QRectF(0, 0, chart->width(), chart->height()));
+            check(rr.contains(cr.adjusted(2, 2, -2, -2)), "cursor: ring wraps the Stage artifact",
+                  QStringLiteral("ring %1x%2 chart %3x%4").arg(rr.width()).arg(rr.height()).arg(cr.width()).arg(cr.height()));
+        }
+        QQuickItem *hints = firstItem(win, "composerHints");
+        const QString ht = hints ? hints->property("text").toString() : QString();
+        check(ht.contains("L2 Voice") && !ht.contains("○ Back") && !ht.contains("⏎"),
+              "hints: composer shows controller glyphs in Controller mode", ht);
+        QQuickItem *composer = firstItem(win, "composer");
+        QMetaObject::invokeMethod(composer, "focusInput", Q_ARG(QVariant, QVariant(QStringLiteral("why"))));
+        settle(50);
+        const QString hf = hints ? hints->property("text").toString() : QString();
+        check(hf.contains("R2 Send") && hf.contains("✕ Select") && hf.contains("○ Back") && !hf.contains("⏎"),
+              "hints: typing shows R2 Send, ✕ Select, ○ Back", hf);
+        // The cursor follows focus into the composer (no chip there: the bar carries its own hints).
+        QQuickItem *bar = firstItem(win, "composerBar");
+        if (ring && bar) {
+            settle(450);
+            const QRectF rr = ring->mapRectToScene(QRectF(0, 0, ring->width(), ring->height()));
+            const QRectF br = bar->mapRectToScene(QRectF(0, 0, bar->width(), bar->height()));
+            check(rr.contains(br) && qAbs(rr.center().y() - br.center().y()) < 1.5, "cursor: wraps the composer while typing");
+        }
+        check(hint && !firstItem(win, "focusCursorHint")->isVisible(), "cursor: no chip over the composer");
+        if (QQuickItem *in = firstItem(win, "composerInput"))
+            in->setProperty("text", QString());
+        QMetaObject::invokeMethod(app, "takeFocus");
+        settle(450);
+        backend.setNavMode("vim");
+        settle(50);
+        const QString hv = hints ? hints->property("text").toString() : QString();
+        check(hv.contains("⏎ ask") && !hv.contains("R2"), "hints: composer shows keys in vim mode", hv);
+        backend.setNavMode("controller");
+        settle(50);
+    }
     scanBanned(win, "stage");
 
     // Stage text scales with the UI zoom.
@@ -1880,9 +2017,16 @@ void gamepadUnitTests()
         press([](S &s) { s.menu = true; });
         press([](S &s) { s.options = true; });
         press([](S &s) { s.touchpad = true; });
-        check(log.names() == "confirm,back,tab,secondary,zoomReset,zoom,step,step,settings,newSession,newSession",
+        check(log.names() == "confirm,back,step,secondary,zoomReset,zoom,step,tab,settings,newSession,newSession",
               "pad: ✕ ○ △ □ L3 R3 L1 R1 ☰ share touchpad map once per press", log.names());
-        check(log.evs.value(6).a == -1 && log.evs.value(7).a == 1, "pad: L1 steps -1, R1 steps +1");
+        check(log.evs.value(2).a == 1 && log.evs.value(6).a == -1, "pad: △ steps +1 (Next View), L1 steps -1 (Previous View)");
+        check(log.evs.value(7).name == "tab", "pad: R1 is Tab / Full Send");
+        check(g.glyphFor("accept_prediction") == "R1" && g.glyphFor("step_next") == "△" && g.glyphFor("step_prev") == "L1"
+                  && g.glyphFor("confirm") == "✕" && g.glyphFor("none").isEmpty(),
+              "pad: glyphFor names the bound button (R1 Tab, △ next, L1 previous)", g.glyphFor("accept_prediction"));
+        check(g.actionLabel("accept_prediction") == "Tab / Full Send" && g.actionLabel("step_prev") == "Previous View"
+                  && g.actionLabel("step_next") == "Next View",
+              "pad: plain-English action labels", g.actionLabel("step_prev"));
         log.evs.clear();
         S s;
         s.options = true;
@@ -2055,10 +2199,10 @@ void gamepadUiTests()
     backend.setNavMode(QStringLiteral("controller"));
     settle(250);
 
-    // Constellation: L1 / R1 and the stick move the island ring, △ accepts the prediction.
+    // Constellation: L1 / △ and the stick move the island ring, R1 accepts the prediction.
     app->setProperty("selectedIsland", 0);
-    tap([](S &s) { s.r1 = true; });
-    check(prop(app, "selectedIsland").toInt() == 1, "pad ui: R1 selects the next island");
+    tap([](S &s) { s.y = true; });
+    check(prop(app, "selectedIsland").toInt() == 1, "pad ui: △ selects the next island (Next View)");
     tap([](S &s) { s.l1 = true; });
     check(prop(app, "selectedIsland").toInt() == 0, "pad ui: L1 selects the previous island");
     tap([](S &s) { s.lx = 1.0; });
@@ -2068,10 +2212,10 @@ void gamepadUiTests()
     {
         const int before = prop(app, "predictorAccepts").toInt();
         const bool predicted = !prop(app, "predictedAction").isNull();
-        tap([](S &s) { s.y = true; });
+        tap([](S &s) { s.r1 = true; });
         settle(400);
         check(predicted && prop(app, "predictorAccepts").toInt() == before + 1 && prop(app, "lens").toInt() > 0,
-              "pad ui: △ accepts the Tab prediction on the constellation", QString::number(prop(app, "lens").toInt()));
+              "pad ui: R1 accepts the Tab prediction on the constellation", QString::number(prop(app, "lens").toInt()));
         tap([](S &s) { s.b = true; });
         settle(400);
         check(prop(app, "lens").toInt() == 0, "pad ui: ○ zooms back out to the constellation");
@@ -2119,9 +2263,9 @@ void gamepadUiTests()
     check(prop(dialog, "open").toBool(), "pad ui: touchpad opens the new-session dialog");
     tap([](S &s) { s.dpadX = 1; });
     check(prop(dialog, "harnessIdx").toInt() == 1, "pad ui: d-pad right picks the next harness");
-    tap([](S &s) { s.r1 = true; });
+    tap([](S &s) { s.y = true; });
     check(prop(dialog, "modelIdx").toInt() == 1 || backend.harnessModels().value("codex").toList().size() < 2,
-          "pad ui: R1 picks the next model in the dialog");
+          "pad ui: △ picks the next model in the dialog");
     tap([](S &s) { s.b = true; });
     settle(150);
     check(!prop(dialog, "open").toBool(), "pad ui: ○ closes the dialog");
@@ -2154,8 +2298,8 @@ void gamepadUiTests()
     check(prop(app, "lens").toInt() == 2, "pad ui: ✕ on the Ladder zooms into the Stage");
     const int arts = prop(stage, "artifactCount").toInt();
     check(arts >= 4, "pad ui: the kickoff Stage has chart, diff, table, pdf", QString::number(arts));
-    tap([](S &s) { s.r1 = true; });
-    check(arts < 2 || prop(app, "artifactIndex").toInt() == 1, "pad ui: R1 slides to the next artifact");
+    tap([](S &s) { s.y = true; });
+    check(arts < 2 || prop(app, "artifactIndex").toInt() == 1, "pad ui: △ slides to the next artifact");
     tap([](S &s) { s.l1 = true; });
     check(prop(app, "artifactIndex").toInt() == 0, "pad ui: L1 slides back");
     tap([](S &s) { s.dpadX = 1; });
@@ -2243,9 +2387,9 @@ void gamepadUiTests()
     }
     tap([](S &s) { s.b = true; });
     check(!prop(composer, "pickerOpen").toBool() && prop(composer, "inputFocused").toBool(), "pad ui: ○ closes the picker, composer keeps focus");
-    tap([](S &s) { s.y = true; });
+    tap([](S &s) { s.r1 = true; });
     check(!prop(composer, "inputText").toString().isEmpty() || prop(app, "promptSuggestion").toString().isEmpty(),
-          "pad ui: △ in the composer accepts the suggested prompt", prop(composer, "inputText").toString());
+          "pad ui: R1 in the composer accepts the suggested prompt", prop(composer, "inputText").toString());
     tap([](S &s) { s.b = true; });
     tap([](S &s) { s.b = true; });
     check(!prop(composer, "inputFocused").toBool(), "pad ui: ○ clears then leaves the composer");

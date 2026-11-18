@@ -476,9 +476,31 @@ FocusScope {
     // backend.gamepad debounces the pad in C++ (stick / d-pad repeat, trigger hysteresis, 8 ms
     // right-stick scroll) and emits one signal per action; these route it to whatever is in charge,
     // topmost first: onboarding, new-session dialog, settings, model picker, composer, term pills,
-    // then the lens. ✕ confirm · ○ back · △ Tab · □ prose / picker · L1 R1 slide · L2 R2 zoom.
+    // then the lens. Defaults: ✕ select · ○ back · R1 Tab / Full Send · □ prose / picker ·
+    // L1 previous view · △ next view · L2 voice · R2 send.
     readonly property QtObject gamepad: backend ? backend.gamepad : null
     readonly property bool padConnected: gamepad ? gamepad.connected : false
+    // On-screen hints speak controller (R1 Tab, ✕ Select) in Controller mode or whenever a pad
+    // is connected; keyboard glyphs (⇥, ⏎) otherwise.
+    readonly property bool padHints: navMode === "controller" || padConnected
+    // action id -> bound glyph ("accept_prediction" -> "R1"), live across remaps. An unbound
+    // action has no entry, so its hint is left out rather than naming the wrong button.
+    readonly property var padGlyphs: {
+        if (!gamepad)
+            return { voice_hold: "L2", send: "R2", accept_prediction: "R1", confirm: "✕", back: "○",
+                     secondary: "□", step_prev: "L1", step_next: "△" };
+        const out = {};
+        const slots = gamepad.bindingSlots;
+        for (let i = slots.length - 1; i >= 0; --i)  // first bound input wins
+            out[slots[i].action] = slots[i].glyph;
+        return out;
+    }
+    function padKey(action) {
+        const g = padGlyphs[action];
+        return g !== undefined ? g : "";
+    }
+    // The key that confirms / interacts in the current input mode: ✕ (pad), E (wasd), ⏎ (else).
+    readonly property string confirmKey: padHints ? padKey("confirm") : (navMode === "wasd" ? "E" : "⏎")
     function padNav(dx, dy) {
         poke();
         if (controllerMap.open) {
@@ -540,7 +562,7 @@ FocusScope {
         else if (proseOpen) proseOpen = false;
         else if (lens > 0) { takeFocus(); goLens(0); }
     }
-    function padTriangle() {
+    function padAcceptPrediction() {
         poke();
         if (onboarding.open || dialog.open || settings.open)
             return;
@@ -625,7 +647,7 @@ FocusScope {
         function onConfirm() { app.padConfirm(); }
         function onBack() { app.padBack(); }
         function onBackHeld(down) { answers.setBackHeld(down); }
-        function onAcceptPrediction() { app.padTriangle(); }
+        function onAcceptPrediction() { app.padAcceptPrediction(); }
         function onSecondary() { app.padSecondary(); }
         function onStep(d) { app.padStep(d); }
         function onZoomStep(d) { app.padZoom(d); }
@@ -652,6 +674,7 @@ FocusScope {
         focusIndex: app.projectIdx
         visible: app.zoom < 0.999
         visited: app.visited
+        cursorActive: app.lens === 0 && focusCursor.active
         onEnter: (i) => app.enterProject(i)
         onZoomBy: (f) => app.zoomBy(f)
         onNewSession: dialog.show()
@@ -790,6 +813,8 @@ FocusScope {
                 live: app.backend ? app.backend.live : false
                 backend: app.backend
                 params: app.project && app.project.params ? app.project.params : []
+                padHints: app.padHints
+                padGlyphs: app.padGlyphs
                 onAskAbout: (p) => app.scopeToParam(p)
                 opacity: app.lens === 2 ? 1 : 0
                 visible: opacity > 0.005
@@ -824,6 +849,8 @@ FocusScope {
                 backend: app.backend
                 hasSession: app.project !== null && app.project.sessionCount > 0
                 navMode: app.navMode
+                padHints: app.padHints
+                padGlyphs: app.padGlyphs
                 suggestion: app.paramScope ? "" : app.promptSuggestion
                 scope: app.paramScope ? app.paramScope.name + (app.paramScope.value ? ": " + app.paramScope.value : "") : ""
                 onScopeCleared: app.paramScope = null
@@ -897,7 +924,7 @@ FocusScope {
         }
     }
 
-    // Tab predictor ring + "⇥ Tab" badge, over whichever lens is settled on screen.
+    // Tab predictor ring + "⇥ Tab" (or "R1 Tab") badge, over whichever lens is settled on screen.
     PredictorRing {
         id: predictor
         anchors.fill: parent
@@ -910,11 +937,69 @@ FocusScope {
         badgeSide: tid.startsWith("pager:") ? "right" : tid.startsWith("rung:") ? "left"
                    : tid === "newSession" ? "bottom" : "top"
         idle: app.idle
+        keyHint: app.padHints && app.padKey("accept_prediction").length > 0 ? app.padKey("accept_prediction") + " Tab" : "⇥ Tab"
         shown: p !== null && (app.zoom < 0.001 || app.zoom > 0.999) && !(app.lens === 2 && app.stageSliding)
                && !(app.lens === 2 && (stage.cardOpen || stage.terms.active))
                && !app.proseOpen && (app.lens !== 1 || ladder.opacity > 0.99) && (app.lens !== 2 || stage.opacity > 0.99)
     }
     readonly property bool stageSliding: stage.slideP < 1
+
+    // --- Focus cursor ---------------------------------------------------------------------------
+    // What the controller / keyboard is on right now, with the action its confirm key takes.
+    // Hidden in pure mouse mode, behind overlays, mid-zoom, and over the write-up.
+    readonly property var cursorSpec: {
+        const deps = [zoom, width, height, uiScale, lens, selectedIsland, artifactIndex, constellation.width,
+                      constellation.count, answers.inputFocused, answers.hasSelection, answers.inputText,
+                      answers.height, answers.pickerOpen, stage.width, stage.height, stage.barH, stage.kind,
+                      stage.terms.active, stage.terms.selected, stage.terms.count];
+        if (deps.length === 0 || (navMode === "mouse" && !padConnected))
+            return null;
+        if (settings.open || onboarding.open || dialog.open || controllerMap.open)
+            return null;
+        if (!(zoom < 0.001 || zoom > 0.999) || (proseOpen && !answers.inputFocused))
+            return null;
+        if (answers.inputFocused && lens > 0) {
+            if (answers.pickerOpen)
+                return null;
+            const sel = answers.hasSelection;
+            return { item: answers, r: answers.cursorRect(), radius: sel ? 8 : 22, round: false, side: "bottom", hint: "" };
+        }
+        if (lens === 0) {
+            if (constellation.count === 0)
+                return null;
+            const i = Math.max(0, Math.min(selectedIsland, constellation.count - 1));
+            return { item: constellation, r: constellation.islandRect(i), radius: 26, round: false, side: "bottom",
+                     hint: confirmKey.length > 0 ? confirmKey + " Expand" : "" };
+        }
+        if (lens === 2) {
+            if (stage.terms.active)
+                return { item: stage, r: stage.cursorRect(), radius: 16, round: true, side: "bottom", hint: "" };
+            if (!artifact)
+                return null;
+            // Pulled up 12 px at the bottom: the Stage ends 18 px above the composer, whose own
+            // predictor ring would otherwise touch this one.
+            const v = stage.cursorRect();
+            return { item: stage, r: Qt.rect(v.x, v.y, v.width, Math.max(0, v.height - 12)), radius: 18, round: false, side: "right",
+                     hint: confirmKey.length > 0 ? confirmKey + " Prompt" : "" };
+        }
+        return null;
+    }
+    readonly property rect cursorRect: {
+        const s = cursorSpec;
+        if (!s || s.r.width <= 0)
+            return Qt.rect(0, 0, 0, 0);
+        return s.item.mapToItem(app, s.r.x, s.r.y, s.r.width, s.r.height);
+    }
+    FocusCursor {
+        id: focusCursor
+        anchors.fill: parent
+        target: app.cursorRect
+        shown: app.cursorSpec !== null
+        cornerRadius: app.cursorSpec ? app.cursorSpec.radius : 26
+        round: app.cursorSpec ? app.cursorSpec.round : false
+        hint: app.cursorSpec ? app.cursorSpec.hint : ""
+        hintSide: app.cursorSpec ? app.cursorSpec.side : "bottom"
+    }
 
     // Keymap pill, bottom right: "nav vim" at rest; hover shows all three for a one-click switch.
     // Clicking the current mode (or Cmd+K) cycles arrows -> vim -> wasd; clicking another picks it.
@@ -1015,6 +1100,8 @@ FocusScope {
         id: dialog
         anchors.fill: parent
         backend: app.backend
+        padHints: app.padHints
+        padGlyphs: app.padGlyphs
         onClosed: app.takeFocus()
     }
 

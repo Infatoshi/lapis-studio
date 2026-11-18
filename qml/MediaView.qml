@@ -17,7 +17,7 @@ Item {
     // Stage shows them; audio waits for a click. Offscreen modes never load a file (live is false).
     MediaPlayer {
         id: player
-        source: root.live && root.path.length > 0 ? "file://" + root.path : ""
+        source: root.live && root.path.length > 0 ? ("file://" + encodeURI(root.path)) : ""
         audioOutput: AudioOutput { muted: !root.audio }
         videoOutput: root.audio ? null : video
         loops: root.audio ? 1 : MediaPlayer.Infinite
@@ -29,6 +29,17 @@ Item {
         anchors.fill: parent
         visible: !root.audio
         fillMode: VideoOutput.PreserveAspectFit
+    }
+
+    Text {
+        anchors.centerIn: parent
+        visible: !root.audio && (!root.live || player.error !== MediaPlayer.NoError || !player.hasVideo)
+        text: player.error !== MediaPlayer.NoError
+              ? ("Video unavailable: " + player.errorString)
+              : (root.path.length > 0 ? "Video ready (click to play)" : "No video frame")
+        color: Theme.dim
+        font.family: Theme.mono
+        font.pixelSize: Theme.px(14)
     }
 
     // Waveform

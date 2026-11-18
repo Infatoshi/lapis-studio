@@ -8,6 +8,7 @@ Item {
     property real recede: 0       // 0..1: the zoom into a project (siblings shrink to 0.94 and fade)
     property int focusIndex: -1   // the island that is the shared element of that zoom
     property var visited: []      // project keys zoomed into this session (StudioApp keeps it)
+    property bool cursorActive: false  // the app-wide focus cursor is wrapping the selected island
     signal enter(int index)
     signal zoomBy(real factor)
     signal newSession()
@@ -164,7 +165,8 @@ Item {
         color: "transparent"
         border.width: 1.5
         border.color: Qt.rgba(0.878, 0.624, 0.243, 0.5)
-        opacity: 1 - root.recede
+        // StudioApp's focus cursor takes over whenever it is on screen (one ring, not two).
+        opacity: root.cursorActive ? 0 : 1 - root.recede
         antialiasing: true
         Behavior on x { enabled: root.recede < 0.01; NumberAnimation { duration: Theme.hopMs; easing.type: Easing.OutExpo } }
         Behavior on y { enabled: root.recede < 0.01; NumberAnimation { duration: Theme.hopMs; easing.type: Easing.OutExpo } }

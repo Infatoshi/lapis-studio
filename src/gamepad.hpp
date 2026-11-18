@@ -138,6 +138,8 @@ public:
     Q_INVOKABLE QString actionFor(const QString &inputId) const;
     Q_INVOKABLE QString actionLabel(const QString &actionId) const;
     Q_INVOKABLE QString inputLabel(const QString &inputId) const;
+    // The compact glyph ("R1", "✕") of the first input bound to actionId, empty when unbound.
+    Q_INVOKABLE QString glyphFor(const QString &actionId) const;
     QVariantList bindingSlots() const;
     QVariantList availableActions() const;
 

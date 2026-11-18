@@ -19,6 +19,26 @@ Item {
     height: col.height
 
     property string navMode: "vim"
+    // Controller hints (StudioApp: Controller mode or a pad connected) and the bound glyph per
+    // action ("send" -> "R2"); an unbound action has no entry and its hint is dropped.
+    property bool padHints: false
+    property var padGlyphs: ({})
+    function padHint(action, word) {
+        const g = padGlyphs[action];
+        return g !== undefined && g.length > 0 ? g + " " + word : "";
+    }
+    function joinHints(parts) {
+        return parts.filter(s => s.length > 0).join("   ");
+    }
+    readonly property string barHints: padHints
+        // Send / Select / Back only while typing: outside the bar ○ is the lens's back, and the
+        // focus cursor's "✕ Prompt" already says how to start (the Stage stays under 40 words).
+        ? joinHints([suggestion.length > 0 && input.text.length === 0 ? padHint("accept_prediction", "Tab") : "",
+                     input.activeFocus ? padHint("send", "Send") : "", padHint("voice_hold", "Voice"),
+                     input.activeFocus && input.text.length > 0 ? padHint("confirm", "Select") : "",
+                     input.activeFocus ? padHint("back", "Back") : ""])
+        : (suggestion.length > 0 && input.text.length === 0 ? "⇥ accept   " : "")
+          + (hasSession ? "⏎ ask   ⌥⏎ think   ⌘⏎ steer" : "⏎ ask   ⌥⏎ think")
     property bool pickerOpen: false
     // Closing the strip warms the chosen model's daemon (live only), so the next Enter is warm.
     onPickerOpenChanged: if (!pickerOpen && backend) backend.warmChannel()
@@ -167,6 +187,17 @@ Item {
     function barRect() {
         return Qt.rect(bar.x, col.y + bar.y, bar.width, bar.height);
     }
+    // What the focus cursor wraps: the highlighted words while a selection is live, else the bar.
+    readonly property bool hasSelection: input.selectionEnd > input.selectionStart
+    function cursorRect() {
+        if (!hasSelection)
+            return barRect();
+        const a = input.positionToRectangle(input.selectionStart);
+        const b = input.positionToRectangle(input.selectionEnd);
+        const x0 = Math.max(0, Math.min(a.x, b.x));
+        const x1 = Math.min(input.width, Math.max(a.x, b.x));
+        return Qt.rect(bar.x + input.x + x0, col.y + bar.y + input.y + a.y, Math.max(8, x1 - x0), a.height);
+    }
 
     Column {
         id: col
@@ -263,7 +294,7 @@ Item {
                 anchors.left: tq.right
                 anchors.leftMargin: 18
                 anchors.baseline: tq.baseline
-                text: root.streaming ? "<think>" : "✦ Thought " + (root.hasTrace ? root.backend.traceSeconds.toFixed(1) : "0") + "s"
+                text: root.streaming ? "thinking …" : "✦ Thought " + (root.hasTrace ? root.backend.traceSeconds.toFixed(1) : "0") + "s"
                 color: root.streaming ? Theme.dim : Theme.copper
                 font.family: Theme.mono
                 font.pixelSize: Theme.px(17)
@@ -425,7 +456,9 @@ Item {
                 anchors.right: parent.right
                 anchors.rightMargin: 28
                 anchors.verticalCenter: parent.verticalCenter
-                text: "⏎ send   esc close"
+                objectName: "pickerHints"
+                text: root.padHints ? root.joinHints([root.padHint("send", "send"), root.padHint("back", "close")])
+                                    : "⏎ send   esc close"
                 color: Theme.faint
                 font.family: Theme.mono
                 font.pixelSize: Theme.px(14)
@@ -586,11 +619,11 @@ Item {
             }
             Text {
                 id: hints
+                objectName: "composerHints"
                 anchors.right: parent.right
                 anchors.rightMargin: 30
                 anchors.verticalCenter: parent.verticalCenter
-                text: (root.suggestion.length > 0 && input.text.length === 0 ? "⇥ accept   " : "")
-                      + (root.hasSession ? "⏎ ask   ⌥⏎ think   ⌘⏎ steer" : "⏎ ask   ⌥⏎ think")
+                text: root.barHints
                 color: Theme.faint
                 font.family: Theme.mono
                 font.pixelSize: Theme.px(16)
@@ -647,7 +680,8 @@ Item {
                 }
             }
             Text {
-                text: root.backHolding ? "Restoring…" : "Hold ○ to restore deleted text"
+                text: root.backHolding ? "Restoring…"
+                      : "Hold " + (root.padGlyphs.back !== undefined ? root.padGlyphs.back : "○") + " to restore deleted text"
                 color: root.backHolding ? Theme.gold : Theme.dim
                 font.family: Theme.mono
                 font.pixelSize: 11

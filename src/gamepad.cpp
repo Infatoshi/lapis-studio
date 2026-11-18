@@ -12,20 +12,21 @@ struct InputMeta {
     const char *id;
     const char *label;
     const char *group;
+    const char *glyph;  // compact on-screen hint ("R1", "✕")
 };
 const InputMeta kInputs[] = {
-    {"l2", "L2 Trigger", "Triggers & Bumpers"},
-    {"r2", "R2 Trigger", "Triggers & Bumpers"},
-    {"l1", "L1 Bumper", "Triggers & Bumpers"},
-    {"r1", "R1 Bumper", "Triggers & Bumpers"},
-    {"a", "✕ Cross", "Face Buttons"},
-    {"b", "○ Circle", "Face Buttons"},
-    {"x", "□ Square", "Face Buttons"},
-    {"y", "△ Triangle", "Face Buttons"},
-    {"l3", "L3 Stick Click", "Sticks & System"},
-    {"r3", "R3 Stick Click", "Sticks & System"},
-    {"menu", "Options ☰", "Sticks & System"},
-    {"options", "Share / Touchpad", "Sticks & System"},
+    {"l2", "L2 Trigger", "Triggers & Bumpers", "L2"},
+    {"r2", "R2 Trigger", "Triggers & Bumpers", "R2"},
+    {"l1", "L1 Bumper", "Triggers & Bumpers", "L1"},
+    {"r1", "R1 Bumper", "Triggers & Bumpers", "R1"},
+    {"a", "✕ Cross", "Face Buttons", "✕"},
+    {"b", "○ Circle", "Face Buttons", "○"},
+    {"x", "□ Square", "Face Buttons", "□"},
+    {"y", "△ Triangle", "Face Buttons", "△"},
+    {"l3", "L3 Stick Click", "Sticks & System", "L3"},
+    {"r3", "R3 Stick Click", "Sticks & System", "R3"},
+    {"menu", "Options ☰", "Sticks & System", "☰"},
+    {"options", "Share / Touchpad", "Sticks & System", "Share"},
 };
 
 struct ActionMeta {
@@ -39,9 +40,9 @@ const ActionMeta kActions[] = {
     {"confirm", "Interact / Confirm", "Zoom into island/stage or focus composer"},
     {"back", "Back / Zoom Out", "Step back or close current overlay"},
     {"secondary", "Write-up / Picker", "Toggle write-up or open model & effort picker"},
-    {"accept_prediction", "Tab / Prediction", "Accept Tab next-action prediction"},
-    {"step_prev", "Previous Slide / Island", "Step to previous island, artifact, or page"},
-    {"step_next", "Next Slide / Island", "Step to next island, artifact, or page"},
+    {"accept_prediction", "Tab / Full Send", "Accept the Tab prediction: open it, or fill the suggested prompt"},
+    {"step_prev", "Previous View", "Step to the previous island, artifact, or page"},
+    {"step_next", "Next View", "Step to the next island, artifact, or page"},
     {"zoom_in", "Zoom In (+10%)", "Increase UI / detail zoom by 10%"},
     {"zoom_out", "Zoom Out (-10%)", "Decrease UI / detail zoom by 10%"},
     {"zoom_reset", "Reset Zoom (1.00x)", "Reset UI / detail zoom back to 1.00x"},
@@ -57,11 +58,11 @@ QHash<QString, QString> GamepadState::defaultBindings()
         {QStringLiteral("l2"), QStringLiteral("voice_hold")},
         {QStringLiteral("r2"), QStringLiteral("send")},
         {QStringLiteral("l1"), QStringLiteral("step_prev")},
-        {QStringLiteral("r1"), QStringLiteral("step_next")},
+        {QStringLiteral("r1"), QStringLiteral("accept_prediction")},
         {QStringLiteral("a"), QStringLiteral("confirm")},
         {QStringLiteral("b"), QStringLiteral("back")},
         {QStringLiteral("x"), QStringLiteral("secondary")},
-        {QStringLiteral("y"), QStringLiteral("accept_prediction")},
+        {QStringLiteral("y"), QStringLiteral("step_next")},
         {QStringLiteral("l3"), QStringLiteral("zoom_reset")},
         {QStringLiteral("r3"), QStringLiteral("zoom_in")},
         {QStringLiteral("menu"), QStringLiteral("toggle_settings")},
@@ -329,6 +330,15 @@ QString Gamepad::inputLabel(const QString &inputId) const
     return inputId;
 }
 
+QString Gamepad::glyphFor(const QString &actionId) const
+{
+    const QHash<QString, QString> map = m_state.bindings();
+    for (const InputMeta &m : kInputs)
+        if (map.value(QString::fromLatin1(m.id)) == actionId)
+            return QString::fromUtf8(m.glyph);
+    return QString();
+}
+
 QVariantList Gamepad::bindingSlots() const
 {
     QVariantList out;
@@ -342,6 +352,7 @@ QVariantList Gamepad::bindingSlots() const
             {QStringLiteral("group"), QString::fromUtf8(m.group)},
             {QStringLiteral("action"), act},
             {QStringLiteral("actionLabel"), actionLabel(act)},
+            {QStringLiteral("glyph"), QString::fromUtf8(m.glyph)},
         };
     }
     return out;

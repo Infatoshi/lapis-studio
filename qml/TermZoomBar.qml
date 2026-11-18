@@ -16,6 +16,17 @@ Item {
     property int selected: 0
     property int expanded: -1     // index of the open card, -1 = none
     property real cardReveal: 1   // 0..1, the Stage drives it from its dim curve (crossfade, no overlap)
+    property bool padHints: false // controller glyphs instead of keys (StudioApp decides)
+    property var padGlyphs: ({})
+    function padHint(action, word) {
+        const g = padGlyphs[action];
+        return g !== undefined && g.length > 0 ? g + " " + word : "";
+    }
+    // The open pill's rect in this item's coordinates (the focus cursor wraps it).
+    function pillRect(i) {
+        const it = i >= 0 && i < pillRep.count ? pillRep.itemAt(i) : null;
+        return it ? Qt.rect(row.x + it.x, row.y + it.y, it.width, it.height) : Qt.rect(0, 0, 0, 0);
+    }
     signal askAbout(var param)
 
     // What is drawn: a snapshot of params, refreshed only while nobody is interacting.
@@ -99,7 +110,7 @@ Item {
             }
         }
         Text {
-            visible: root.count > 0 && !root.active && root.expanded < 0
+            visible: root.count > 0 && !root.active && root.expanded < 0 && !root.padHints
             anchors.verticalCenter: parent.verticalCenter
             text: "⌘P"
             color: Theme.faint
@@ -186,8 +197,12 @@ Item {
                 font.pixelSize: Theme.px(17)
             }
             Text {
-                text: root.active ? "⏎ ask about " + (card.p ? card.p.name : "") + "    ←→ next    esc close"
-                                  : "click again to close    ⌘P keys"
+                objectName: "paramCardHints"
+                text: root.padHints
+                      ? [root.padHint("confirm", "ask about " + (card.p ? card.p.name : "")), "←→ next",
+                         root.padHint("back", "close")].filter(t => t.length > 0).join("    ")
+                      : root.active ? "⏎ ask about " + (card.p ? card.p.name : "") + "    ←→ next    esc close"
+                                    : "click again to close    ⌘P keys"
                 color: Theme.faint
                 font.family: Theme.mono
                 font.pixelSize: Theme.px(13)

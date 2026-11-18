@@ -354,6 +354,39 @@ QString modelDisplayLabel(const QString &model)
     return model;
 }
 
+QString stripToolNoise(const QString &s)
+{
+    if (!s.contains(QLatin1Char('<')) && !s.contains(QLatin1Char('{')) && !s.contains(QLatin1Char('[')))
+        return s;  // the common case: plain prose, no regex work at all
+    using RE = QRegularExpression;
+    static const RE blocks(
+        QStringLiteral("<(?:\\w+:)?(tool_calls?|tool_use|tool_result|function_calls?|invoke)\\b[^>]*>"
+                       ".*?(</(?:\\w+:)?\\1>|$)"),
+        RE::DotMatchesEverythingOption | RE::CaseInsensitiveOption);
+    static const RE specialBlocks(
+        QStringLiteral("<[|\\x{FF5C}]tool[_\\x{2581}]calls?[_\\x{2581}](section[_\\x{2581}])?begin[|\\x{FF5C}]>"
+                       ".*?(<[|\\x{FF5C}]tool[_\\x{2581}]calls?[_\\x{2581}](section[_\\x{2581}])?end[|\\x{FF5C}]>|$)"),
+        RE::DotMatchesEverythingOption);
+    static const RE specialTokens(QStringLiteral("<[|\\x{FF5C}][^|\\x{FF5C}<>\\n]{1,48}[|\\x{FF5C}]>"));
+    static const RE strayTags(QStringLiteral("</?(?:\\w+:)?(tool_calls?|tool_use|tool_result|function_calls?|invoke|parameter)\\b[^>]*>"),
+                              RE::CaseInsensitiveOption);
+    static const RE jsonCall(QStringLiteral("^\\s*\\{\\s*\"(name|tool|tool_name|function)\"\\s*:.*\"(arguments|parameters|input|args)\"\\s*:"));
+    static const RE toolLine(QStringLiteral("^\\s*(\\[(tool|tool_call|tool_use|function_call)\\b[^\\]]*\\]|(tool call|calling tool|tool_call)\\s*[:(])"),
+                             RE::CaseInsensitiveOption);
+    QString out = s;
+    out.remove(blocks);
+    out.remove(specialBlocks);
+    out.remove(specialTokens);
+    out.remove(strayTags);
+    QStringList keep;
+    for (const QString &l : out.split(QLatin1Char('\n'))) {
+        if (jsonCall.match(l).hasMatch() || toolLine.match(l).hasMatch())
+            continue;
+        keep << l;
+    }
+    return keep.join(QLatin1Char('\n'));
+}
+
 QString tailWords(const QString &s, int maxWords)
 {
     const QStringList w = s.simplified().split(QLatin1Char(' '), Qt::SkipEmptyParts);
@@ -1898,7 +1931,7 @@ void Backend::noteThinking(const QString &delta)
     // The newest words, so the dim line keeps moving for as long as the model thinks. The raw
     // stream is kept whole: a delta's trailing space must survive until the next delta lands.
     m_quickThinkRaw += delta;
-    m_quickThinking = tailWords(m_quickThinkRaw, 40);
+    m_quickThinking = tailWords(stripToolNoise(m_quickThinkRaw), 40);
     if (m_quickPhase != QLatin1String("writing"))
         m_quickPhase = QStringLiteral("thinking");
 }
@@ -1919,7 +1952,7 @@ void Backend::appendAnswer(const QString &delta)
 {
     // Concatenate raw deltas, then clamp: trimming each delta first glued "No, " + "1001" into "No,1001".
     m_quickAnswerRaw += delta;
-    noteAnswer(oneLine(m_quickAnswerRaw, 40));
+    noteAnswer(oneLine(stripToolNoise(m_quickAnswerRaw), 40));
 }
 
 void Backend::onChannelOutput(const QString &key)
@@ -1993,7 +2026,7 @@ void Backend::onChannelOutput(const QString &key)
                 if (current) {
                     const QString resp = o.value(QLatin1String("result")).toObject().value(QLatin1String("response")).toString();
                     if (!resp.isEmpty())
-                        noteAnswer(oneLine(resp, 40));
+                        noteAnswer(oneLine(stripToolNoise(resp), 40));
                     const StreamProgress sp = agyProgress(o);
                     if (sp.thinkingTokens >= 0)
                         m_quickThinkTokens = sp.thinkingTokens;
@@ -2018,7 +2051,7 @@ void Backend::onChannelOutput(const QString &key)
                 if (v.toObject().value(QLatin1String("type")).toString() == QLatin1String("text"))
                     text += v.toObject().value(QLatin1String("text")).toString();
             if (!text.isEmpty()) {
-                noteAnswer(oneLine(text, 40));
+                noteAnswer(oneLine(stripToolNoise(text), 40));
                 changed = true;
             }
         } else if (type == QLatin1String("result")) {
@@ -2026,7 +2059,7 @@ void Backend::onChannelOutput(const QString &key)
             if (current) {
                 const QString r = o.value(QLatin1String("result")).toString();
                 if (!r.isEmpty())
-                    noteAnswer(oneLine(r, 40));
+                    noteAnswer(oneLine(stripToolNoise(r), 40));
                 done = true;
             }
         }
@@ -2249,7 +2282,7 @@ void Backend::finishTrace()
     m_traceBusy = false;
     if (m_traceSeconds <= 0)
         m_traceSeconds = m_traceClock.isValid() ? m_traceClock.elapsed() / 1000.0 : 0;
-    m_traceAnswer = oneLine(m_traceRaw, 28);
+    m_traceAnswer = oneLine(stripToolNoise(m_traceRaw), 28);
     emit traceChanged();
 }
 
@@ -2403,15 +2436,27 @@ void Backend::togglePin(const QString &projectKey, int index)
 
 void Backend::loadFolders()
 {
+    QStringList ordered;
+    auto addFolder = [&](const QString &raw) {
+        const QString t = tildePath(expandHome(raw));
+        if (!t.isEmpty() && t != QLatin1String("~") && t != QLatin1String("/tmp") && !ordered.contains(t))
+            ordered << t;
+    };
+    for (const Project &p : std::as_const(m_projects))
+        if (!isScratchDir(p.dir))
+            addFolder(p.dir);
     QDir dev(home() + QStringLiteral("/dev"));
-    QFileInfoList dirs = dev.entryInfoList(QDir::Dirs | QDir::NoDotAndDotDot, QDir::Time);
-    m_folders.clear();
+    const QFileInfoList dirs = dev.entryInfoList(QDir::Dirs | QDir::NoDotAndDotDot, QDir::Time);
     for (const QFileInfo &fi : dirs) {
-        if (m_folders.size() >= 60)
+        if (ordered.size() >= 18)
             break;
-        m_folders << tildePath(fi.absoluteFilePath());
+        if (QFileInfo::exists(fi.absoluteFilePath() + QStringLiteral("/.git")))
+            addFolder(fi.absoluteFilePath());
     }
-    m_defaultFolder = QStringLiteral("~/dev");
+    if (ordered.isEmpty())
+        ordered << QStringLiteral("~/dev");
+    m_folders = ordered;
+    m_defaultFolder = m_folders.first();
     emit foldersChanged();
 }
 

@@ -14,6 +14,8 @@ Item {
     property int direction: 1     // +1: the next artifact enters from the right
     property bool animate: false  // only slide while the Stage is on screen and settled
     property var params: []       // hyperparameter / term pills for this project
+    property bool padHints: false // controller glyphs in the pill card hints (StudioApp decides)
+    property var padGlyphs: ({})
     signal pick(int index)
     signal askAbout(var param)
 
@@ -103,6 +105,14 @@ Item {
         return Qt.rect(x, pager.y, i === artifactIndex ? 20 : 7, 7);
     }
 
+    // What the focus cursor wraps, in this item's coordinates: the selected term pill while the
+    // keyboard is in the pill row, else the artifact viewer of the settled pane.
+    function cursorRect() {
+        if (termBar.active)
+            return termBar.pillRect(termBar.selected);
+        return pane.viewerRect();
+    }
+
     function sameArtifact(a, b) {
         return a && b && a.kind === b.kind && a.title === b.title;
     }
@@ -147,6 +157,9 @@ Item {
         property bool current: false
         readonly property string kind: artifact ? artifact.kind : ""
         readonly property real titleHeight: title.height
+        function viewerRect() {  // where it lands (x = 0), not where the slide has it right now
+            return Qt.rect(viewer.x, p.y + viewer.y, viewer.width, viewer.height);
+        }
         function scrollBy(d) {
             if (viewer.item && viewer.item.scrollBy)
                 viewer.item.scrollBy(d);
@@ -308,6 +321,8 @@ Item {
         y: 0
         width: root.width
         params: root.params
+        padHints: root.padHints
+        padGlyphs: root.padGlyphs
         // The card fades in as the artifact dims: squared, so the two are never both above half
         // opacity on the same frame (dim 0.5 -> card 0.41).
         cardReveal: Math.pow((1 - root.dim) / 0.78, 2)

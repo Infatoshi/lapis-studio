@@ -36,10 +36,26 @@ FocusScope {
     readonly property QtObject gamepad: backend ? backend.gamepad : null
     readonly property bool padConnected: gamepad ? gamepad.connected : false
     readonly property string padName: gamepad && gamepad.controllerName.length > 0 ? gamepad.controllerName : "Gamepad"
-    readonly property var padBinds: [
-        ["L2", "voice"], ["R2", "send"], ["✕", "confirm"], ["○", "back"],
-        ["△", "tab"], ["□", "Write-up"], ["L1 R1", "slide"], ["R3", "zoom +"],
-        ["L3", "zoom 1x"], ["L-Stick", "nav"], ["R-Stick", "scroll"], ["☰", "settings"]]
+    // Live from the pad's bindings (defaults shown here), so a remap shows up at once; an action
+    // with no button bound is left out.
+    readonly property var padBinds: {
+        const g = gamepad;
+        if (g)
+            g.bindingSlots;  // re-evaluate on bindingsChanged
+        const rows = [["voice_hold", "L2", "voice"], ["send", "R2", "send"],
+                      ["accept_prediction", "R1", "Tab / Full Send"], ["confirm", "✕", "select"],
+                      ["back", "○", "back"], ["secondary", "□", "write-up"],
+                      ["step_prev", "L1", "previous view"], ["step_next", "△", "next view"],
+                      ["zoom_in", "R3", "zoom +"], ["zoom_reset", "L3", "zoom 1x"],
+                      ["toggle_settings", "☰", "settings"]];
+        const out = [];
+        for (const r of rows) {
+            const glyph = g ? g.glyphFor(r[0]) : r[1];
+            if (glyph.length > 0)
+                out.push([glyph, r[2]]);
+        }
+        return out.concat([["L-Stick", "nav"], ["R-Stick", "scroll"]]);
+    }
 
     function show() {
         row = 0;

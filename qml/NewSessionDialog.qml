@@ -6,6 +6,8 @@ Item {
     objectName: "newSessionDialog"
     property QtObject backend
     property bool open: false
+    property bool padHints: false  // controller glyphs in the key hint (StudioApp decides)
+    property var padGlyphs: ({})
     signal closed()
 
     readonly property var harnesses: ["claude", "codex", "agy"]
@@ -216,7 +218,14 @@ Item {
             anchors.right: parent.right
             anchors.rightMargin: 48
             y: 276
-            text: "↑↓ folder   ⌥←→ harness   ⌥↑↓ model   ⏎ start"
+            objectName: "dialogHints"
+            // Pad: stick up/down folder, left/right harness, L1 / △ model, ✕ or R2 start.
+            text: root.padHints
+                  ? ["↑↓ folder", "←→ harness",
+                     [root.padGlyphs.step_prev, root.padGlyphs.step_next].filter(g => g !== undefined).join(" ") + " model",
+                     root.padGlyphs.confirm !== undefined ? root.padGlyphs.confirm + " start" : ""]
+                    .filter(t => t.length > 0 && t !== " model").join("   ")
+                  : "↑↓ folder   ⌥←→ harness   ⌥↑↓ model   ⏎ start"
             color: Theme.faint
             font.family: Theme.mono
             font.pixelSize: 15

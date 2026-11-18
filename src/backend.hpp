@@ -106,6 +106,11 @@ StreamProgress agyProgress(const QJsonObject &line);     // agy stream-json (ste
 StreamProgress claudeProgress(const QJsonObject &line);  // claude stream-json (stream_event deltas)
 // The newest `maxWords` words of a stream (the live thinking line scrolls, it never freezes).
 QString tailWords(const QString &s, int maxWords);
+// Raw tool-call markup a model can leak into its thinking or answer stream (<tool_call>...,
+// <function_calls>, <|tool_call_begin|> tokens, JSON {"name":..,"arguments":..} lines), removed
+// so the quick line and the trace show only thinking and answer. Unclosed blocks (mid-stream)
+// are cut to the end.
+QString stripToolNoise(const QString &s);
 
 // OpenAI-compatible HTTP/SSE fast-feedback helpers (unit-tested).
 struct OpenAiSseEvent {
@@ -182,7 +187,7 @@ public:
     bool quickBusy() const { return m_quickBusy; }
     double quickSeconds() const { return m_quickSeconds; }
     QString traceQuestion() const { return m_traceQuestion; }
-    QString traceThinking() const { return m_traceThinking; }
+    QString traceThinking() const { return stripToolNoise(m_traceThinking); }
     QString traceAnswer() const { return m_traceAnswer; }
     bool traceBusy() const { return m_traceBusy; }
     double traceSeconds() const { return m_traceSeconds; }
