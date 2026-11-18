@@ -955,6 +955,7 @@ FocusScope {
         // One input at a time: the bound button alone with a controller ("R1"), "⇥ Tab" on keys.
         // An unbound accept action shows no key chip rather than a keyboard glyph.
         keyHint: app.padHints ? app.padKey("accept_prediction") : "⇥ Tab"
+        visible: opacity > 0.01 && !(app.lens === 2 && stage.cardOpen)
         shown: p !== null && (app.zoom < 0.001 || app.zoom > 0.999) && !(app.lens === 2 && app.stageSliding)
                && !(app.lens === 2 && (stage.cardOpen || stage.terms.active))
                && !app.proseOpen && (app.lens !== 1 || ladder.opacity > 0.99) && (app.lens !== 2 || stage.opacity > 0.99)
@@ -1014,6 +1015,13 @@ FocusScope {
         anchors.fill: parent
         target: app.cursorRect
         shown: app.cursorSpec !== null
+        Connections {
+            target: stage
+            function onCardOpenChanged() {
+                if (stage.cardOpen && app.lens === 2)
+                    focusCursor.snap();
+            }
+        }
         cornerRadius: app.cursorSpec ? app.cursorSpec.radius : 26
         round: app.cursorSpec ? app.cursorSpec.round : false
         hint: app.cursorSpec ? app.cursorSpec.hint : ""
