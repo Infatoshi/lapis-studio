@@ -524,6 +524,7 @@ private:
     QString m_activeCategory;
     QStringList m_selectedAgentIds;
     QStringList m_recentActions;
+    QStringList m_projectOrder;  // locks card slots so background updates never shuffle muscle memory
     Gamepad m_gamepad;
 
     QString m_quickQuestion, m_quickAnswer;

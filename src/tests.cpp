@@ -766,8 +766,12 @@ void unitTests()
         Turn t;
         t.role = "assistant";
         t.text = "Rerun with tile 128x64: 4.4x over eager.";
+        const int idxBefore = b.projectIndex("kernel-search");
         b.mockAppendTurn("kernel-search", t);
         b.mockAppendTurn("kernel-search", t);
+        check(b.projectIndex("kernel-search") == idxBefore,
+              "order: background turns never shuffle existing card positions",
+              QStringLiteral("%1 -> %2").arg(idxBefore).arg(b.projectIndex("kernel-search")));
         check(fresh("kernel-search") == 2, "fresh: background turns raise +2 on an unfocused island", QString::number(fresh("kernel-search")));
         b.setFocusedProject("kernel-search");
         check(fresh("kernel-search") == 0, "fresh: opening the project clears its badge");

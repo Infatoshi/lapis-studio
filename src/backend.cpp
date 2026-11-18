@@ -1576,11 +1576,30 @@ void Backend::publish()
 {
     QElapsedTimer clock;
     clock.start();
-    std::stable_sort(m_projects.begin(), m_projects.end(), [](const Project &a, const Project &b) {
-        if (a.pending != b.pending)
-            return a.pending;
-        return a.mtime > b.mtime;
-    });
+    // Lock existing card slots so transcript/mtime updates never shuffle the user's muscle memory.
+    // On first publish (empty m_projectOrder), seed order by pending then recency; after that,
+    // existing keys keep their exact indices and only newly discovered projects append at the end.
+    if (m_projectOrder.isEmpty()) {
+        std::stable_sort(m_projects.begin(), m_projects.end(), [](const Project &a, const Project &b) {
+            if (a.pending != b.pending)
+                return a.pending;
+            return a.mtime > b.mtime;
+        });
+        for (const Project &p : std::as_const(m_projects))
+            m_projectOrder << p.key;
+    } else {
+        for (const Project &p : std::as_const(m_projects)) {
+            if (!m_projectOrder.contains(p.key)) {
+                if (p.pending)
+                    m_projectOrder.prepend(p.key);
+                else
+                    m_projectOrder << p.key;
+            }
+        }
+        std::stable_sort(m_projects.begin(), m_projects.end(), [this](const Project &a, const Project &b) {
+            return m_projectOrder.indexOf(a.key) < m_projectOrder.indexOf(b.key);
+        });
+    }
     QVariantList list;
     for (const Project &p : m_projects) {
         if (list.size() >= 12)
