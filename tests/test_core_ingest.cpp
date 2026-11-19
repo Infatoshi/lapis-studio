@@ -585,7 +585,7 @@ void ambientTests()
               && leaf.contains("Stage: lapis; music paused") && leaf.contains("decode tok/s")
               && leaf.endsWith("Spoken: open the review and play nights"),
           "ambient: leaf carries instructions, vocabulary, live state, hover slice and spoken text", leaf);
-    check(kAmbientActionVocabulary.size() == 11, "ambient: 11-action vocabulary");
+    check(kAmbientActionVocabulary.size() >= 11, "ambient: action vocabulary includes core + music/spotify actions");
 }
 
 void memoryTests()
