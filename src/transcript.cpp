@@ -498,6 +498,190 @@ QString highlightCode(const QString &line)
     return out;
 }
 
+namespace {
+
+// Inline markdown on one line of prose: `code`, **bold**, *italic* / _italic_, [text](url).
+// An unmatched trailing backtick (mid-stream) stays literal until its partner arrives.
+QString inlineMarkdown(const QString &s, int codePx)
+{
+    static const QRegularExpression bold(QStringLiteral("\\*\\*(?=\\S)(.+?)(?<=\\S)\\*\\*|__(?=\\S)(.+?)(?<=\\S)__"));
+    static const QRegularExpression ital(QStringLiteral("(?<![\\w*])\\*(?=[^\\s*])(.+?)(?<=[^\\s*])\\*(?![\\w*])"
+                                                        "|(?<!\\w)_(?=\\S)(.+?)(?<=\\S)_(?!\\w)"));
+    static const QRegularExpression link(QStringLiteral("\\[([^\\]]+)\\]\\(([^)\\s]+)\\)"));
+    auto prose = [&](const QString &t) {
+        QString h = t.toHtmlEscaped();
+        h.replace(bold, QStringLiteral("<b>\\1\\2</b>"));
+        h.replace(ital, QStringLiteral("<i>\\1\\2</i>"));
+        h.replace(link, QStringLiteral("<a href=\"\\2\" style=\"color:#e09f3e; text-decoration:none\">\\1</a>"));
+        return h;
+    };
+    QString out;
+    qsizetype i = 0;
+    while (i < s.size()) {
+        const qsizetype open = s.indexOf(QLatin1Char('`'), i);
+        const qsizetype close = open < 0 ? -1 : s.indexOf(QLatin1Char('`'), open + 1);
+        if (open < 0 || close < 0) {
+            out += prose(s.mid(i));
+            break;
+        }
+        out += prose(s.mid(i, open - i));
+        out += QStringLiteral("<span style=\"font-family:Menlo; font-size:%1px; color:#e8d5b5; background-color:#1d1915\">"
+                              "&nbsp;%2&nbsp;</span>")
+                   .arg(codePx)
+                   .arg(s.mid(open + 1, close - open - 1).toHtmlEscaped());
+        i = close + 1;
+    }
+    return out;
+}
+
+QStringList tableCells(const QString &line)
+{
+    QString t = line.trimmed();
+    if (t.startsWith(QLatin1Char('|'))) t.remove(0, 1);
+    if (t.endsWith(QLatin1Char('|'))) t.chop(1);
+    QStringList cells = t.split(QLatin1Char('|'));
+    for (QString &c : cells)
+        c = c.trimmed();
+    return cells;
+}
+
+}  // namespace
+
+QString markdownToHtml(const QString &md, int codePx)
+{
+    static const QRegularExpression fence(QStringLiteral("^\\s*(```|~~~)\\s*([\\w+#.-]*)"));
+    static const QRegularExpression heading(QStringLiteral("^(#{1,6})\\s+(.*?)\\s*#*\\s*$"));
+    static const QRegularExpression bullet(QStringLiteral("^(\\s*)[-*+]\\s+(.*)$"));
+    static const QRegularExpression numbered(QStringLiteral("^(\\s*)(\\d+)[.)]\\s+(.*)$"));
+    static const QRegularExpression tableSep(QStringLiteral("^\\s*\\|?\\s*:?-{2,}:?\\s*(\\|\\s*:?-{2,}:?\\s*)*\\|?\\s*$"));
+    static const QRegularExpression rule(QStringLiteral("^\\s*([-*_])(\\s*\\1){2,}\\s*$"));
+    const QString para = QStringLiteral("<p style=\"margin-top:0px; margin-bottom:8px; line-height:130%\">");
+
+    QString out;
+    QStringList paraLines;
+    QString listTag;  // "ul" / "ol" while a list is open
+    auto flushPara = [&] {
+        if (paraLines.isEmpty())
+            return;
+        out += para + paraLines.join(QStringLiteral("<br>")) + QStringLiteral("</p>");
+        paraLines.clear();
+    };
+    auto closeList = [&] {
+        if (listTag.isEmpty())
+            return;
+        out += QStringLiteral("</%1>").arg(listTag);
+        listTag.clear();
+    };
+    auto openList = [&](const QString &tag, int start) {
+        if (listTag == tag)
+            return;
+        closeList();
+        listTag = tag;
+        out += QStringLiteral("<%1 style=\"margin-top:0px; margin-bottom:8px; -qt-list-indent:1\"%2>")
+                   .arg(tag, start > 1 ? QStringLiteral(" start=\"%1\"").arg(start) : QString());
+    };
+
+    const QStringList lines = md.split(QLatin1Char('\n'));
+    for (qsizetype i = 0; i < lines.size(); ++i) {
+        const QString &line = lines[i];
+        const auto fm = fence.match(line);
+        if (fm.hasMatch()) {
+            flushPara();
+            closeList();
+            const QString marker = fm.captured(1);
+            const QString lang = fm.captured(2);
+            QStringList body;
+            ++i;
+            while (i < lines.size() && !lines[i].trimmed().startsWith(marker))
+                body << lines[i++];
+            while (!body.isEmpty() && body.last().trimmed().isEmpty())
+                body.removeLast();
+            QStringList html;
+            for (const QString &b : body)
+                html << highlightCode(b).replace(QStringLiteral("&nbsp;"), QStringLiteral(" "));
+            out += QStringLiteral("<table width=\"100%\" cellspacing=\"0\" cellpadding=\"10\" bgcolor=\"#14120f\" "
+                                  "style=\"margin-top:2px; margin-bottom:10px; border-style:none\"><tr><td>");
+            if (!lang.isEmpty())
+                out += QStringLiteral("<p style=\"margin:0px; font-family:Menlo; font-size:%1px; color:#6e665e\">%2</p>")
+                           .arg(std::max(9, codePx - 3))
+                           .arg(lang.toHtmlEscaped());
+            out += QStringLiteral("<pre style=\"margin:0px; white-space:pre-wrap; font-family:Menlo; font-size:%1px; "
+                                  "color:#d9cfc3\">%2</pre></td></tr></table>")
+                       .arg(codePx)
+                       .arg(html.join(QLatin1Char('\n')));
+            continue;
+        }
+        if (line.trimmed().isEmpty()) {
+            flushPara();
+            closeList();
+            continue;
+        }
+        if (line.trimmed().startsWith(QLatin1Char('|')) && i + 1 < lines.size() && tableSep.match(lines[i + 1]).hasMatch()) {
+            flushPara();
+            closeList();
+            out += QStringLiteral("<table cellspacing=\"0\" cellpadding=\"5\" style=\"margin-bottom:10px; "
+                                  "border-style:solid; border-color:#1d1915\" border=\"1\"><tr>");
+            for (const QString &c : tableCells(line))
+                out += QStringLiteral("<th align=\"left\" style=\"color:#e8d5b5\">%1</th>").arg(inlineMarkdown(c, codePx));
+            out += QStringLiteral("</tr>");
+            i += 2;
+            for (; i < lines.size() && lines[i].trimmed().startsWith(QLatin1Char('|')); ++i) {
+                out += QStringLiteral("<tr>");
+                for (const QString &c : tableCells(lines[i]))
+                    out += QStringLiteral("<td>%1</td>").arg(inlineMarkdown(c, codePx));
+                out += QStringLiteral("</tr>");
+            }
+            --i;
+            out += QStringLiteral("</table>");
+            continue;
+        }
+        const auto hm = heading.match(line);
+        if (hm.hasMatch()) {
+            flushPara();
+            closeList();
+            const int level = hm.captured(1).size();
+            out += QStringLiteral("<p style=\"margin-top:4px; margin-bottom:6px; color:#e8d5b5; font-size:%1px\"><b>%2</b></p>")
+                       .arg(level <= 2 ? codePx + 6 : codePx + 3)
+                       .arg(inlineMarkdown(hm.captured(2), codePx));
+            continue;
+        }
+        if (rule.match(line).hasMatch()) {
+            flushPara();
+            closeList();
+            out += QStringLiteral("<hr>");
+            continue;
+        }
+        const auto bm = bullet.match(line);
+        const auto nm = numbered.match(line);
+        if (bm.hasMatch() || nm.hasMatch()) {
+            flushPara();
+            if (bm.hasMatch())
+                openList(QStringLiteral("ul"), 1);
+            else
+                openList(QStringLiteral("ol"), nm.captured(2).toInt());
+            out += QStringLiteral("<li style=\"line-height:130%\">%1</li>")
+                       .arg(inlineMarkdown(bm.hasMatch() ? bm.captured(2) : nm.captured(3), codePx));
+            continue;
+        }
+        if (line.startsWith(QLatin1Char('>'))) {
+            flushPara();
+            closeList();
+            out += QStringLiteral("<p style=\"margin-top:0px; margin-bottom:8px; margin-left:12px; color:#6e665e\"><i>%1</i></p>")
+                       .arg(inlineMarkdown(line.mid(1).trimmed(), codePx));
+            continue;
+        }
+        closeList();
+        paraLines << inlineMarkdown(line, codePx);
+    }
+    flushPara();
+    closeList();
+    // The last block's bottom margin would leave a gap under the answer.
+    static const QRegularExpression trailing(QStringLiteral("margin-bottom:(8|10)px([^<]*>)(?!.*margin-bottom)"),
+                                             QRegularExpression::DotMatchesEverythingOption);
+    out.replace(trailing, QStringLiteral("margin-bottom:0px\\2"));
+    return out;
+}
+
 QVariantList diffLines(const QString &diff, int maxLines)
 {
     QVariantList out;

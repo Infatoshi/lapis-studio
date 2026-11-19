@@ -4,6 +4,7 @@
 #include "fixtures.hpp"
 #include "gamepad.hpp"
 #include "pdfrender.hpp"
+#include "qml_host.hpp"
 #include "transcript.hpp"
 
 #include <QDir>
@@ -29,6 +30,7 @@
 #include <QQuickItem>
 #include <QQuickWindow>
 
+#include <csignal>
 #include <cstdio>
 #include <limits>
 
@@ -4324,8 +4326,13 @@ int snapOmnibar(const QString &outPath)
     settle(40);
     sendKey(win, Qt::Key_K, Qt::ControlModifier);
     settle(30);
-    sse.answer = QStringLiteral("Row 3 is faster: the wider tile keeps both warps fed, so it holds 410 tok/s where row 2 "
-                                "stalls on shared-memory bank conflicts at 126.");
+    // Markdown on purpose: inline code, bold and a fenced block must render, not show raw backticks.
+    sse.answer = QStringLiteral("Row 3 is **faster**: the wider `TILE_N` keeps both warps fed, so it holds 410 tok/s "
+                                "where row 2 stalls on shared-memory bank conflicts at 126.\n\n"
+                                "```cpp\n"
+                                "constexpr int TILE_N = 128;  // was 64\n"
+                                "__shared__ float smem[TILE_N + 1];\n"
+                                "```");
     askAndWait(QStringLiteral("which of these is faster and why"));
     settle(300);
 
@@ -4517,6 +4524,194 @@ int snapSlowmix(const QString &outPath)
     return saved && barSaved ? 0 : 1;
 }
 
+// --- Cross-session memory in Tier 3 -------------------------------------------------------------
+
+void memoryTierTests()
+{
+    Backend b(Backend::Mode::Mock);
+    check(b.memoryIndex()->size() == 0 && !b.memoryIndex()->refreshing(),
+          "memory tier: the mock backend's index stays empty (no transcript scan in --test)");
+    QString key;
+    for (const QVariant &v : b.projects()) {
+        const QString k = v.toMap().value("key").toString();
+        if (!b.contextTrunk(k).isEmpty() && !b.contextSlice(k, 0).isEmpty()) {
+            key = k;
+            break;
+        }
+    }
+    check(!key.isEmpty(), "memory tier: a mock project with a trunk and a slice");
+    FakeSse sse;
+    check(sse.start(), "memory tier: fake SSE endpoint listens");
+    LlmRouter router;
+    b.setLlmRouter(&router);
+    b.setOpenaiCompatUrl(sse.url());
+    QStringList finished;
+    QObject::connect(&b, &Backend::streamFinished, [&finished](const QString &id, const QString &) { finished << id; });
+    const QString q = QStringLiteral("why did cublas lose to the fp4 kernel?");
+
+    b.askStreamWithSlice(QStringLiteral("mem0"), key, 0, QStringLiteral("hovered: row 2"), q);
+    check(waitUntil([&] { return finished.contains("mem0"); }, 5000) && sse.bodies.size() == 1, "memory tier: baseline ask sent");
+
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    const QString active = b.activeSessionId(key);
+    check(!active.isEmpty(), "memory tier: the project names its active (Tier 1) session");
+    MemoryTurn past{QStringLiteral("claude"), QStringLiteral("0badc0de-0000-0000-0000-000000000001"), QStringLiteral("gemm-lab"),
+                    now - 2 * 86400000, 0, QStringLiteral("cuBLAS vs our sm120 FP4 kernel at 128x256 tiles?"),
+                    QStringLiteral("cuBLAS chose a 64x128 tile and left the tensor cores half fed.")};
+    MemoryTurn own = past;
+    own.sessionId = active;
+    own.userText = QStringLiteral("cuBLAS fp4 kernel lose question from the active session itself");
+    b.memoryIndex()->setTurns({past, own});
+    b.askStreamWithSlice(QStringLiteral("mem1"), key, 0, QStringLiteral("hovered: row 2"), q);
+    b.askStream(QStringLiteral("mem2"), key, 0, q);
+    check(waitUntil([&] { return finished.contains("mem1") && finished.contains("mem2"); }, 5000) && sse.bodies.size() == 3,
+          "memory tier: asks with recall sent", QString::number(sse.bodies.size()));
+
+    const QJsonArray m0 = QJsonDocument::fromJson(sse.bodies.value(0)).object().value("messages").toArray();
+    // mem1 and mem2 run concurrently: tell them apart by the hovered slice, not arrival order.
+    const bool firstIsHover = sse.bodies.value(1).contains("hovered: row 2");
+    const QJsonArray m1 = QJsonDocument::fromJson(sse.bodies.value(firstIsHover ? 1 : 2)).object().value("messages").toArray();
+    const QJsonArray m2 = QJsonDocument::fromJson(sse.bodies.value(firstIsHover ? 2 : 1)).object().value("messages").toArray();
+    // The warmed prefix: exactly what warmProjectPrefix() prefills for this project.
+    TieredPrompt warm;
+    warm.model = b.tieredPrompt(key, QString(), q).model;
+    warm.systemPrompt = kCompatSystemPrompt;
+    warm.trunk = b.contextTrunk(key);
+    const QJsonArray w = QJsonDocument::fromJson(buildTieredWarmRequest(warm)).object().value("messages").toArray();
+    auto bytes = [](const QJsonValue &v) { return QJsonDocument(v.toObject()).toJson(QJsonDocument::Compact); };
+    check(w.size() == 2 && m0.size() == 3 && m1.size() == 3 && m2.size() == 3 && bytes(m1[0]) == bytes(w[0])
+              && bytes(m1[1]) == bytes(w[1]) && bytes(m2[0]) == bytes(w[0]) && bytes(m2[1]) == bytes(w[1])
+              && bytes(m0[0]) == bytes(m1[0]) && bytes(m0[1]) == bytes(m1[1]),
+          "memory tier: Tier 0 + Tier 1 stay byte-identical to the warmed prefix with recall on",
+          QStringLiteral("%1/%2/%3/%4").arg(w.size()).arg(m0.size()).arg(m1.size()).arg(m2.size()));
+    const QString leaf0 = m0.last().toObject().value("content").toString();
+    const QString leaf1 = m1.last().toObject().value("content").toString();
+    const QString leaf2 = m2.last().toObject().value("content").toString();
+    const QString recall = QStringLiteral("Relevant past conversations:\n[claude 0badc0de] gemm-lab, 2d ago\nUser: cuBLAS vs our sm120");
+    check(!leaf0.contains("Relevant past conversations") && leaf1.contains(recall) && leaf2.contains(recall)
+              && leaf1.startsWith("On screen now:\nhovered: row 2") && leaf1.endsWith("Question: " + q),
+          "memory tier: recall lands in the Tier 3 leaf only (slice first, question last)", leaf1.left(300));
+    check(!leaf1.contains("from the active session itself") && !bytes(m1[1]).contains("Relevant past"),
+          "memory tier: the active session's own turns are excluded; Tier 1 never carries recall");
+    const qsizetype at = leaf1.indexOf("Relevant past conversations:\n");
+    const qsizetype qAt = leaf1.lastIndexOf("\n\nQuestion: ");
+    check(at >= 0 && qAt > at && qAt - at - 29 <= 3200, "memory tier: the recall block is <= 3,200 chars",
+          QString::number(qAt - at - 29));
+    const TieredPrompt quick = b.tieredPrompt(key, b.contextSlice(key, 0), q);
+    check(quick.memory.contains("[claude 0badc0de]") && quick.trunk == b.contextTrunk(key),
+          "memory tier: the quick-ask prompt (askOpenAiCompat) carries the same recall in Tier 3");
+    b.setLlmRouter(nullptr);
+    check(b.spawnCount() == 0, "memory tier: zero processes spawned");
+}
+
+// --- Fresh-engine QML hot reload ----------------------------------------------------------------
+
+void hotReloadTests()
+{
+    Backend backend(Backend::Mode::Mock);
+    QTemporaryDir td;
+    const QString dir = td.path();
+    // The compiled-in module's sources, copied to disk: the same files `--hot-reload` reads from qml/.
+    const QDir src(QStringLiteral(":/qt/qml/Studio/qml"));
+    int copied = 0;
+    for (const QString &f : src.entryList({QStringLiteral("*.qml")}, QDir::Files))
+        copied += QFile::copy(src.filePath(f), dir + "/" + f) ? 1 : 0;
+    for (const QString &f : QDir(dir).entryList({QStringLiteral("*.qml")}, QDir::Files))
+        QFile::setPermissions(dir + "/" + f, QFileDevice::ReadOwner | QFileDevice::WriteOwner);
+    check(copied >= 20 && QmlHost::ensureQmldir(dir) && QFileInfo::exists(dir + "/qmldir"),
+          "reload: qml sources + qmldir on disk", QString::number(copied));
+    QFile orig(dir + "/StudioApp.qml");
+    check(orig.open(QIODevice::ReadOnly), "reload: StudioApp.qml readable");
+    const QByteArray original = orig.readAll();
+    orig.close();
+    auto writeApp = [&](const QByteArray &data) {
+        QFile f(dir + "/StudioApp.qml");
+        return f.open(QIODevice::WriteOnly | QIODevice::Truncate) && f.write(data) == data.size();
+    };
+    auto withMarker = [&](const char *v) {
+        QByteArray d = original;
+        d.replace("    property int lens: 0\n", QByteArray("    property int lens: 0\n    property string hotMarker: \"") + v + "\"\n");
+        return d;
+    };
+
+    QQuickWindow win;
+    win.setColor(Qt::black);
+    win.resize(1920, 1080);
+    win.show();
+    QmlHost host(&win, &backend);
+    host.setQmlDir(dir);
+    check(host.load() && host.root() && host.root()->objectName() == "studioApp" && host.generation() == 1,
+          "reload: StudioApp loads from the filesystem into a bare QQuickWindow", host.lastErrors().join("; "));
+    if (!host.root())
+        return;
+    QPointer<QQuickItem> root1 = host.root();
+    QPointer<QQmlEngine> engine1 = host.engine();
+    settle(50);
+    check(qAbs(root1->width() - 1920) < 0.5 && qAbs(root1->height() - 1080) < 0.5 && root1->parentItem() == win.contentItem(),
+          "reload: root fills the window's contentItem");
+    check(findItems(win.contentItem(), "island").size() == 5, "reload: the Theme singleton and child types resolve from disk");
+
+    QString key;
+    for (const QVariant &v : backend.projects())
+        if (v.toMap().value("artifacts").toList().size() > 1) {
+            key = v.toMap().value("key").toString();
+            break;
+        }
+    root1->setProperty("projectKey", key);
+    root1->setProperty("artifactIndex", 1);
+    root1->setProperty("lens", 2);
+    root1->setProperty("islandFilter", "needs");
+    settle(300);
+
+    // 1. Broken QML: errors logged, the live root and engine untouched.
+    check(writeApp(original + "\n}}} not qml {{{\n"), "reload: broken StudioApp.qml written");
+    check(!host.reload() && host.failures() == 1 && !host.lastErrors().isEmpty(), "reload: broken QML is rejected with errors",
+          host.lastErrors().value(0));
+    settle(50);
+    check(root1 && host.root() == root1 && engine1 && host.engine() == engine1 && root1->isVisible()
+              && root1->parentItem() == win.contentItem() && host.generation() == 1,
+          "reload: after broken QML the old root and engine stay live (no blank window)");
+    check(root1 && root1->property("lens").toInt() == 2, "reload: the live UI keeps its state after a failed reload");
+
+    // 2. A valid edit: fresh engine, new root swapped in, state restored, old root + engine freed.
+    check(writeApp(withMarker("v2")), "reload: edited StudioApp.qml written");
+    check(host.reload() && host.generation() == 2, "reload: valid edit swaps in a new root", host.lastErrors().join("; "));
+    QQuickItem *root2 = host.root();
+    check(root2 && root2 != root1.data() && host.engine() != engine1.data() && root2->property("hotMarker").toString() == "v2",
+          "reload: the new root comes from a fresh QQmlEngine and shows the edit");
+    check(root2 && root2->property("backend").value<QObject *>() == &backend,
+          "reload: the same C++ Backend pointer is bound into the new root");
+    check(root2 && root2->property("projectKey").toString() == key && root2->property("artifactIndex").toInt() == 1
+              && root2->property("lens").toInt() == 2 && root2->property("islandFilter").toString() == "needs",
+          "reload: lens, project, slide and Needs Me filter carry over",
+          root2 ? QStringLiteral("%1/%2/%3/%4").arg(root2->property("projectKey").toString())
+                      .arg(root2->property("artifactIndex").toInt()).arg(root2->property("lens").toInt())
+                      .arg(root2->property("islandFilter").toString())
+                : QString());
+    QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+    settle(50);
+    check(root1.isNull() && engine1.isNull(), "reload: the old root and old engine are destroyed");
+    check(win.isVisible() && root2 && qAbs(root2->width() - 1920) < 0.5, "reload: same window, still shown, new root fills it");
+    win.resize(1600, 1000);
+    settle(20);
+    check(root2 && qAbs(root2->width() - 1600) < 0.5 && qAbs(root2->height() - 1000) < 0.5, "reload: new root tracks window resizes");
+    win.resize(1920, 1080);
+
+    // 3. The live triggers: a saved file (watcher, 150 ms debounce), Cmd+Shift+L, SIGUSR1.
+    host.setHotReload(true);
+    check(writeApp(withMarker("v3")), "reload: v3 written");
+    check(waitUntil([&] { return host.generation() == 3; }, 4000) && host.root()->property("hotMarker").toString() == "v3",
+          "reload: a file save reloads through the watcher", QString::number(host.generation()));
+    sendKey(&win, Qt::Key_L, Qt::ControlModifier | Qt::ShiftModifier);
+    check(waitUntil([&] { return host.generation() == 4; }, 2000), "reload: Cmd+Shift+L reloads", QString::number(host.generation()));
+    ::raise(SIGUSR1);
+    check(waitUntil([&] { return host.generation() == 5; }, 2000), "reload: SIGUSR1 reloads", QString::number(host.generation()));
+    host.setHotReload(false);
+    QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+    check(forbiddenPixels(win.grabWindow()) == 0 && backend.spawnCount() == 0,
+          "reload: reloaded UI renders on-palette; zero processes spawned");
+}
+
 int runTests()
 {
     unitTests();
@@ -4528,6 +4723,8 @@ int runTests()
     phase3UiTests();
     slowmixUiTests();
     omnibarUiTests();
+    memoryTierTests();
+    hotReloadTests();
     uiTests();
     gamepadUiTests();
     std::printf("%d passed, %d failed\n", g_pass, g_fail);

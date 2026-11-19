@@ -219,23 +219,48 @@ Item {
                 width: Math.min(implicitWidth, 420)
                 elide: Text.ElideRight
             }
-            Text {
+            // A drawn arrow, not the "→" glyph: the glyph sat on its own line box (different size,
+            // possibly a fallback font) and drifted off the text line. This one is centred on the
+            // question's x-height, and the answer and seconds share the question's baseline.
+            FontMetrics { id: qfm; font: qq.font }
+            Canvas {
                 id: arrow
+                objectName: "quickArrow"
                 anchors.left: qq.right
-                anchors.leftMargin: 16
-                anchors.verticalCenter: parent.verticalCenter
-                text: "→"
-                color: Theme.gold
-                font.family: Theme.sans
-                font.pixelSize: Theme.px(22)
+                anchors.leftMargin: 14
+                width: Math.round(Theme.px(18))
+                height: Math.round(Theme.px(12))
+                y: Math.round(qq.y + qq.baselineOffset - qfm.xHeight / 2 - height / 2)
+                property color stroke: Theme.gold
+                onStrokeChanged: requestPaint()
+                onWidthChanged: requestPaint()
+                onHeightChanged: requestPaint()
+                onPaint: {
+                    const ctx = getContext("2d");
+                    ctx.reset();
+                    const lw = Math.max(1.5, height / 7);
+                    const mid = height / 2;
+                    const head = height / 2 - lw / 2;
+                    ctx.strokeStyle = stroke;
+                    ctx.lineWidth = lw;
+                    ctx.lineCap = "round";
+                    ctx.lineJoin = "round";
+                    ctx.beginPath();
+                    ctx.moveTo(lw / 2, mid);
+                    ctx.lineTo(width - lw / 2, mid);
+                    ctx.moveTo(width - lw / 2 - head, mid - head);
+                    ctx.lineTo(width - lw / 2, mid);
+                    ctx.lineTo(width - lw / 2 - head, mid + head);
+                    ctx.stroke();
+                }
             }
             Text {
                 objectName: "quickAnswer"
                 anchors.left: arrow.right
-                anchors.leftMargin: 16
+                anchors.leftMargin: 14
                 anchors.right: qsec.left
                 anchors.rightMargin: 20
-                anchors.verticalCenter: parent.verticalCenter
+                anchors.baseline: qq.baseline
                 readonly property bool waiting: root.hasQuick && root.backend.quickBusy && root.backend.quickAnswer.length === 0
                 readonly property bool thinking: waiting && root.backend.quickThinking.length > 0
                 // Before the first answer token: live thinking text (claude thinking_delta, codex
@@ -256,7 +281,7 @@ Item {
                 id: qsec
                 objectName: "quickSeconds"
                 anchors.right: parent.right
-                anchors.verticalCenter: parent.verticalCenter
+                anchors.baseline: qq.baseline
                 // Live seconds while the model works (a 10 Hz tick), the final time once it is done.
                 text: !root.hasQuick ? ""
                       : root.backend.quickBusy ? root.backend.quickElapsed.toFixed(1) + "s"

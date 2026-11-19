@@ -328,6 +328,7 @@ Item {
                 }
                 AnswerBody {
                     width: parent.width
+                    backend: root.backend
                     question: pc.question
                     answer: pc.answer
                     thinking: pc.thinking
@@ -554,6 +555,7 @@ Item {
                 objectName: "omnibarAnswerBody"
                 width: parent.width
                 visible: root.question.length > 0
+                backend: root.backend
                 question: root.question
                 answer: root.answer
                 thinking: root.thinking
@@ -581,6 +583,7 @@ Item {
     // Question, the streaming answer (scrolls, follows the tail) and a quiet thinking indicator.
     component AnswerBody: Column {
         id: ab
+        property QtObject backend
         property string question
         property string answer
         property string thinking
@@ -632,17 +635,20 @@ Item {
             clip: true
             boundsBehavior: Flickable.StopAtBounds
             onContentHeightChanged: if (ab.busy) contentY = Math.max(0, contentHeight - height)
+            // Markdown rendered as rich text (code blocks highlighted on a dark block, inline code
+            // in mono); line spacing comes from the HTML so code lines stay tight.
             Text {
                 id: answerText
                 objectName: "omnibarAnswer"
                 width: answerFlick.width
-                text: ab.answer
-                textFormat: Text.PlainText
+                text: ab.backend ? ab.backend.markdownHtml(ab.answer, Theme.px(15)) : ab.answer
+                textFormat: ab.backend ? Text.RichText : Text.PlainText
                 wrapMode: Text.Wrap
                 color: Theme.ink
+                linkColor: Theme.gold
                 font.family: Theme.sans
                 font.pixelSize: Theme.px(18)
-                lineHeight: 1.3
+                onLinkActivated: link => Qt.openUrlExternally(link)
             }
         }
         Text {

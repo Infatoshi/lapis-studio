@@ -4,6 +4,8 @@
 #include "gamepad.hpp"
 #include "transcript.hpp"
 #include "core/types.hpp"
+#include "core/window_geometry.hpp"
+#include "ingest/memory.hpp"
 #include "ingest/phonon.hpp"
 #include "ingest/slowmix.hpp"
 #include "llm/prefix.hpp"
@@ -402,6 +404,21 @@ public:
     Q_INVOKABLE void clearStreamHistory(const QString &streamId);
     // Hover history, pins and the active semantic target (created on first use).
     TargetRegistry *targets();
+    // Cross-session memory (past Claude Code / Codex / Antigravity / Phonon turns). Live mode
+    // rescans in the background; Mock mode stays empty unless a test calls setTurns().
+    MemoryIndex *memoryIndex() { return &m_memory; }
+    // The ask's Tier 3 "Relevant past conversations:" block: top 4 turns, <= 3,200 chars, never
+    // from the project's own (Tier 1) session. "" when nothing matches.
+    QString memoryContext(const QString &projectKey, const QString &question) const;
+    // The session whose transcript feeds the project's Tier 1 trunk (newest), by harness ident
+    // (its Lapis id when it has none).
+    QString activeSessionId(const QString &projectKey) const;
+    // The OpenAI-compatible prompt every quick ask and stream sends (Tiers 0-3).
+    TieredPrompt tieredPrompt(const QString &projectKey, const QString &slice, const QString &question,
+                              const QVector<ChatTurn> &history = {}) const;
+    // Live window placement ("windowState" in studio_prefs.json). Setting it writes prefs at once.
+    WindowState windowState() const { return m_windowState; }
+    void setWindowState(const WindowState &state);
     QObject *slowmix() { return &m_slowmix; }
     SlowmixController *slowmixController() { return &m_slowmix; }
     QVector<ChatTurn> streamHistory(const QString &streamId) const { return m_streamHistory.value(streamId); }
@@ -456,6 +473,7 @@ public:
     Q_INVOKABLE int pdfPages(const QString &path) const;
     Q_INVOKABLE QVariantList audioPeaks(const QString &path) const { return studio::audioPeaks(path, 160); }
     Q_INVOKABLE int wordCount(const QString &s) const { return studio::countWords(s); }
+    Q_INVOKABLE QString markdownHtml(const QString &md, int codePx = 14) const { return studio::markdownToHtml(md, codePx); }
     static bool isRedactedCategory(const QString &category);
 
     // --harness codex: quick asks default to gpt-6-astra (not persisted; the picker still switches).
@@ -677,6 +695,10 @@ private:
     Gamepad m_gamepad;
     std::unique_ptr<TargetRegistry> m_targets;  // lazy: targets()
     SlowmixController m_slowmix;  // its destructor sends `quit`, so no audio outlives the app
+    MemoryIndex m_memory;
+    QTimer m_memoryTimer;  // live: periodic background rescan
+    void refreshMemory();
+    WindowState m_windowState;
     void startConversation(const QString &streamId, const QString &projectKey, const QString &slice,
                            const QString &question);
 

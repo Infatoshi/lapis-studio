@@ -6,7 +6,7 @@
 //   Tier 1  canonical workspace / session trunk ("Pinned context:"), stable, append-only
 //   Tier 2  prior conversation turns (empty for an ephemeral hover ask)
 //   Tier 3  the ephemeral leaf, strictly last: on-screen target slice, recent actions,
-//           live Phonon tail and the question
+//           live Phonon tail, recalled past conversations and the question
 // A warm request sends Tiers 0-2 with max_tokens 1; its messages are a byte-identical prefix
 // of the ask that follows.
 #pragma once
@@ -34,6 +34,7 @@ struct TieredPrompt {
     QString targetSlice;
     QStringList recentActions;
     QString phononTail;
+    QString memory;               // cross-session recall ("Relevant past conversations:")
     QString question;
 };
 

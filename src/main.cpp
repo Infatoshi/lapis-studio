@@ -12,16 +12,23 @@
 //                                        OUT-constellation.png (dragged card, Needs Me) and OUT-stage.png
 //   lapis_studio --snap-slowmix OUT.png  offscreen dark frames: Music overlay, plus OUT-bar.png (♪ pill)
 //   lapis_studio --harness codex    quick asks (Enter) go to a warm codex app-server instead of claude
+//   lapis_studio --hot-reload       (or LAPIS_HOT_RELOAD=1) load qml/ from disk ($LAPIS_QML_DIR or
+//                                   <repo>/qml) and rebuild the UI in place on save, Cmd+Shift+L or SIGUSR1
+//
+// The interactive window restores its saved display, geometry and fullscreen / maximized state
+// ("windowState" in ~/.lapis-next/studio_prefs.json); no offscreen mode reads or writes it.
 //
 // A PS4 DualShock 4 (GameController.framework) drives every lens in the interactive window only;
 // no offscreen mode ever touches GameController (src/gamepad.hpp).
 
 #include "backend.hpp"
 #include "demo.hpp"
+#include "mac/window_state.hpp"
+#include "qml_host.hpp"
 
+#include <QColor>
 #include <QFont>
 #include <QGuiApplication>
-#include <QQmlApplicationEngine>
 #include <QQuickStyle>
 #include <QQuickWindow>
 #include <QScreen>
@@ -45,6 +52,7 @@ int main(int argc, char **argv)
     QString reviewOut;
     QString slowmixOut;
     QString quickHarness = QStringLiteral("claude");
+    bool hotReload = qEnvironmentVariableIntValue("LAPIS_HOT_RELOAD") == 1;
     QString chatModel;
     QString chatEffort = QStringLiteral("low");
     QString chatQuestion = QStringLiteral("Reply with exactly one word: the color of a clear daytime sky.");
@@ -99,10 +107,12 @@ int main(int argc, char **argv)
                 return 64;
             }
             slowmixOut = QString::fromLocal8Bit(argv[++i]);
+        } else if (std::strcmp(argv[i], "--hot-reload") == 0) {
+            hotReload = true;
         } else if (std::strcmp(argv[i], "--harness") == 0 && i + 1 < argc) {
             quickHarness = QString::fromLocal8Bit(argv[++i]);
         } else if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
-            std::printf("usage: lapis_studio [--harness claude|codex] [--test | --smoke-offscreen [DIR] | --probe-live | --probe-chat MODEL [EFFORT] | --bench-fps [--metal [DIR]] | --record-demo OUT.mp4 | --snap-omnibar OUT.png | --snap-review OUT.png | --snap-slowmix OUT.png]\n");
+            std::printf("usage: lapis_studio [--harness claude|codex] [--hot-reload] [--test | --smoke-offscreen [DIR] | --probe-live | --probe-chat MODEL [EFFORT] | --bench-fps [--metal [DIR]] | --record-demo OUT.mp4 | --snap-omnibar OUT.png | --snap-review OUT.png | --snap-slowmix OUT.png]\n");
             return 0;
         }
     }
@@ -113,6 +123,9 @@ int main(int argc, char **argv)
         // Never open a visible window while building or testing on the host Mac.
         qputenv("QT_QPA_PLATFORM", "offscreen");
         qputenv("QSG_RENDER_LOOP", "basic");
+        // --test loads qml/ copies from a temp dir (hot-reload tests): no .qmlc left in ~/Library/Caches.
+        if (test)
+            qputenv("QML_DISABLE_DISK_CACHE", "1");
         if (metalBench) {
             // Real Metal, still windowless: QQuickRenderControl renders into an offscreen texture.
             // The offscreen QPA reports no RHI support, so Qt Quick would fall back to its software
@@ -124,6 +137,9 @@ int main(int argc, char **argv)
             QQuickWindow::setGraphicsApi(QSGRendererInterface::Software);
         }
     } else {
+        // Every reload compiles the edited .qml afresh; never a stale .qmlc from the disk cache.
+        if (hotReload)
+            qputenv("QML_DISABLE_DISK_CACHE", "1");
 #ifdef Q_OS_MACOS
         // The interactive window renders through Metal (QRhi), never the OpenGL or software path.
         QQuickWindow::setGraphicsApi(QSGRendererInterface::Metal);
@@ -168,10 +184,35 @@ int main(int argc, char **argv)
     backend.gamepad()->setEnabled(true);
     // Likewise the only place `slowmix --stdio` may ever be spawned (lazily, on first play).
     backend.slowmixController()->setSpawnAllowed(true);
-    QQmlApplicationEngine engine;
-    QQuickWindow *win = studio::createStudioWindow(engine, &backend, false, QSize(1680, 1050));
-    if (!win)
+    // C++ owns the window and the Backend; QmlHost owns only the replaceable QML root + engine.
+    // The window starts hidden on the theme background and is placed before it is ever shown.
+    QQuickWindow window;
+    QQuickWindow *win = &window;
+    window.setTitle(QStringLiteral("lapis studio"));
+    window.setColor(QColor(0, 0, 0));  // Theme.bg
+    window.setMinimumSize(QSize(1100, 700));
+    studio::QmlHost host(&window, &backend);
+    QString qmlDir;
+    if (hotReload) {
+        qmlDir = studio::QmlHost::findQmlDir();
+        if (qmlDir.isEmpty() || !studio::QmlHost::ensureQmldir(qmlDir)) {
+            std::fprintf(stderr, "lapis_studio: --hot-reload: no qml/ directory (set LAPIS_QML_DIR); using the built-in UI\n");
+            qmlDir.clear();
+        } else {
+            host.setQmlDir(qmlDir);
+        }
+    }
+    if (!host.load())
         return 2;
+    if (!qmlDir.isEmpty()) {
+        host.setHotReload(true);
+        std::fprintf(stderr, "lapis_studio: hot reload on %s (save a .qml, Cmd+Shift+L, or kill -USR1 %lld)\n",
+                     qPrintable(qmlDir), qint64(QCoreApplication::applicationPid()));
+    }
+    studio::restoreWindowState(&window, backend.windowState(), QSize(1680, 1050));
+    window.requestActivate();
+    studio::WindowStateTracker tracker(&window, backend.windowState(),
+                                       [&backend](const studio::WindowState &s) { backend.setWindowState(s); });
     // Log the graphics API the scene graph actually got (expected: Metal on macOS).
     QObject::connect(win, &QQuickWindow::sceneGraphInitialized, win, [win] {
         const auto api = win->rendererInterface()->graphicsApi();

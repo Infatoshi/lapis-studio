@@ -90,6 +90,10 @@ QString clampWords(const QString &s, int maxWords);
 QString shortModel(const QString &model);
 QVariantList diffLines(const QString &diff, int maxLines = 400);
 QString highlightCode(const QString &line);
+// A streamed markdown answer as Qt rich text: fenced code blocks (highlighted, wrapped, dark
+// block), `inline code`, bold/italic, headings, lists, tables, quotes. Unclosed fences render
+// as code so a half-streamed block already looks right.
+QString markdownToHtml(const QString &md, int codePx = 14);
 QVariantMap tableFromMarkdown(const QStringList &lines);
 QVariantMap tableFromCsv(const QString &csv);
 QVariantMap chartFromTable(const QVariantMap &table);

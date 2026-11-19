@@ -1132,6 +1132,15 @@ Backend::Backend(Mode mode, QObject *parent, bool warmHelpers)
     m_ageTimer.setInterval(30000);
     connect(&m_ageTimer, &QTimer::timeout, this, &Backend::publish);
     m_ageTimer.start();
+    // Cross-session memory: first scan once the registry has named its redacted sessions, then
+    // an incremental rescan (unchanged transcripts come from the cache) every 5 minutes.
+    connect(&m_memory, &MemoryIndex::refreshed, this, [](int turns, double ms) {
+        std::fprintf(stderr, "lapis_studio: memory index %d turns in %.0f ms\n", turns, ms);
+    });
+    m_memoryTimer.setInterval(5 * 60 * 1000);
+    connect(&m_memoryTimer, &QTimer::timeout, this, &Backend::refreshMemory);
+    m_memoryTimer.start();
+    QTimer::singleShot(1500, this, &Backend::refreshMemory);
     if (warmHelpers) {
         // The default model's daemon is the one the first Enter will use; every other provider
         // channel starts lazily the first time the picker sends to it, then stays up.
@@ -1472,6 +1481,7 @@ void Backend::loadPrefs()
         m_openaiCompatModel = compatModel;
     m_openaiCompatKey = o.value(QLatin1String("openaiCompatKey")).toString().trimmed();
     m_showCodeDiffs = o.value(QLatin1String("showCodeDiffs")).toBool(false);
+    m_windowState = WindowState::fromJson(o.value(QLatin1String("windowState")).toObject());
     m_cardPositions.clear();
     const QJsonObject cards = o.value(QLatin1String("cardPositions")).toObject();
     for (auto it = cards.begin(); it != cards.end(); ++it) {
@@ -1588,6 +1598,8 @@ bool Backend::savePrefs()
     if (!m_openaiCompatKey.isEmpty())
         o.insert(QStringLiteral("openaiCompatKey"), m_openaiCompatKey);
     o.insert(QStringLiteral("showCodeDiffs"), m_showCodeDiffs);
+    if (m_windowState.hasGeometry() || m_windowState.fullscreen || m_windowState.maximized)
+        o.insert(QStringLiteral("windowState"), m_windowState.toJson());
     if (!m_cardPositions.isEmpty()) {
         QJsonObject cards;
         for (auto it = m_cardPositions.cbegin(); it != m_cardPositions.cend(); ++it) {
@@ -1629,6 +1641,50 @@ Backend::Project *Backend::find(const QString &key)
         if (p.key == key)
             return &p;
     return nullptr;
+}
+
+QString Backend::activeSessionId(const QString &projectKey) const
+{
+    for (const Project &p : m_projects) {
+        if (p.key != projectKey)
+            continue;
+        const SessionInfo *best = nullptr;
+        for (const SessionInfo &s : p.sessions)
+            if ((!s.ident.isEmpty() || !s.id.isEmpty()) && (!best || s.mtime > best->mtime))
+                best = &s;
+        // The harness uuid names the transcript the memory index read; a session without one
+        // (a fixture, a fresh kickoff) falls back to its Lapis id.
+        return best ? (best->ident.isEmpty() ? best->id : best->ident) : QString();
+    }
+    return {};
+}
+
+QString Backend::memoryContext(const QString &projectKey, const QString &question) const
+{
+    if (m_memory.size() == 0 || question.trimmed().isEmpty())
+        return {};
+    return m_memory.query(question, activeSessionId(projectKey), 4, 3200);
+}
+
+void Backend::refreshMemory()
+{
+    if (m_mode != Mode::Live)
+        return;
+    MemorySources src = MemorySources::defaults();
+    for (const Project &p : m_projects)
+        for (const SessionInfo &s : p.sessions)
+            if (s.redacted && !s.ident.isEmpty())
+                src.excludeSessionIds.insert(s.ident);  // a redacted category is never read
+    m_memory.refreshAsync(src);
+}
+
+void Backend::setWindowState(const WindowState &state)
+{
+    if (state == m_windowState)
+        return;
+    m_windowState = state;
+    if (!m_prefsPath.isEmpty())
+        savePrefs();  // now, not debounced: build scripts pkill the app right after a resize
 }
 
 int Backend::pdfPages(const QString &path) const
@@ -2378,7 +2434,6 @@ void Backend::askOpenAiCompat(const QString &projectKey, int artifactIndex, cons
     const QString endpoint = base.endsWith(QLatin1String("/chat/completions"))
                                  ? base
                                  : base + QStringLiteral("/chat/completions");
-    const QString model = compatModel();
     const QString key = compatKey();
 
     if (m_suggestReply) {
@@ -2397,15 +2452,7 @@ void Backend::askOpenAiCompat(const QString &projectKey, int artifactIndex, cons
 
     // Tier 0 system + Tier 1 trunk are byte-identical to what warmProjectPrefix() prefilled when
     // the island opened; the on-screen slice, recent actions, Phonon tail and question ride last.
-    TieredPrompt p;
-    p.model = model;
-    p.effort = m_chatEffort;
-    p.systemPrompt = kCompatSystemPrompt;
-    p.trunk = contextTrunk(projectKey);
-    p.targetSlice = contextSlice(projectKey, artifactIndex);
-    p.recentActions = m_recentActions;
-    p.phononTail = m_phononTail;
-    p.question = question;
+    const TieredPrompt p = tieredPrompt(projectKey, contextSlice(projectKey, artifactIndex), question);
     LlmStreamRequest req;
     req.streamId = QString::fromLatin1(kQuickStreamId);
     req.endpoint = endpoint;
@@ -2557,16 +2604,7 @@ void Backend::startConversation(const QString &streamId, const QString &projectK
         emit streamFinished(streamId, QStringLiteral("Set openaiCompatUrl in studio_prefs.json or LAPIS_OPENAI_COMPAT_URL"));
         return;
     }
-    TieredPrompt p;
-    p.model = compatModel();
-    p.effort = m_chatEffort;
-    p.systemPrompt = kCompatSystemPrompt;
-    p.trunk = contextTrunk(projectKey);
-    p.history = m_streamHistory.value(streamId);
-    p.targetSlice = slice;
-    p.recentActions = m_recentActions;
-    p.phononTail = m_phononTail;
-    p.question = q;
+    const TieredPrompt p = tieredPrompt(projectKey, slice, q, m_streamHistory.value(streamId));
     m_streamAsks.insert(streamId, StreamAsk{q, QString()});
     LlmStreamRequest req;
     req.streamId = streamId;
@@ -2574,6 +2612,23 @@ void Backend::startConversation(const QString &streamId, const QString &projectK
     req.apiKey = compatKey();
     req.payload = buildTieredChatRequest(p);
     router->startStream(req);
+}
+
+TieredPrompt Backend::tieredPrompt(const QString &projectKey, const QString &slice, const QString &question,
+                                   const QVector<ChatTurn> &history) const
+{
+    TieredPrompt p;
+    p.model = compatModel();
+    p.effort = m_chatEffort;
+    p.systemPrompt = kCompatSystemPrompt;  // Tier 0
+    p.trunk = contextTrunk(projectKey);    // Tier 1: byte-identical to warmProjectPrefix()
+    p.history = history;                   // Tier 2
+    p.targetSlice = slice;                 // Tier 3 from here on
+    p.recentActions = m_recentActions;
+    p.phononTail = m_phononTail;
+    p.memory = memoryContext(projectKey, question);  // recall rides in Tier 3 only: the prefix stays hot
+    p.question = question;
+    return p;
 }
 
 void Backend::cancelStream(const QString &streamId)

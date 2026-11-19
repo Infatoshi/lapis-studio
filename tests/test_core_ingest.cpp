@@ -1,14 +1,21 @@
-// test_core_ingest: lapis_core (TargetRef, SpscRing) and lapis_ingest (Phonon snapshot/tail).
+// test_core_ingest: lapis_core (TargetRef, SpscRing, window geometry) and lapis_ingest (Phonon,
+// Slowmix, cross-session MemoryIndex).
 #include "core/ring_buffer.hpp"
 #include "core/types.hpp"
+#include "core/window_geometry.hpp"
+#include "ingest/memory.hpp"
 #include "ingest/phonon.hpp"
 #include "ingest/slowmix.hpp"
 
 #include <QCoreApplication>
 #include <QDateTime>
 #include <QDir>
+#include <QElapsedTimer>
 #include <QFile>
+#include <QJsonDocument>
 #include <QTemporaryDir>
+
+#include <algorithm>
 
 #include <cstdio>
 #include <thread>
@@ -321,6 +328,231 @@ void slowmixTests()
     check(!live.available(), "slowmix: spawn allowed but binary missing -> unavailable");
 }
 
+// --- Cross-session memory ---------------------------------------------------------------------
+
+MemoryTurn turn(const QString &harness, const QString &session, qint64 mtimeMs, const QString &user,
+                const QString &assistant, const QString &project = QStringLiteral("proj"))
+{
+    MemoryTurn t;
+    t.harness = harness;
+    t.sessionId = session;
+    t.project = project;
+    t.mtimeMs = mtimeMs;
+    t.userText = user;
+    t.assistantText = assistant;
+    return t;
+}
+
+// 500 filler turns over a shared engineering vocabulary (deterministic), none of which mention
+// the planted topics below.
+QVector<MemoryTurn> syntheticTurns(qint64 now, int n = 500)
+{
+    static const char *vocab[] = {"build", "deploy", "branch", "rebase", "commit", "review", "config", "parser",
+                                  "socket", "timeout", "retry", "cache", "index", "schema", "migration", "router",
+                                  "widget", "layout", "shader", "texture", "buffer", "queue", "thread", "mutex",
+                                  "logger", "metric", "dashboard", "alert", "budget", "invoice", "calendar", "email",
+                                  "docker", "python", "rust", "compile", "linker", "symbol", "profile", "benchmark"};
+    const int nv = int(sizeof vocab / sizeof *vocab);
+    quint32 seed = 12345;
+    auto rnd = [&seed] { seed = seed * 1103515245u + 12345u; return int((seed >> 16) & 0x7fff); };
+    QVector<MemoryTurn> out;
+    for (int i = 0; i < n; ++i) {
+        QStringList u, a;
+        for (int w = 0; w < 14; ++w)
+            u << QString::fromLatin1(vocab[rnd() % nv]);
+        for (int w = 0; w < 60; ++w)
+            a << QString::fromLatin1(vocab[rnd() % nv]);
+        out << turn(i % 3 == 0 ? "codex" : "claude", QStringLiteral("filler-%1").arg(i / 10), now - qint64(rnd() % 13) * 86400000,
+                    u.join(' '), a.join(' '));
+    }
+    return out;
+}
+
+void memoryTests()
+{
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    const qint64 day = 86400000;
+    QVector<MemoryTurn> corpus = syntheticTurns(now);
+    const int cublas = int(corpus.size());
+    corpus << turn("claude", "sess-cublas", now - 3 * day,
+                   "Why is the cuBLAS GEMM slower than our sm120 FP4 kernel at 128x256 tiles?",
+                   "cuBLAS picks a 64x128 tile for this shape, so it leaves the tensor cores half fed.");
+    const int slowmix = int(corpus.size());
+    corpus << turn("agy", "sess-slowmix", now - 2 * day, "Set the slowmix reverb preset to cathedral for night drive",
+                   "Reverb is now cathedral at 0.85x speed.");
+    // Identical text, two sessions: only recency can order them.
+    const int oldTwin = int(corpus.size());
+    corpus << turn("codex", "sess-twin-old", now - 10 * day, "Rotate the grafana dashboard api token", "Rotated it.");
+    const int newTwin = int(corpus.size());
+    corpus << turn("codex", "sess-twin-new", now - 1 * day, "Rotate the grafana dashboard api token", "Rotated it.");
+    corpus << turn("phonon", "meeting_1700000012345678", now - 1 * day,
+                   "[00:01] CALL: should we fund the kernelbench grant\n[00:05] ME: yes, fifty thousand", QString(), "meeting");
+
+    MemoryIndex idx;
+    idx.setTurns(corpus);
+    check(idx.size() == corpus.size(), "memory: corpus indexed", QString::number(idx.size()));
+
+    QVector<MemoryHit> hits = idx.search("cublas gemm fp4 tiles", QString(), 4, now);
+    check(!hits.isEmpty() && hits[0].turn == cublas && hits[0].bm25Rank == 1,
+          "memory: exact words recall the planted turn at rank 1",
+          hits.isEmpty() ? QString() : QString::number(hits[0].turn));
+
+    // Voice-typed misspellings share no word with the turn: only character 3-grams carry it.
+    hits = idx.search("kublass", QString(), 4, now);
+    check(!hits.isEmpty() && hits[0].turn == cublas && hits[0].bm25Rank == 0 && hits[0].semanticRank == 1,
+          "memory: char 3-grams recall a misspelled term (kublass -> cuBLAS) with no BM25 match",
+          hits.isEmpty() ? QStringLiteral("no hits") : QStringLiteral("%1 bm25 %2").arg(hits[0].turn).arg(hits[0].bm25Rank));
+    hits = idx.search("slow mix reverb presets", QString(), 4, now);
+    check(!hits.isEmpty() && hits[0].turn == slowmix, "memory: a paraphrase (slow mix / presets) recalls the turn");
+
+    hits = idx.search("rotate grafana dashboard token", QString(), 4, now);
+    check(hits.size() >= 2 && hits[0].turn == newTwin && hits[1].turn == oldTwin,
+          "memory: recency breaks a tie between identical turns (1 day beats 10 days)",
+          hits.size() >= 2 ? QStringLiteral("%1, %2").arg(hits[0].turn).arg(hits[1].turn) : QString());
+
+    hits = idx.search("cublas gemm fp4 tiles", "sess-cublas", 4, now);
+    check(std::none_of(hits.cbegin(), hits.cend(), [&](const MemoryHit &h) { return h.turn == cublas; }),
+          "memory: excludeSessionId drops the active session's turns");
+
+    const QString block = idx.query("cublas gemm fp4 tiles", QString(), 4, 3200, now);
+    check(block.startsWith("[claude sess-cub] proj, 3d ago\nUser: Why is the cuBLAS") && block.contains("\nAssistant: cuBLAS picks"),
+          "memory: query formats [harness session] project, age / User / Assistant", block.left(120));
+    check(block.size() <= 3200, "memory: query stays within 3,200 chars", QString::number(block.size()));
+    const QString meet = idx.query("kernelbench grant funding", QString(), 4, 3200, now);
+    check(meet.startsWith("[phonon 12345678] meeting, 24h ago\nUser: [00:01] CALL: should we fund"),
+          "memory: a Phonon meeting chunk is tagged by its meeting id", meet.left(80));
+
+    // A tight budget with long turns: every block shares it, the total never exceeds it.
+    QVector<MemoryTurn> longTurns;
+    for (int i = 0; i < 8; ++i)
+        longTurns << turn("claude", QStringLiteral("long-%1").arg(i), now - i * day,
+                          QString("tensor parallel allreduce bandwidth ").repeated(40),
+                          QString("nccl ring allreduce saturates pcie at 24 GB/s ").repeated(60));
+    MemoryIndex tight;
+    tight.setTurns(longTurns);
+    const QString t3200 = tight.query("allreduce bandwidth", QString(), 4, 3200, now);
+    const QString t600 = tight.query("allreduce bandwidth", QString(), 4, 600, now);
+    check(t3200.size() <= 3200 && t3200.count("\nUser: ") == 4 && t600.size() <= 600 && !t600.isEmpty(),
+          "memory: top-4 long turns fit 3,200 and 600 char budgets",
+          QStringLiteral("%1 (%2 blocks) / %3").arg(t3200.size()).arg(t3200.count("\nUser: ")).arg(t600.size()));
+    check(t3200.count("[claude ") == 4 && !t3200.contains("long-4"), "memory: exactly top-K turns, no neighbours");
+
+    check(idx.query("zzqx", QString(), 4, 3200, now).isEmpty() && idx.query("the and of", QString(), 4, 3200, now).isEmpty()
+              && MemoryIndex().query("cublas").isEmpty(),
+          "memory: no match, stopwords only, or an empty index yield \"\"");
+
+    // Latency on 500 synthetic turns (plus the planted ones).
+    QElapsedTimer timer;
+    timer.start();
+    const QStringList qs{"cublas gemm fp4 tiles", "kublass", "rotate grafana dashboard token", "docker build cache",
+                         "thread mutex queue timeout"};
+    for (int r = 0; r < 4; ++r)
+        for (const QString &q : qs)
+            idx.query(q, QString(), 4, 3200, now);
+    const double perQuery = timer.nsecsElapsed() / 1e6 / (4 * qs.size());
+    check(perQuery < 50.0, "memory: query latency < 50 ms on 500 turns", QStringLiteral("%1 ms").arg(perQuery, 0, 'f', 2));
+    std::printf("memory: %.2f ms per query over %d turns, ~%.1f MB\n", perQuery, idx.size(), idx.memoryBytes() / 1e6);
+
+    // scan(): fixture transcripts for all four harnesses, plus a redacted path and a stale file.
+    QTemporaryDir td;
+    const QString root = td.path();
+    QDir().mkpath(root + "/claude/-Users-me-dev-lapis");
+    QDir().mkpath(root + "/claude/-Users-me-dev-infinity");
+    QDir().mkpath(root + "/codex/2026/11/18");
+    QDir().mkpath(root + "/agy/0f0f0f0f-1111-2222-3333-444444444444/.system_generated/logs");
+    QDir().mkpath(root + "/phonon/meeting_1795000000000");
+    const QByteArray claude =
+        R"({"type":"user","cwd":"/Users/me/dev/lapis","message":{"role":"user","content":"why does the fn key toggle lag?"}})" "\n"
+        R"({"type":"assistant","cwd":"/Users/me/dev/lapis","message":{"role":"assistant","content":[{"type":"text","text":"The HID poll runs at 125 Hz."}]}})" "\n"
+        R"({"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":"ok"}]}})" "\n"
+        R"({"type":"user","message":{"role":"user","content":"and the fix?"}})" "\n"
+        R"({"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Poll at 1 kHz."}]}})" "\n"
+        R"({"type":"user","message":{"role":"user","content":"unanswered"}})" "\n";
+    const QString claudeId = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+    check(writeFile(root + "/claude/-Users-me-dev-lapis/" + claudeId + ".jsonl", claude)
+              && writeFile(root + "/claude/-Users-me-dev-lapis/11111111-2222-3333-4444-555555555555.jsonl", claude)
+              && writeFile(root + "/claude/-Users-me-dev-infinity/99999999-2222-3333-4444-555555555555.jsonl", claude),
+          "memory scan: claude fixtures");
+    setAgeSeconds(root + "/claude/-Users-me-dev-lapis/11111111-2222-3333-4444-555555555555.jsonl", 20 * 86400);
+    const QByteArray codex =
+        R"({"type":"session_meta","payload":{"id":"x","cwd":"/Users/me/dev/slowmix"}})" "\n"
+        R"({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions\n\n<INSTRUCTIONS>\nrules\n</INSTRUCTIONS>"},{"type":"input_text","text":"<environment_context>\n  <cwd>/Users/me</cwd>\n</environment_context>"}]}})" "\n"
+        R"({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"add a cathedral reverb"}]}})" "\n"
+        R"({"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Added cathedral."}]}})" "\n";
+    const QString codexId = "c0dec0de-0000-4000-8000-000000000001";
+    check(writeFile(root + "/codex/2026/11/18/rollout-2026-11-18T10-00-00-" + codexId + ".jsonl", codex), "memory scan: codex fixture");
+    check(writeFile(root + "/agy/0f0f0f0f-1111-2222-3333-444444444444/.system_generated/logs/transcript.jsonl",
+                    R"({"step_index":0,"type":"USER_INPUT","content":"<USER_REQUEST>\nwhy did 128-reg win?\n</USER_REQUEST>"})" "\n"
+                    R"({"step_index":2,"type":"PLANNER_RESPONSE","content":"Registers hold the dequant."})" "\n"),
+          "memory scan: agy fixture");
+    check(writeFile(root + "/phonon/meeting_1795000000000/transcript.txt", "[00:01] CALL: hello\n[00:02] ME: hi\n"),
+          "memory scan: phonon fixture");
+
+    MemorySources src;
+    src.claudeProjects = root + "/claude";
+    src.codexSessions = root + "/codex";
+    src.agyBrain = root + "/agy";
+    src.phononMeetings = root + "/phonon";
+    src.excludePathParts = {"infinity"};
+    MemoryCache cache;
+    const QVector<MemoryTurn> scanned = MemoryIndex::scan(src, now, &cache);
+    auto count = [&](const QString &h) {
+        return std::count_if(scanned.cbegin(), scanned.cend(), [&](const MemoryTurn &t) { return t.harness == h; });
+    };
+    const auto claudeTurn = std::find_if(scanned.cbegin(), scanned.cend(), [](const MemoryTurn &t) { return t.harness == "claude"; });
+    check(count("claude") == 2 && count("codex") == 1 && count("agy") == 1 && count("phonon") == 1,
+          "memory scan: 2 claude + 1 codex + 1 agy + 1 phonon (stale, redacted, unanswered and AGENTS.md skipped)",
+          QStringLiteral("%1/%2/%3/%4").arg(count("claude")).arg(count("codex")).arg(count("agy")).arg(count("phonon")));
+    check(claudeTurn != scanned.cend() && claudeTurn->sessionId == claudeId && claudeTurn->project == "lapis"
+              && claudeTurn->userText == "why does the fn key toggle lag?" && claudeTurn->assistantText == "The HID poll runs at 125 Hz.",
+          "memory scan: claude turn keeps session uuid, cwd project and both sides");
+    check(std::any_of(scanned.cbegin(), scanned.cend(),
+                      [&](const MemoryTurn &t) { return t.sessionId == codexId && t.project == "slowmix" && t.userText == "add a cathedral reverb"; }),
+          "memory scan: codex session id is the rollout uuid, project from session_meta cwd");
+    check(std::none_of(scanned.cbegin(), scanned.cend(), [](const MemoryTurn &t) { return t.sessionId.startsWith("99999999"); }),
+          "memory scan: an excluded (infinity) path is never read");
+    src.excludeSessionIds = {claudeId};
+    const QVector<MemoryTurn> again = MemoryIndex::scan(src, now, &cache);
+    check(again.size() == scanned.size() - 2 && cache.size() >= 3, "memory scan: excludeSessionIds + cached rescan",
+          QStringLiteral("%1 vs %2").arg(again.size()).arg(scanned.size()));
+    src.maxTurns = 2;
+    check(MemoryIndex::scan(src, now, nullptr).size() == 2, "memory scan: maxTurns caps the corpus");
+}
+
+// --- Window state -----------------------------------------------------------------------------
+
+void windowStateTests()
+{
+    WindowState s;
+    s.displayUuid = "00000000-0000-4000-8000-0000000D15A1";
+    s.relX = 120;
+    s.relY = -4;
+    s.width = 1680;
+    s.height = 1050;
+    s.fullscreen = true;
+    const QJsonObject o = s.toJson();
+    check(WindowState::fromJson(o) == s && o.value("displayUuid").toString() == s.displayUuid && o.value("fullscreen").toBool(),
+          "window: JSON round trip");
+    const QJsonObject parsed = QJsonDocument::fromJson(QJsonDocument(QJsonObject{{"windowState", o}}).toJson())
+                                   .object().value("windowState").toObject();
+    check(WindowState::fromJson(parsed) == s, "window: round trip through serialized prefs text");
+    const WindowState bad = WindowState::fromJson(QJsonObject{{"width", -5}, {"height", "x"}, {"maximized", true}});
+    check(!bad.hasGeometry() && bad.maximized && !bad.fullscreen && bad.displayUuid.isEmpty(),
+          "window: malformed fields read as defaults");
+
+    const QRect avail(0, 25, 1512, 920);  // a 14" MacBook below the menu bar
+    check(clampWindowRect(QRect(100, 100, 1200, 800), avail) == QRect(100, 100, 1200, 800), "window: clamp keeps a fitting rect");
+    check(clampWindowRect(QRect(3000, 2000, 1200, 800), avail) == QRect(312, 145, 1200, 800),
+          "window: clamp pulls an off-screen rect back inside", "");
+    check(clampWindowRect(QRect(-400, -300, 1200, 800), avail) == QRect(0, 25, 1200, 800), "window: clamp from top-left");
+    check(clampWindowRect(QRect(0, 0, 2560, 1600), avail) == QRect(0, 25, 1512, 920),
+          "window: a rect larger than the screen shrinks to it");
+    check(clampWindowRect(QRect(50, 60, 400, 300), avail) == QRect(50, 60, 1100, 700), "window: minimum size enforced");
+    const QRect external(1512, -200, 2560, 1415);  // an external display right of and above the laptop
+    check(clampWindowRect(QRect(1512 + 2400, 900, 1680, 1050), external) == QRect(1512 + 2560 - 1680, 165, 1680, 1050),
+          "window: clamp on a secondary display with a negative origin");
+}
+
 }  // namespace
 
 int main(int argc, char **argv)
@@ -329,6 +561,8 @@ int main(int argc, char **argv)
     coreTests();
     phononTests();
     slowmixTests();
+    memoryTests();
+    windowStateTests();
     std::printf("test_core_ingest: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

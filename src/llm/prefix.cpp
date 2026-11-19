@@ -47,6 +47,8 @@ QString tieredLeafText(const TieredPrompt &p)
         section(QStringLiteral("Recent user actions:\n- ") + p.recentActions.join(QStringLiteral("\n- ")));
     if (!p.phononTail.isEmpty())
         section(QStringLiteral("Live Phonon audio transcript:\n") + p.phononTail);
+    if (!p.memory.isEmpty())
+        section(QStringLiteral("Relevant past conversations:\n") + p.memory);
     section(QStringLiteral("Question: ") + p.question);
     return leaf;
 }

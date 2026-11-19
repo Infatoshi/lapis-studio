@@ -22,6 +22,7 @@ endfunction()
 # Value types and the lock-free SPSC ring. QtCore only.
 add_library(lapis_core STATIC
   src/core/types.hpp src/core/types.cpp
+  src/core/window_geometry.hpp src/core/window_geometry.cpp
   src/core/ring_buffer.hpp
 )
 target_include_directories(lapis_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -32,9 +33,10 @@ lapis_warnings(lapis_core)
 add_library(lapis_ingest STATIC
   src/ingest/phonon.hpp src/ingest/phonon.cpp
   src/ingest/slowmix.hpp src/ingest/slowmix.cpp
+  src/ingest/memory.hpp src/ingest/memory.cpp
   src/transcript.hpp src/transcript.cpp
 )
-target_link_libraries(lapis_ingest PUBLIC lapis_core Qt6::Core)
+target_link_libraries(lapis_ingest PUBLIC lapis_core Qt6::Core Qt6::Concurrent)
 lapis_warnings(lapis_ingest)
 
 # APC-aligned prompt builder, SSE parser and the libcurl-multi LlmRouter.
@@ -58,10 +60,11 @@ add_library(lapis_mac STATIC
   src/pdfrender.hpp src/pdfrender.mm
   src/gamepad.hpp src/gamepad.cpp src/gamepad_mac.mm
   src/metalbench.hpp src/metalbench.mm
+  src/mac/window_state.hpp src/mac/window_state.mm
 )
 target_include_directories(lapis_mac PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(lapis_mac PUBLIC Qt6::Core Qt6::Gui Qt6::Quick
-  "-framework PDFKit" "-framework AppKit" "-framework CoreGraphics" "-framework Metal" "-framework GameController")
+target_link_libraries(lapis_mac PUBLIC lapis_core Qt6::Core Qt6::Gui Qt6::Quick
+  "-framework ApplicationServices" "-framework PDFKit" "-framework AppKit" "-framework CoreGraphics" "-framework Metal" "-framework GameController")
 lapis_warnings(lapis_mac)
 
 # --- App -----------------------------------------------------------------------------------
@@ -74,6 +77,7 @@ qt_add_executable(lapis_studio
   src/demo.hpp src/demo.cpp
   src/tests.cpp
   src/bench.cpp
+  src/qml_host.hpp src/qml_host.cpp
 )
 # A plain Unix executable at build/lapis_studio, as the brief asks (no .app bundle).
 set_target_properties(lapis_studio PROPERTIES MACOSX_BUNDLE OFF)
