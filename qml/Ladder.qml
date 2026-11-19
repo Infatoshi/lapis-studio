@@ -32,6 +32,32 @@ Item {
     function scrollBy(d) {
         scrollPixels(d * 34 * 4);
     }
+    function reportTurnHover(pos) {
+        const targets = backend ? backend.targets : null;
+        if (!targets)
+            return;
+        const lp = thread.mapFromItem(convo, pos.x, pos.y);
+        const i = lp.x >= 0 && lp.y >= 0 && lp.y < thread.height
+            ? thread.indexAt(lp.x + thread.contentX, lp.y + thread.contentY) : -1;
+        const item = i >= 0 ? thread.itemAtIndex(i) : null;
+        const t = i >= 0 ? turns[i] : null;
+        if (!item || !t) {
+            clearTurnHover();
+            return;
+        }
+        const r = item.mapToItem(null, 0, 0, item.width, item.height);
+        const text = String(t.text || "");
+        targets.setHoverTarget("turn", project ? project.key : "", "", "turn=" + (i + 1),
+                               t.role + " turn " + (i + 1),
+                               text.length > 3000 ? text.slice(0, 3000) + "…" : text,
+                               r.x, r.y, r.width, r.height);
+    }
+    function clearTurnHover() {
+        const targets = backend ? backend.targets : null;
+        if (targets && targets.activeTarget.kind === "turn")
+            targets.clearHoverTarget("turn");
+    }
+
     // A different session opens at its newest turn.
     property string shownKey: ""
     onProjectChanged: {
@@ -93,6 +119,12 @@ Item {
         y: rungs.y + rungs.height + 8
         width: root.colW
         height: Math.max(0, root.height - y)
+
+        // Hover-to-ask: one HoverHandler for the thread; the turn comes from the pointer's y.
+        HoverHandler {
+            onPointChanged: if (hovered) root.reportTurnHover(point.position)
+            onHoveredChanged: if (!hovered) root.clearTurnHover()
+        }
 
         Text {
             x: 76

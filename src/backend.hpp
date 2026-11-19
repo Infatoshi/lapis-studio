@@ -8,6 +8,7 @@
 #include "llm/prefix.hpp"
 #include "llm/router.hpp"
 #include "llm/sse.hpp"
+#include "targets/target_registry.hpp"
 
 #include <QElapsedTimer>
 #include <QFileSystemWatcher>
@@ -212,6 +213,8 @@ class Backend : public QObject {
     Q_PROPERTY(QString openaiCompatModel READ openaiCompatModel WRITE setOpenaiCompatModel NOTIFY prefsChanged)
     // PS4 DualShock 4 / extended gamepad. Always present; only main()'s live window enables it.
     Q_PROPERTY(QObject *gamepad READ gamepadObject CONSTANT)
+    // Hovered / pinned semantic targets (TargetRegistry); viewers push, FloatingOmnibar reads.
+    Q_PROPERTY(QObject *targets READ targets CONSTANT)
     // Morning Briefing: changed / active projects in two lines each (see localBriefing()).
     Q_PROPERTY(QVariantList briefing READ briefing NOTIFY briefingChanged)
     Q_PROPERTY(bool briefingBusy READ briefingBusy NOTIFY briefingChanged)
@@ -330,8 +333,15 @@ public:
     // cancels the old request. Emits streamDelta / streamFinished.
     Q_INVOKABLE void askStream(const QString &streamId, const QString &projectKey, int artifactIndex,
                                const QString &question);
+    // askStream with an explicit Tier 3 target slice (hovered / pinned targets from
+    // TargetRegistry::buildCombinedSlice) in place of the on-screen artifact slice. Tier 0 + 1
+    // stay byte-identical to the warmed prefix. An empty slice falls back to the artifact's.
+    Q_INVOKABLE void askStreamWithSlice(const QString &streamId, const QString &projectKey, int artifactIndex,
+                                        const QString &targetSlice, const QString &question);
     Q_INVOKABLE void cancelStream(const QString &streamId);
     Q_INVOKABLE void clearStreamHistory(const QString &streamId);
+    // Hover history, pins and the active semantic target (created on first use).
+    TargetRegistry *targets();
     QVector<ChatTurn> streamHistory(const QString &streamId) const { return m_streamHistory.value(streamId); }
     // Live mode owns a router (created lazily); tests may inject one (not owned) in any mode.
     LlmRouter *llmRouter();
@@ -590,6 +600,9 @@ private:
     QStringList m_recentActions;
     QStringList m_projectOrder;  // locks card slots so background updates never shuffle muscle memory
     Gamepad m_gamepad;
+    std::unique_ptr<TargetRegistry> m_targets;  // lazy: targets()
+    void startConversation(const QString &streamId, const QString &projectKey, const QString &slice,
+                           const QString &question);
 
     QString m_quickQuestion, m_quickAnswer;
     bool m_quickBusy = false;

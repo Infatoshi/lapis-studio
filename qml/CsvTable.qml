@@ -69,6 +69,52 @@ Item {
         list.contentY = Math.max(0, Math.min(Math.max(0, list.contentHeight - list.height), list.contentY + d * 48 * 2));
     }
 
+    // Hover-to-ask: one HoverHandler over the table; (row, col) from the pointer and the scroll.
+    property QtObject targets: null
+    function rowText(r) {
+        const cells = rows[r] || [];
+        const out = [];
+        for (let c = 0; c < header.length; ++c)
+            out.push(cells[c] !== undefined ? String(cells[c]) : "");
+        return out.join(" | ");
+    }
+    function reportHover(pos) {
+        if (!targets)
+            return;
+        const lp = list.mapFromItem(sheet, pos.x, pos.y);
+        const r = list.indexAt(lp.x + list.contentX, lp.y + list.contentY);
+        const item = r >= 0 ? list.itemAtIndex(r) : null;
+        // Column: the pointer's x in the horizontally scrolled content.
+        const cx = lp.x;
+        let c = -1, x0 = 0;
+        for (let i = 0, acc = 0; i < colW.length; ++i) {
+            if (cx >= acc && cx < acc + colW[i]) {
+                c = i;
+                x0 = acc;
+                break;
+            }
+            acc += colW[i];
+        }
+        if (!item || c < 0) {
+            clearHover();
+            return;
+        }
+        const h = String(header[c]);
+        const v = rows[r] && rows[r][c] !== undefined ? String(rows[r][c]) : "";
+        const lines = ["Table: " + (artifact && artifact.title ? artifact.title : "table"),
+                       "Columns: " + header.join(" | ")];
+        for (let j = Math.max(0, r - 1); j <= Math.min(rows.length - 1, r + 1); ++j)
+            lines.push((j === r ? "> Row " : "  Row ") + (j + 1) + ": " + rowText(j));
+        lines.push("Cell: " + h + " = " + v);
+        const rect = item.mapToItem(null, x0, 0, colW[c], item.height);
+        targets.setHoverTarget("table_cell", "", "", "row=" + (r + 1) + "/col=" + (c + 1), h + ": " + v,
+                               lines.join("\n"), rect.x, rect.y, rect.width, rect.height);
+    }
+    function clearHover() {
+        if (targets && targets.activeTarget.kind === "table_cell")
+            targets.clearHoverTarget("table_cell");
+    }
+
     Rectangle {
         id: sheet
         anchors.centerIn: parent
@@ -79,6 +125,11 @@ Item {
         border.width: 1
         border.color: Theme.line
         clip: true
+
+        HoverHandler {
+            onPointChanged: if (hovered) root.reportHover(point.position)
+            onHoveredChanged: if (!hovered) root.clearHover()
+        }
 
         Flickable {
             id: hFlick

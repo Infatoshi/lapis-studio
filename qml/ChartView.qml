@@ -22,6 +22,55 @@ Item {
         return isFinite(m) ? m : 0;
     }
 
+    // Hover-to-ask: one HoverHandler; the bar under the pointer, or the line point nearest in x.
+    property QtObject targets: null
+    readonly property string series: artifact && artifact.title ? artifact.title : "series"
+    function valueAt(i) {
+        return valueText[i] !== undefined && String(valueText[i]).length > 0 ? String(valueText[i]) : String(values[i]);
+    }
+    function reportHover(pos) {
+        const n = values.length;
+        if (!targets || n === 0)
+            return;
+        let i = -1;
+        let r;
+        if (line) {
+            const lp = linePlot.mapFromItem(root, pos.x, pos.y);
+            i = Math.max(0, Math.min(n - 1, Math.round(lp.x / Math.max(1, linePlot.width) * Math.max(1, n - 1))));
+            const pt = linePlot.pt(i);
+            r = linePlot.mapToItem(null, pt.x - 14, pt.y - 14, 28, 28);
+        } else {
+            const lp = plot.mapFromItem(root, pos.x, pos.y);
+            i = Math.floor(lp.x / plot.slot);
+            if (i < 0 || i >= n) {
+                clearHover();
+                return;
+            }
+            r = plot.mapToItem(null, plot.slot * i + (plot.slot - plot.barW) / 2, 0, plot.barW, plot.height);
+        }
+        let sum = 0;
+        for (let j = 0; j < n; ++j) sum += values[j];
+        const name = labels[i] !== undefined ? String(labels[i]) : "#" + (i + 1);
+        const all = [];
+        for (let j = 0; j < Math.min(n, 24); ++j)
+            all.push((labels[j] !== undefined ? labels[j] : "#" + (j + 1)) + "=" + valueAt(j));
+        const ctx = ["Chart: " + series + " (" + (line ? "line" : "bar") + ", " + n + " points)",
+                     "min " + minV + " · max " + maxV + " · mean " + (sum / n).toFixed(2)
+                         + (best >= 0 && labels[best] !== undefined ? " · best " + labels[best] : ""),
+                     "Point " + (i + 1) + ": " + name + " = " + valueAt(i) + (i === best ? " (best)" : ""),
+                     "All: " + all.join(", ") + (n > 24 ? ", ..." : "")];
+        targets.setHoverTarget("chart_point", "", "", "series=" + series + "/idx=" + i, name + ": " + valueAt(i),
+                               ctx.join("\n"), r.x, r.y, r.width, r.height);
+    }
+    function clearHover() {
+        if (targets && targets.activeTarget.kind === "chart_point")
+            targets.clearHoverTarget("chart_point");
+    }
+    HoverHandler {
+        onPointChanged: if (hovered) root.reportHover(point.position)
+        onHoveredChanged: if (!hovered) root.clearHover()
+    }
+
     property real grow: 0
     Component.onCompleted: grow = 1
     Behavior on grow { NumberAnimation { duration: 520; easing.type: Easing.OutCubic } }

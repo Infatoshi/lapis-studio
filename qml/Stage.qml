@@ -255,9 +255,11 @@ Item {
             }
         }
 
-        Component { id: chartC; ChartView { artifact: p.artifact } }
-        Component { id: diffC; DiffView { artifact: p.artifact } }
-        Component { id: tableC; CsvTable { artifact: p.artifact } }
+        // Only the pane on screen reports hover targets (the outgoing one is mid-slide).
+        readonly property QtObject targets: p.current && p.backend ? p.backend.targets : null
+        Component { id: chartC; ChartView { artifact: p.artifact; targets: p.targets } }
+        Component { id: diffC; DiffView { artifact: p.artifact; targets: p.targets } }
+        Component { id: tableC; CsvTable { artifact: p.artifact; targets: p.targets } }
         Component { id: pdfC; PdfView { artifact: p.artifact; backend: p.backend; live: p.live } }
         Component { id: imageC; ImageView { artifact: p.artifact; live: p.live } }
         Component { id: mediaC; MediaView { artifact: p.artifact; backend: p.backend; live: p.live } }

@@ -17,6 +17,20 @@ FocusScope {
     // There is no arrows mode; arrow keys are a silent fallback in every mode.
     readonly property real uiScale: backend ? backend.uiScale : 1.0
     readonly property string navMode: backend ? backend.navMode : "controller"
+    // Hovered / pinned semantic targets; viewers push into it, the floating ask card reads it.
+    readonly property QtObject targets: backend ? backend.targets : null
+    Binding {
+        target: app.targets
+        when: app.targets !== null
+        property: "scopeSessionId"
+        value: app.lens > 0 ? app.projectKey : ""
+    }
+    Binding {
+        target: app.targets
+        when: app.targets !== null
+        property: "scopeArtifactId"
+        value: app.lens === 2 ? String(app.artifactIndex) : ""
+    }
 
     // --- Tab next-action predictor -------------------------------------------------------------
     property var visited: []        // project keys zoomed into this session
@@ -44,6 +58,8 @@ FocusScope {
     }
     onArtifactIndexChanged: markSeen()
     onLensChanged: {
+        if (targets)
+            targets.clearHoverTarget();  // the lens that reported it is fading out
         if (lens === 0)
             seenArtifacts = [];  // re-entering a project starts a fresh tour
         markSeen();
@@ -57,7 +73,7 @@ FocusScope {
 
     // The view in charge supplies the prediction: the composer while it has focus, else the lens.
     readonly property var predictedAction: {
-        if (settings.open || onboarding.open || dialog.open || briefing.open)
+        if (settings.open || onboarding.open || dialog.open || briefing.open || omnibar.open)
             return null;
         if (answers.inputFocused)
             return answers.predictedAction;
@@ -314,9 +330,14 @@ FocusScope {
             e.accepted = true;
             return;
         }
+        // Cmd+K: the floating ask card (prompt from anywhere). Cmd+Shift+K: cycle the keymap.
         if (ctrl && e.key === Qt.Key_K) {
-            if (backend)
-                backend.cycleNavMode();
+            if ((e.modifiers & Qt.ShiftModifier) !== 0) {
+                if (backend)
+                    backend.cycleNavMode();
+            } else {
+                omnibar.toggle();
+            }
             e.accepted = true;
             return;
         }
@@ -371,8 +392,18 @@ FocusScope {
             e.accepted = true;
             return;
         }
+        // "/" with no text field focused opens the floating ask card.
+        if (!ctrl && e.text === "/") {
+            omnibar.openAt(-1, -1);
+            e.accepted = true;
+            return;
+        }
         if (e.key === Qt.Key_Tab && !ctrl) {
-            acceptPrediction();
+            // Mouse mode, pointer on a target: Tab pins it for a multi-target ask.
+            if (navMode === "mouse" && targets && targets.hasActiveTarget)
+                targets.pinActiveTarget();
+            else
+                acceptPrediction();
             e.accepted = true;
             return;
         }
@@ -397,7 +428,9 @@ FocusScope {
             action = Qt.Key_Escape;
         if (action === Qt.Key_Escape) {
             app.takeFocus();
-            if (proseOpen)
+            if (omnibar.open)
+                omnibar.close();
+            else if (proseOpen)
                 proseOpen = false;
             else if (lens > 0)
                 goLens(0);
@@ -724,6 +757,7 @@ FocusScope {
         visible: app.zoom < 0.999
         visited: app.visited
         cursorActive: app.lens === 0 && focusCursor.active
+        targets: app.lens === 0 ? app.targets : null
         onEnter: (i) => app.enterProject(i)
         onZoomBy: (f) => app.zoomBy(f)
         onNewSession: dialog.show()
@@ -1065,7 +1099,7 @@ FocusScope {
     }
 
     // Keymap pill, bottom right: "nav vim" at rest; hover shows all three for a one-click switch.
-    // Clicking the current mode (or Cmd+K) cycles arrows -> vim -> wasd; clicking another picks it.
+    // Clicking the current mode (or Cmd+Shift+K) cycles the modes; clicking another picks it.
     Item {
         id: navPill
         objectName: "navPill"
@@ -1157,6 +1191,37 @@ FocusScope {
                 font.pixelSize: 13
             }
         }
+    }
+
+    // Middle-click anywhere, or Shift+Click on a hovered target, opens the floating ask card.
+    // Every other press is declined, so it falls through to whatever is underneath.
+    MouseArea {
+        objectName: "omnibarTrigger"
+        anchors.fill: parent
+        acceptedButtons: Qt.LeftButton | Qt.MiddleButton
+        enabled: !omnibar.suppressed
+        onPressed: (m) => {
+            const middle = m.button === Qt.MiddleButton;
+            const shiftTarget = m.button === Qt.LeftButton && (m.modifiers & Qt.ShiftModifier) !== 0
+                                && app.targets && app.targets.hasActiveTarget;
+            if (!middle && !shiftTarget) {
+                m.accepted = false;
+                return;
+            }
+            omnibar.openAt(m.x, m.y);
+        }
+    }
+
+    FloatingOmnibar {
+        id: omnibar
+        anchors.fill: parent
+        backend: app.backend
+        projectKey: app.lens > 0 ? app.projectKey
+                                 : (app.projects.length > 0 ? app.projects[Math.min(app.selectedIsland, app.projects.length - 1)].key : "")
+        artifactIndex: app.lens === 2 ? app.artifactIndex : -1
+        mouseMode: app.navMode === "mouse"
+        suppressed: settings.open || dialog.open || onboarding.open || briefing.open || controllerMap.open
+        onClosed: app.takeFocus()
     }
 
     NewSessionDialog {

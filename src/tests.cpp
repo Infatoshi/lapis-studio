@@ -20,6 +20,8 @@
 #include <QTemporaryDir>
 #include <QThread>
 #include <QWheelEvent>
+#include <QMouseEvent>
+#include <QPointer>
 #include <QGuiApplication>
 #include <QQmlApplicationEngine>
 #include <QQmlComponent>
@@ -1330,8 +1332,9 @@ void uiTests()
         auto sel = [&] { return app->property("selectedIsland").toInt(); };
         auto letter = [&](int key, const char *t) { sendKey(win, key, Qt::NoModifier, QString::fromLatin1(t)); };
         check(backend.navMode() == "controller" && sel() == 0, "nav: starts in Controller mode on island 1");
-        sendKey(win, Qt::Key_K, Qt::ControlModifier);
-        check(backend.navMode() == "vim" && sel() == 0, "nav: Cmd+K -> vim (Neovim)", backend.navMode());
+        // Cmd+K opens the floating ask card now; Cmd+Shift+K cycles the keymap.
+        sendKey(win, Qt::Key_K, Qt::ControlModifier | Qt::ShiftModifier);
+        check(backend.navMode() == "vim" && sel() == 0, "nav: Cmd+Shift+K -> vim (Neovim)", backend.navMode());
         letter(Qt::Key_D, "d");
         check(sel() == 0, "nav: vim mode ignores wasd letters", QString::number(sel()));
         letter(Qt::Key_L, "l");
@@ -1351,8 +1354,8 @@ void uiTests()
         sendKey(win, Qt::Key_Right);
         check(sel() == 1, "nav: arrow keys still work in vim mode");
         sendKey(win, Qt::Key_Left);
-        sendKey(win, Qt::Key_K, Qt::ControlModifier);
-        check(backend.navMode() == "wasd", "nav: Cmd+K -> wasd (Gaming)", backend.navMode());
+        sendKey(win, Qt::Key_K, Qt::ControlModifier | Qt::ShiftModifier);
+        check(backend.navMode() == "wasd", "nav: Cmd+Shift+K -> wasd (Gaming)", backend.navMode());
         letter(Qt::Key_L, "l");
         check(sel() == 0, "nav: wasd mode ignores vim keys");
         letter(Qt::Key_D, "d");
@@ -1374,13 +1377,13 @@ void uiTests()
         sendKey(win, Qt::Key_Down);
         check(sel() == 3, "nav: arrow keys still work in wasd mode", QString::number(sel()));
         sendKey(win, Qt::Key_Up);
-        sendKey(win, Qt::Key_K, Qt::ControlModifier);
-        check(backend.navMode() == "mouse", "nav: Cmd+K -> mouse", backend.navMode());
+        sendKey(win, Qt::Key_K, Qt::ControlModifier | Qt::ShiftModifier);
+        check(backend.navMode() == "mouse", "nav: Cmd+Shift+K -> mouse", backend.navMode());
         letter(Qt::Key_L, "l");
         letter(Qt::Key_D, "d");
         check(sel() == 0, "nav: mouse mode has no letter navigation");
-        sendKey(win, Qt::Key_K, Qt::ControlModifier);
-        check(backend.navMode() == "controller" && sel() == 0, "nav: Cmd+K wraps back to controller");
+        sendKey(win, Qt::Key_K, Qt::ControlModifier | Qt::ShiftModifier);
+        check(backend.navMode() == "controller" && sel() == 0, "nav: Cmd+Shift+K wraps back to controller");
         settle(700);
     }
 
@@ -3087,6 +3090,461 @@ void llmRouterBackendTests()
     b.setLlmRouter(nullptr);
 }
 
+// --- Floating omnibar / hover targets ---------------------------------------------------------
+
+// A local OpenAI-compatible SSE endpoint: every POST gets one reasoning delta and then `answer`,
+// unless `hold` is set, in which case the request stays open with no reply (a slow model).
+struct FakeSse {
+    QTcpServer server;
+    QList<QByteArray> bodies;
+    QString answer = QStringLiteral("Row 2 leads.");
+    bool hold = false;
+
+    static QByteArray chunk(const char *field, const QString &v)
+    {
+        const QJsonObject delta{{QString::fromLatin1(field), v}};
+        const QJsonObject o{{QStringLiteral("choices"), QJsonArray{QJsonObject{{QStringLiteral("delta"), delta}}}}};
+        return "data: " + QJsonDocument(o).toJson(QJsonDocument::Compact) + "\n\n";
+    }
+    bool start()
+    {
+        QObject::connect(&server, &QTcpServer::newConnection, &server, [this] {
+            while (QTcpSocket *s = server.nextPendingConnection()) {
+                auto buf = std::make_shared<QByteArray>();
+                auto done = std::make_shared<bool>(false);
+                QObject::connect(s, &QTcpSocket::readyRead, s, [this, s, buf, done] {
+                    *buf += s->readAll();
+                    const qsizetype he = buf->indexOf("\r\n\r\n");
+                    if (*done || he < 0)
+                        return;
+                    const QByteArray head = buf->left(he).toLower();
+                    const qsizetype cl = head.indexOf("content-length:");
+                    const qsizetype eol = head.indexOf("\r\n", cl);
+                    const qsizetype len =
+                        cl < 0 ? 0 : head.mid(cl + 15, eol < 0 ? -1 : eol - cl - 15).trimmed().toLongLong();
+                    if (buf->size() < he + 4 + len)
+                        return;
+                    *done = true;
+                    bodies << buf->mid(he + 4, len);
+                    if (hold)
+                        return;
+                    const QByteArray body = chunk("reasoning_content", QStringLiteral("comparing the pinned cells"))
+                                            + chunk("content", answer) + "data: [DONE]\n\n";
+                    s->write("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n"
+                             "Content-Length: " + QByteArray::number(body.size()) + "\r\n\r\n" + body);
+                    s->disconnectFromHost();
+                });
+                QObject::connect(s, &QTcpSocket::disconnected, s, &QObject::deleteLater);
+            }
+        });
+        return server.listen(QHostAddress::LocalHost, 0);
+    }
+    QString url() const { return QStringLiteral("http://127.0.0.1:%1/v1").arg(server.serverPort()); }
+};
+
+bool waitUntil(const std::function<bool()> &ok, int ms)
+{
+    QElapsedTimer t;
+    t.start();
+    while (!ok() && t.elapsed() < ms) {
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 5);
+        QThread::msleep(1);
+    }
+    return ok();
+}
+
+void mouseMove(QQuickWindow *w, QPointF p, Qt::MouseButtons held = Qt::NoButton)
+{
+    QMouseEvent ev(QEvent::MouseMove, p, w->mapToGlobal(p), Qt::NoButton, held, Qt::NoModifier);
+    QCoreApplication::sendEvent(w, &ev);
+}
+
+void mouseButton(QQuickWindow *w, QEvent::Type type, QPointF p, Qt::MouseButton b, Qt::KeyboardModifiers mods = {})
+{
+    QMouseEvent ev(type, p, w->mapToGlobal(p), b, type == QEvent::MouseButtonPress ? Qt::MouseButtons(b) : Qt::NoButton,
+                   mods);
+    QCoreApplication::sendEvent(w, &ev);
+}
+
+void mouseClick(QQuickWindow *w, QPointF p, Qt::MouseButton b, Qt::KeyboardModifiers mods = {})
+{
+    mouseButton(w, QEvent::MouseButtonPress, p, b, mods);
+    mouseButton(w, QEvent::MouseButtonRelease, p, b, mods);
+}
+
+// Left-drag from `from` by `delta` in small steps (past the drag threshold).
+void mouseDrag(QQuickWindow *w, QPointF from, QPointF delta)
+{
+    mouseMove(w, from);
+    mouseButton(w, QEvent::MouseButtonPress, from, Qt::LeftButton);
+    const int steps = 24;
+    for (int i = 1; i <= steps; ++i) {
+        mouseMove(w, from + delta * (qreal(i) / steps), Qt::LeftButton);
+        QCoreApplication::processEvents();
+    }
+    mouseButton(w, QEvent::MouseButtonRelease, from + delta, Qt::LeftButton);
+}
+
+QQuickItem *visibleItem(QQuickWindow *w, const char *name)
+{
+    for (QQuickItem *it : findItems(w->contentItem(), QString::fromLatin1(name)))
+        if (it->isVisible() && it->width() > 0 && it->height() > 0)
+            return it;
+    return nullptr;
+}
+
+int visibleCount(QQuickWindow *w, const char *name)
+{
+    int n = 0;
+    for (QQuickItem *it : findItems(w->contentItem(), QString::fromLatin1(name)))
+        n += it->isVisible() ? 1 : 0;
+    return n;
+}
+
+// Opens the first mock project with an artifact of KIND on the Stage, showing that artifact.
+bool showArtifactKind(QObject *app, Backend &b, const QString &kind, QString *projectKey = nullptr)
+{
+    const QVariantList ps = b.projects();
+    for (int i = 0; i < ps.size(); ++i) {
+        const QVariantList arts = ps[i].toMap().value(QStringLiteral("artifacts")).toList();
+        for (int a = 0; a < arts.size(); ++a) {
+            if (arts[a].toMap().value(QStringLiteral("kind")).toString() != kind)
+                continue;
+            QMetaObject::invokeMethod(app, "enterProject", Q_ARG(QVariant, QVariant(i)));
+            app->setProperty("artifactIndex", a);
+            settle(700);
+            if (projectKey)
+                *projectKey = ps[i].toMap().value(QStringLiteral("key")).toString();
+            return true;
+        }
+    }
+    return false;
+}
+
+// Window point at the centre of table row `row`, column `col` of the visible CsvTable.
+QPointF tableCellPoint(QQuickWindow *win, int row, int col)
+{
+    QQuickItem *table = visibleItem(win, "tableView");
+    QQuickItem *list = visibleItem(win, "csvList");
+    if (!table || !list)
+        return {-1, -1};
+    QQuickItem *rowItem = nullptr;
+    QMetaObject::invokeMethod(list, "itemAtIndex", Q_RETURN_ARG(QQuickItem *, rowItem), Q_ARG(int, row));
+    if (!rowItem)
+        return {-1, -1};
+    const QVariantList colW = table->property("colW").toList();
+    qreal x = 0;
+    for (int c = 0; c < col && c < colW.size(); ++c)
+        x += colW[c].toReal();
+    const qreal w = colW.value(col).toReal();
+    return rowItem->mapToScene(QPointF(x + std::min<qreal>(w / 2, 40), rowItem->height() / 2));
+}
+
+void omnibarUiTests()
+{
+    Backend backend(Backend::Mode::Mock);
+    QQmlApplicationEngine engine;
+    QQuickWindow *win = createStudioWindow(engine, &backend, false, QSize(1920, 1080));
+    check(win != nullptr, "omni: QML loads");
+    if (!win)
+        return;
+    QObject *app = win->findChild<QObject *>("studioApp");
+    QQuickItem *omni = firstItem(win, "floatingOmnibar");
+    QQuickItem *card = firstItem(win, "omnibarCard");
+    TargetRegistry *reg = backend.targets();
+    check(app && omni && card && backend.property("targets").value<QObject *>() == reg,
+          "omni: FloatingOmnibar present; backend.targets is the registry");
+    if (!app || !omni || !card)
+        return;
+    settle(450);
+    auto isOpen = [&] { return omni->property("open").toBool(); };
+    auto focusName = [&] {
+        QQuickItem *f = win->activeFocusItem();
+        return f ? f->objectName() : QString();
+    };
+    auto cardRect = [&] { return QRectF(card->x(), card->y(), card->width(), card->height()); };
+    auto rectText = [](const QRectF &r) {
+        return QStringLiteral("%1,%2 %3x%4").arg(r.x()).arg(r.y()).arg(r.width()).arg(r.height());
+    };
+    const QString key0 = backend.projects().value(0).toMap().value("key").toString();
+    check(!isOpen() && !card->isVisible(), "omni: closed at start");
+
+    // Cmd+K opens with focus in the prompt; Esc closes and hands focus back.
+    sendKey(win, Qt::Key_K, Qt::ControlModifier);
+    settle(30);
+    check(isOpen() && card->isVisible() && focusName() == "omnibarInput", "omni: Cmd+K opens, prompt focused",
+          focusName());
+    sendKey(win, Qt::Key_Escape);
+    settle(30);
+    check(!isOpen() && !card->isVisible() && focusName() != "omnibarInput", "omni: Esc closes and returns focus");
+    check(backend.navMode() == "controller", "omni: Cmd+K no longer cycles the keymap", backend.navMode());
+
+    // "/" with no text field focused opens it too.
+    sendKey(win, Qt::Key_Slash, Qt::NoModifier, "/");
+    settle(30);
+    check(isOpen() && focusName() == "omnibarInput", "omni: / opens the card");
+    sendKey(win, Qt::Key_Escape);
+
+    // A real pointer over an island reports a session target; leaving clears it.
+    {
+        QQuickItem *isl = findItems(win->contentItem(), "island").value(0);
+        const QPointF c = isl ? isl->mapToScene(QPointF(isl->width() / 2, isl->height() / 2)) : QPointF();
+        mouseMove(win, c);
+        settle(40);
+        const QVariantMap t = reg->activeTarget();
+        check(t.value("kind") == "session" && t.value("sessionId") == key0 && !t.value("label").toString().isEmpty()
+                  && QRectF(t.value("x").toReal(), t.value("y").toReal(), t.value("w").toReal(), t.value("h").toReal())
+                         .contains(c),
+              "hover: island reports kind=session, its key, name and window rect",
+              t.value("kind").toString() + " " + t.value("sessionId").toString());
+        // Shift+Click on the hovered island opens the card under it (and does not enter it).
+        mouseClick(win, c, Qt::LeftButton, Qt::ShiftModifier);
+        settle(40);
+        check(isOpen() && app->property("lens").toInt() == 0
+                  && omni->property("chips").toList().value(0).toMap().value("kind") == "session",
+              "omni: Shift+Click on a hovered island opens the card about it, no zoom",
+              QString::number(app->property("lens").toInt()));
+        sendKey(win, Qt::Key_Escape);
+        mouseMove(win, QPointF(3, 3));
+        settle(40);
+        check(!reg->hasActiveTarget(), "hover: leaving the island clears the target");
+    }
+
+    // Middle-click anywhere opens it at the pointer.
+    mouseClick(win, QPointF(3, 300), Qt::MiddleButton);
+    settle(30);
+    check(isOpen() && std::abs(card->x() - 16) < 1 && std::abs(card->y() - 310) < 1,
+          "omni: middle-click opens the card at the pointer (clamped to the 16 px margin)", rectText(cardRect()));
+    sendKey(win, Qt::Key_Escape);
+
+    // Anchoring: under the target (x, y + h + 10); a corner target keeps the card inside the window.
+    reg->setHoverTarget("table_cell", key0, "0", "row=2/col=3", "tok/s: 126", "Table: sweep\n> Row 2: c1 | 126",
+                        300, 200, 110, 30);
+    sendKey(win, Qt::Key_K, Qt::ControlModifier);
+    settle(30);
+    check(isOpen() && card->x() == 300 && card->y() == 240, "omni: card anchors under the hovered target",
+          rectText(cardRect()));
+    sendKey(win, Qt::Key_Escape);
+    reg->setHoverTarget("table_cell", key0, "0", "row=9/col=3", "tok/s: 410", "corner", 1860, 1050, 50, 20);
+    sendKey(win, Qt::Key_K, Qt::ControlModifier);
+    settle(30);
+    {
+        const QRectF r = cardRect();
+        check(r.left() >= 16 && r.top() >= 16 && r.right() <= 1920 - 16 + 0.5 && r.bottom() <= 1080 - 16 + 0.5,
+              "omni: card is clamped inside the window bounds", rectText(r));
+    }
+    sendKey(win, Qt::Key_Escape);
+
+    // Dragging the header moves the card.
+    reg->setHoverTarget("table_cell", key0, "0", "row=2/col=3", "tok/s: 126", "Table: sweep\n> Row 2: c1 | 126",
+                        300, 200, 110, 30);
+    sendKey(win, Qt::Key_K, Qt::ControlModifier);
+    settle(30);
+    {
+        QQuickItem *header = firstItem(win, "omnibarHeader");
+        const QPointF from = header ? header->mapToScene(QPointF(header->width() / 2, header->height() / 2)) : QPointF();
+        const QRectF before = cardRect();
+        mouseDrag(win, from, QPointF(240, 120));
+        settle(30);
+        const QRectF after = cardRect();
+        check(header && std::abs(after.x() - before.x() - 240) < 2 && std::abs(after.y() - before.y() - 120) < 2,
+              "omni: dragging the header moves the card", rectText(before) + " -> " + rectText(after));
+        QMetaObject::invokeMethod(app, "takeFocus");
+        sendKey(win, Qt::Key_Escape);  // focus left the prompt: the app's Esc closes it
+        settle(30);
+        check(!isOpen(), "omni: Esc from the app closes the card too");
+    }
+
+    // Multi-target pins: Tab in the prompt pins the hovered target; a repeat is deduplicated.
+    reg->setHoverTarget("table_cell", key0, "0", "row=2/col=3", "tok/s: 126", "Table: sweep\n> Row 2: c1 | 126",
+                        300, 200, 110, 30);
+    sendKey(win, Qt::Key_K, Qt::ControlModifier);
+    settle(20);
+    sendKey(win, Qt::Key_Tab);
+    reg->setHoverTarget("diff_line", key0, "1", "line=7", "fix.diff L7", "Diff: fix\n> 7 + return x;", 300, 600, 400, 30);
+    sendKey(win, Qt::Key_Tab);
+    sendKey(win, Qt::Key_Tab);
+    settle(40);
+    check(reg->pinnedCount() == 2 && visibleCount(win, "omnibarChip") == 2 && isOpen() && focusName() == "omnibarInput",
+          "omni: Tab pins two targets as two chips (repeat deduplicated), prompt keeps focus",
+          QStringLiteral("%1 pins, %2 chips").arg(reg->pinnedCount()).arg(visibleCount(win, "omnibarChip")));
+
+    // Dispatch: Enter sends askStreamWithSlice on omni:<card> with both pins as the Tier 3 slice.
+    FakeSse sse;
+    check(sse.start(), "omni: local SSE server listens");
+    LlmRouter router;
+    backend.setLlmRouter(&router);
+    backend.setOpenaiCompatUrl(sse.url());
+    QStringList finished;
+    const auto conn = QObject::connect(&backend, &Backend::streamFinished,
+                                       [&finished](const QString &id, const QString &e) { finished << id + "|" + e; });
+    typeText(win, "which is faster");
+    sendKey(win, Qt::Key_Return);
+    const QString sid = omni->property("streamId").toString();
+    check(sid.startsWith("omni:") && omni->property("busy").toBool(), "omni: Enter starts a stream on omni:<card>", sid);
+    waitUntil([&] { return !omni->property("busy").toBool(); }, 5000);
+    check(finished.contains(sid + "|") && omni->property("answer").toString() == sse.answer
+              && omni->property("thinking").toString() == "comparing the pinned cells",
+          "omni: the answer and thinking stream into the card", finished.join(';'));
+    {
+        const QJsonArray msgs =
+            QJsonDocument::fromJson(sse.bodies.value(0)).object().value("messages").toArray();
+        const QString leaf = msgs.isEmpty() ? QString() : msgs.last().toObject().value("content").toString();
+        check(leaf.contains("Pointed-at targets (2):") && leaf.contains("tok/s: 126") && leaf.contains("fix.diff L7")
+                  && leaf.endsWith("Question: which is faster"),
+              "omni: Tier 3 carries both pinned targets, then the question", leaf.left(200));
+        check(msgs.size() == 3 && msgs[1].toObject().value("content").toString() == "Pinned context:\n" + backend.contextTrunk(key0),
+              "omni: Tier 0 + Tier 1 are the warmed prefix, unchanged (cache-hot)", QString::number(msgs.size()));
+        check(omni->property("lastProject").toString() == key0 && omni->property("lastArtifact").toInt() == 0,
+              "omni: the first chip names the project and artifact of the ask");
+    }
+    {
+        const QImage shot = win->grabWindow();
+        check(forbiddenPixels(shot) == 0, "omni: open card with an answer has zero blue/green pixels",
+              QString::number(forbiddenPixels(shot)));
+    }
+
+    // Pin card: the card detaches into a persistent answer card; a second card streams beside it.
+    QMetaObject::invokeMethod(omni, "pinCard");
+    settle(30);
+    check(!isOpen() && omni->property("pinnedCardCount").toInt() == 1 && visibleCount(win, "pinnedAskCard") == 1,
+          "omni: Pin card detaches it into a persistent floating card");
+    sendKey(win, Qt::Key_K, Qt::ControlModifier);
+    settle(20);
+    sse.answer = QStringLiteral("Because MTP adds 15 tok/s.");
+    typeText(win, "and why");
+    sendKey(win, Qt::Key_Return);
+    const QString sid2 = omni->property("streamId").toString();
+    waitUntil([&] { return !omni->property("busy").toBool(); }, 5000);
+    QMetaObject::invokeMethod(omni, "pinCard");
+    settle(30);
+    check(sid2 != sid && sid2.startsWith("omni:") && omni->property("pinnedCardCount").toInt() == 2
+              && visibleCount(win, "pinnedAskCard") == 2,
+          "omni: a second card has its own stream id and pins beside the first", sid + " / " + sid2);
+
+    // Cancel: Esc on a card whose request is still open cancels its stream; no late finish arrives.
+    sse.hold = true;
+    sendKey(win, Qt::Key_K, Qt::ControlModifier);
+    settle(20);
+    typeText(win, "slow one");
+    sendKey(win, Qt::Key_Return);
+    const QString sid3 = omni->property("streamId").toString();
+    waitUntil([&] { return sse.bodies.size() >= 3; }, 5000);
+    check(router.activeStreams() == 1 && omni->property("busy").toBool(), "omni: the slow ask is in flight",
+          QString::number(router.activeStreams()));
+    sendKey(win, Qt::Key_Escape);
+    settle(30);
+    check(!isOpen() && !omni->property("busy").toBool() && router.activeStreams() == 0,
+          "omni: Esc closes the card and cancels its stream", QString::number(router.activeStreams()));
+    settle(200);
+    check(!finished.join(';').contains(sid3), "omni: no finish event arrives for the cancelled card", finished.join(';'));
+
+    // Closing a pinned card removes it.
+    QMetaObject::invokeMethod(omni, "closePinned", Q_ARG(QVariant, QVariant(0)));
+    QMetaObject::invokeMethod(omni, "closePinned", Q_ARG(QVariant, QVariant(0)));
+    settle(20);
+    check(omni->property("pinnedCardCount").toInt() == 0 && visibleCount(win, "pinnedAskCard") == 0,
+          "omni: closing pinned cards removes them");
+    QObject::disconnect(conn);
+    backend.setLlmRouter(nullptr);
+    reg->clearPinnedTargets();
+    reg->clearHoverTarget();
+
+    // Viewer hover hooks, driven by real pointer moves over the mock Stage and Ladder.
+    {
+        QString key;
+        const bool shown = showArtifactKind(app, backend, "table", &key);
+        const QPointF p = tableCellPoint(win, 1, 1);
+        mouseMove(win, p);
+        settle(40);
+        const QVariantMap t = reg->activeTarget();
+        check(shown && t.value("kind") == "table_cell" && t.value("path") == "row=2/col=2"
+                  && t.value("sessionId") == key && t.value("contextText").toString().contains("> Row 2:")
+                  && t.value("contextText").toString().contains("Columns: "),
+              "hover: table cell reports row/col, header: value, and adjacent rows",
+              t.value("path").toString() + " | " + t.value("label").toString());
+        mouseMove(win, QPointF(3, 3));
+        settle(30);
+        check(!reg->hasActiveTarget(), "hover: leaving the table clears the cell");
+    }
+    {
+        // No mock island carries a diff: a DiffView in its own offscreen window over a known diff.
+        QQuickWindow dwin;
+        dwin.resize(1000, 600);
+        QQmlComponent comp(&engine);
+        comp.setData("import QtQuick\nimport Studio\nDiffView { width: 1000; height: 600 }", QUrl());
+        auto *dv = qobject_cast<QQuickItem *>(comp.create());
+        auto ln = [](const char *k, const char *no, const char *html) {
+            return QVariantMap{{"k", QString::fromLatin1(k)}, {"no", QString::fromLatin1(no)}, {"html", QString::fromLatin1(html)}};
+        };
+        const QVariantList lines{ln("f", "", "src/attn.cpp"), ln(" ", "40", "int tile = 64;"),
+                                 ln("-", "41", "return 0;"), ln("+", "41", "return tile &amp; mask;"),
+                                 ln(" ", "42", "}")};
+        if (dv) {
+            dv->setParentItem(dwin.contentItem());
+            dv->setProperty("artifact", QVariantMap{{"title", "attn tile fix"}, {"lines", lines}});
+            dv->setProperty("targets", QVariant::fromValue(static_cast<QObject *>(reg)));
+            dwin.show();
+            settle(250);
+            QQuickItem *row = nullptr;
+            QQuickItem *list = findItems(dv, "diffList").value(0);
+            if (list)
+                QMetaObject::invokeMethod(list, "itemAtIndex", Q_RETURN_ARG(QQuickItem *, row), Q_ARG(int, 3));
+            const QPointF p = row ? row->mapToScene(QPointF(300, row->height() / 2)) : QPointF();
+            mouseMove(&dwin, p);
+            settle(40);
+        }
+        const QVariantMap t = reg->activeTarget();
+        const QString ctx = t.value("contextText").toString();
+        check(dv && t.value("kind") == "diff_line" && t.value("path") == "line=4" && t.value("label") == "attn tile fix L41"
+                  && ctx.contains("> 41 + return tile & mask;") && ctx.contains("  40   int tile = 64;"),
+              "hover: diff line reports line=N, '<title> L<N>' and the surrounding lines (markup stripped)",
+              t.value("path").toString() + " | " + t.value("label").toString() + " | " + ctx);
+        if (dv) {
+            mouseMove(&dwin, QPointF(-50, -50));
+            settle(30);
+            delete dv;
+        }
+        reg->clearHoverTarget();
+    }
+    {
+        const bool shown = showArtifactKind(app, backend, "chart");
+        QQuickItem *cv = visibleItem(win, "chartView");
+        const QPointF p = cv ? cv->mapToScene(QPointF(cv->width() * 0.5, cv->height() * 0.8)) : QPointF();
+        mouseMove(win, p);
+        settle(40);
+        const QVariantMap t = reg->activeTarget();
+        check(shown && t.value("kind") == "chart_point" && t.value("path").toString().contains("/idx=")
+                  && t.value("contextText").toString().contains("mean "),
+              "hover: chart bar reports series/idx, label: value and series stats",
+              t.value("path").toString() + " | " + t.value("label").toString());
+        mouseMove(win, QPointF(3, 3));
+        settle(30);
+    }
+    {
+        QMetaObject::invokeMethod(app, "goLens", Q_ARG(QVariant, QVariant(1)));
+        settle(500);
+        QQuickItem *thread = visibleItem(win, "threadView");
+        const int count = thread ? thread->property("count").toInt() : 0;
+        QQuickItem *last = nullptr;
+        if (thread && count > 0)
+            QMetaObject::invokeMethod(thread, "itemAtIndex", Q_RETURN_ARG(QQuickItem *, last), Q_ARG(int, count - 1));
+        const QPointF p = last ? last->mapToScene(QPointF(40, std::min<qreal>(last->height() / 2, 30))) : QPointF();
+        mouseMove(win, p);
+        settle(40);
+        const QVariantMap t = reg->activeTarget();
+        check(last && t.value("kind") == "turn" && t.value("path") == QStringLiteral("turn=%1").arg(count)
+                  && t.value("label").toString().endsWith(QStringLiteral("turn %1").arg(count)),
+              "hover: ladder turn reports turn=N and '<role> turn <N>'",
+              QString::number(count) + " " + t.value("path").toString() + " | " + t.value("label").toString());
+        mouseMove(win, QPointF(3, 3));
+        settle(30);
+        QMetaObject::invokeMethod(app, "goLens", Q_ARG(QVariant, QVariant(0)));
+        settle(400);
+        check(!reg->hasActiveTarget(), "hover: changing lens clears the hover target");
+    }
+}
+
 Turn mkTurn(const QString &role, const QString &text)
 {
     Turn t;
@@ -3302,6 +3760,85 @@ void formFactorTests()
 
 }  // namespace
 
+int snapOmnibar(const QString &outPath)
+{
+    Backend backend(Backend::Mode::Mock);
+    QQmlApplicationEngine engine;
+    QQuickWindow *win = createStudioWindow(engine, &backend, false, QSize(1920, 1080));
+    if (!win) {
+        std::fprintf(stderr, "snap-omnibar: QML failed to load\n");
+        return 2;
+    }
+    QObject *app = win->findChild<QObject *>("studioApp");
+    QQuickItem *omni = firstItem(win, "floatingOmnibar");
+    QQuickItem *card = firstItem(win, "omnibarCard");
+    if (!app || !omni || !card)
+        return 3;
+    settle(450);
+    backend.setNavMode("mouse");  // Tab pins the hovered target
+    if (!showArtifactKind(app, backend, "table")) {
+        std::fprintf(stderr, "snap-omnibar: no mock table artifact\n");
+        return 4;
+    }
+    FakeSse sse;
+    if (!sse.start())
+        return 5;
+    LlmRouter router;
+    backend.setLlmRouter(&router);
+    backend.setOpenaiCompatUrl(sse.url());
+    auto askAndWait = [&](const QString &q) {
+        typeText(win, q);
+        sendKey(win, Qt::Key_Return);
+        waitUntil([&] { return !omni->property("busy").toBool(); }, 5000);
+    };
+
+    // First card: one cell, answered, pinned, dragged to the right edge. Before it opens, the
+    // mouse-mode hover pill sits under the hovered cell: saved beside OUT as OUT-pill.png.
+    mouseMove(win, tableCellPoint(win, 0, 1));
+    settle(60);
+    QString pillPath = outPath;
+    pillPath.insert(outPath.endsWith(QLatin1String(".png"), Qt::CaseInsensitive) ? outPath.size() - 4 : outPath.size(),
+                    QStringLiteral("-pill"));
+    win->grabWindow().save(pillPath);
+    sendKey(win, Qt::Key_K, Qt::ControlModifier);
+    settle(30);
+    sse.answer = QStringLiteral("This row is the baseline: no tiling change yet, so every other row is measured against it.");
+    askAndWait(QStringLiteral("what is this row"));
+    QMetaObject::invokeMethod(omni, "pinCard");
+    settle(30);
+    if (QQuickItem *pc = firstItem(win, "pinnedAskCard")) {
+        const QPointF from = pc->mapToScene(QPointF(pc->width() / 2, 22));
+        mouseDrag(win, from, QPointF(1920 - 16 - pc->width() - pc->x(), 140 - pc->y()));
+        settle(30);
+    }
+
+    // Second card: Tab pins two cells (mouse mode), the card opens under the hovered one.
+    mouseMove(win, tableCellPoint(win, 1, 1));
+    settle(40);
+    sendKey(win, Qt::Key_Tab);
+    mouseMove(win, tableCellPoint(win, 2, 1));
+    settle(40);
+    sendKey(win, Qt::Key_Tab);
+    settle(40);
+    sendKey(win, Qt::Key_K, Qt::ControlModifier);
+    settle(30);
+    sse.answer = QStringLiteral("Row 3 is faster: the wider tile keeps both warps fed, so it holds 410 tok/s where row 2 "
+                                "stalls on shared-memory bank conflicts at 126.");
+    askAndWait(QStringLiteral("which of these is faster and why"));
+    settle(300);
+
+    const QImage img = win->grabWindow();
+    const bool saved = img.save(outPath);
+    const QRectF r(card->x(), card->y(), card->width(), card->height());
+    std::printf("snap-omnibar: %s %dx%d, card %.0f,%.0f %.0fx%.0f, %d pinned targets, %d pinned cards, "
+                "%d blue/green pixels\nanswer: %s\n",
+                saved ? "saved" : "FAILED to save", img.width(), img.height(), r.x(), r.y(), r.width(), r.height(),
+                backend.targets()->pinnedCount(), omni->property("pinnedCardCount").toInt(), forbiddenPixels(img),
+                qPrintable(omni->property("answer").toString()));
+    backend.setLlmRouter(nullptr);
+    return saved ? 0 : 1;
+}
+
 int runTests()
 {
     unitTests();
@@ -3309,6 +3846,7 @@ int runTests()
     openAiCompatUnitTests();
     llmRouterBackendTests();
     formFactorTests();
+    omnibarUiTests();
     uiTests();
     gamepadUiTests();
     std::printf("%d passed, %d failed\n", g_pass, g_fail);

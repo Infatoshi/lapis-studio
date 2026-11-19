@@ -2298,6 +2298,27 @@ void Backend::onRouterFinished(const QString &streamId, const QString &error)
 void Backend::askStream(const QString &streamId, const QString &projectKey, int artifactIndex,
                         const QString &question)
 {
+    startConversation(streamId, projectKey, contextSlice(projectKey, artifactIndex), question);
+}
+
+void Backend::askStreamWithSlice(const QString &streamId, const QString &projectKey, int artifactIndex,
+                                 const QString &targetSlice, const QString &question)
+{
+    const QString slice = targetSlice.trimmed();
+    startConversation(streamId, projectKey,
+                      slice.isEmpty() && artifactIndex >= 0 ? contextSlice(projectKey, artifactIndex) : slice, question);
+}
+
+TargetRegistry *Backend::targets()
+{
+    if (!m_targets)
+        m_targets = std::make_unique<TargetRegistry>();
+    return m_targets.get();
+}
+
+void Backend::startConversation(const QString &streamId, const QString &projectKey, const QString &slice,
+                                const QString &question)
+{
     const QString q = question.trimmed();
     if (streamId.isEmpty() || streamId == QLatin1String(kQuickStreamId) || q.isEmpty())
         return;
@@ -2317,7 +2338,7 @@ void Backend::askStream(const QString &streamId, const QString &projectKey, int 
     p.systemPrompt = kCompatSystemPrompt;
     p.trunk = contextTrunk(projectKey);
     p.history = m_streamHistory.value(streamId);
-    p.targetSlice = contextSlice(projectKey, artifactIndex);
+    p.targetSlice = slice;
     p.recentActions = m_recentActions;
     p.phononTail = m_phononTail;
     p.question = q;

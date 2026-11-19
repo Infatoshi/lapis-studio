@@ -168,5 +168,22 @@ Item {
         hoverEnabled: true
         cursorShape: Qt.PointingHandCursor
         onClicked: root.clicked()
+        // Hover-to-ask: the island reports itself as a session target (window coordinates).
+        onContainsMouseChanged: root.reportHover()
+    }
+    property QtObject targets: null
+    function reportHover() {
+        if (!targets || !proj)
+            return;
+        if (mouse.containsMouse) {
+            const r = root.mapToItem(null, 0, 0, root.width, root.height);
+            const job = proj.jobName ? proj.jobName : "";
+            const state = proj.stateLine ? proj.stateLine : "";
+            targets.setHoverTarget("session", proj.key, "", "", proj.name,
+                                   job.length > 0 && state.length > 0 ? job + " — " + state : job + state,
+                                   r.x, r.y, r.width, r.height);
+        } else if (targets.activeTarget.kind === "session" && targets.activeTarget.sessionId === proj.key) {
+            targets.clearHoverTarget("session");
+        }
     }
 }

@@ -9,6 +9,7 @@ Item {
     property int focusIndex: -1   // the island that is the shared element of that zoom
     property var visited: []      // project keys zoomed into this session (StudioApp keeps it)
     property bool cursorActive: false  // the app-wide focus cursor is wrapping the selected island
+    property QtObject targets: null    // backend.targets: islands report hover as session targets
     signal enter(int index)
     signal zoomBy(real factor)
     signal newSession()
@@ -138,6 +139,7 @@ Item {
             recede: index === root.focusIndex ? 0 : root.recede
             morphing: index === root.focusIndex && root.recede > 0.001
             pulse: root.pulse
+            targets: root.targets
             width: root.islandW
             height: root.islandH
             readonly property point c: root.islandCenter(index)

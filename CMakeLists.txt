@@ -45,6 +45,13 @@ add_library(lapis_llm STATIC
 target_link_libraries(lapis_llm PUBLIC lapis_core Qt6::Core PRIVATE CURL::libcurl)
 lapis_warnings(lapis_llm)
 
+# Hover / pin semantic targets and their Tier 3 slice. QtCore + QtGui only.
+add_library(lapis_targets STATIC
+  src/targets/target_registry.hpp src/targets/target_registry.cpp
+)
+target_link_libraries(lapis_targets PUBLIC lapis_core Qt6::Core Qt6::Gui)
+lapis_warnings(lapis_targets)
+
 # macOS-only rendering and input: PDFKit pages, GameController pad, offscreen Metal target.
 add_library(lapis_mac STATIC
   src/pdfrender.hpp src/pdfrender.mm
@@ -99,11 +106,12 @@ qt_add_qml_module(lapis_studio
     qml/ControllerMapOverlay.qml
     qml/OnboardingModal.qml
     qml/MorningBriefingOverlay.qml
+    qml/FloatingOmnibar.qml
 )
 
 lapis_warnings(lapis_studio)
 target_link_libraries(lapis_studio PRIVATE
-  lapis_core lapis_ingest lapis_llm lapis_mac
+  lapis_core lapis_ingest lapis_llm lapis_targets lapis_mac
   Qt6::Core Qt6::Gui Qt6::Qml Qt6::Quick Qt6::QuickControls2 Qt6::QuickShapes
   Qt6::Multimedia Qt6::Svg Qt6::Network Qt6::Concurrent)
 
@@ -118,3 +126,8 @@ qt_add_executable(test_llm tests/test_llm.cpp)
 set_target_properties(test_llm PROPERTIES MACOSX_BUNDLE OFF)
 target_link_libraries(test_llm PRIVATE lapis_llm lapis_core Qt6::Core)
 lapis_warnings(test_llm)
+
+qt_add_executable(test_targets tests/test_targets.cpp)
+set_target_properties(test_targets PROPERTIES MACOSX_BUNDLE OFF)
+target_link_libraries(test_targets PRIVATE lapis_targets lapis_core Qt6::Core Qt6::Gui)
+lapis_warnings(test_targets)

@@ -22,6 +22,52 @@ Rectangle {
         padIdle.restart();
         list.contentY = Math.max(0, Math.min(list.contentHeight - list.height, list.contentY + px));
     }
+    // Hover-to-ask: one HoverHandler for the whole diff; the line comes from the pointer's y.
+    property QtObject targets: null
+    function plain(i) {
+        const l = list.lines[i];
+        if (!l)
+            return "";
+        const body = String(l.html || "").replace(/<[^>]*>/g, "").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+            .replace(/&quot;/g, "\"").replace(/&#39;/g, "'").replace(/&nbsp;/g, " ").replace(/&amp;/g, "&");
+        const k = l.k === "+" || l.k === "-" ? l.k : " ";
+        return (l.no !== undefined && l.no !== "" ? String(l.no) : "") + " " + k + " " + body;
+    }
+    function lineNo(i) {
+        const l = list.lines[i];
+        return l && l.no !== undefined && String(l.no).length > 0 ? String(l.no) : String(i + 1);
+    }
+    function reportHover(pos) {
+        if (!targets)
+            return;
+        const lp = list.mapFromItem(root, pos.x, pos.y);
+        const i = list.indexAt(lp.x + list.contentX, lp.y + list.contentY);
+        const item = i >= 0 ? list.itemAtIndex(i) : null;
+        if (!item) {
+            clearHover();
+            return;
+        }
+        const title = root.artifact && root.artifact.title ? root.artifact.title : "diff";
+        const n = lineNo(i);
+        const around = [];
+        for (let j = Math.max(0, i - 4); j <= Math.min(list.lines.length - 1, i + 4); ++j)
+            around.push((j === i ? "> " : "  ") + plain(j));
+        const r = item.mapToItem(null, 0, 0, item.width, item.height);
+        // path: the diff row (unique even when a - and + line share a file line number);
+        // label: the file line number a human reads in the gutter.
+        targets.setHoverTarget("diff_line", "", "", "line=" + (i + 1), title + " L" + n,
+                               "Diff: " + title + "\n" + around.join("\n"), r.x, r.y, r.width, r.height);
+    }
+    function clearHover() {
+        if (targets && targets.activeTarget.kind === "diff_line")
+            targets.clearHoverTarget("diff_line");
+    }
+    HoverHandler {
+        id: hover
+        onPointChanged: if (hovered) root.reportHover(point.position)
+        onHoveredChanged: if (!hovered) root.clearHover()
+    }
+
     ListView {
         id: list
         objectName: "diffList"
