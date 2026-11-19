@@ -18,12 +18,13 @@ const QString kCompatSystemPrompt = QStringLiteral(
     "set_volume:<pct>, open_spotify, spotify_play, spotify_play:<song>, spotify_pause, spotify_next, spotify_prev, "
     "spotify_volume:<pct>, focus_project:<name>, open_stage:<name>, open_ladder:<name>, go_home, "
     "sort_map:category|recent|activity, move_cluster:<Work|Projects|Apps|Quick Qs>:<left|right|top|bottom>, "
-    "spawn_agent:<task> to start a coding agent on real work, cua_click:<on-screen target>, "
+    "spawn_agent:<task> to start a new coding agent, steer_agent:<message> or steer_agent:<project>|<message> to "
+    "send a message directly into an existing agent's session, cua_click:<on-screen target>, "
     "cua_type:<target>|<text>, cua_scroll:<target>|<deltaY> to operate the Mac visibly). Several tags may go in one answer. "
     "Name the app in every cua target and end typed text with \\n to submit a URL or search, "
     "e.g. [[ACTION:cua_type:Chrome address bar|x.com\\n]]. "
-    "Never say you are spawning or starting an agent unless the same answer emits [[ACTION:spawn_agent:<task>]]; "
-    "the tag is what starts it, the words alone do nothing.");
+    "Never say you are steering, messaging, spawning, or starting an agent unless the same answer emits "
+    "[[ACTION:steer_agent:...]] or [[ACTION:spawn_agent:<task>]]; the tag is what runs it, the words alone do nothing.");
 
 namespace {
 

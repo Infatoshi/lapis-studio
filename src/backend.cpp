@@ -4440,7 +4440,7 @@ QStringList studioActionNames()
             QStringLiteral("open_review"),    QStringLiteral("filter_needs_me"), QStringLiteral("filter_all"),
             QStringLiteral("reset_layout"),   QStringLiteral("open_settings"), QStringLiteral("open_briefing"),
             QStringLiteral("set_theme"),      QStringLiteral("show_diffs"),    QStringLiteral("spawn_agent"),
-            QStringLiteral("set_volume"),     QStringLiteral("open_spotify"),  QStringLiteral("spotify_play"),
+            QStringLiteral("steer_agent"),    QStringLiteral("set_volume"),    QStringLiteral("open_spotify"),  QStringLiteral("spotify_play"),
             QStringLiteral("spotify_pause"),  QStringLiteral("spotify_next"),  QStringLiteral("spotify_prev"),
             QStringLiteral("spotify_volume"), QStringLiteral("focus_project"), QStringLiteral("open_stage"),
             QStringLiteral("open_ladder"),    QStringLiteral("go_home"),       QStringLiteral("sort_map"),
@@ -5056,6 +5056,32 @@ QString Backend::dispatchStudioAction(const QString &action, const QString &arg)
         reply = on ? QStringLiteral("Code diffs are on.") : QStringLiteral("Code diffs are hidden.");
     } else if (a == QLatin1String("spawn_agent")) {
         return spawnAgent(m_commandProject.isEmpty() ? m_focusedProject : m_commandProject, arg, false);
+    } else if (a == QLatin1String("steer_agent")) {
+        QString targetKey = m_commandProject.isEmpty() ? m_focusedProject : m_commandProject;
+        QString msg = arg.trimmed();
+        const qsizetype bar = msg.indexOf(QLatin1Char('|'));
+        if (bar > 0) {
+            const QString projQuery = squashAlnum(msg.left(bar));
+            const QString rest = msg.mid(bar + 1).trimmed();
+            if (!projQuery.isEmpty() && !rest.isEmpty()) {
+                int best = 0;
+                QString matchedKey;
+                for (const Project &p : m_projects) {
+                    int score = 0;
+                    for (const QString &c : {squashAlnum(p.name), squashAlnum(p.key)})
+                        score = std::max(score, c == projQuery ? 3 : c.startsWith(projQuery) ? 2 : c.contains(projQuery) ? 1 : 0);
+                    if (score > best) {
+                        best = score;
+                        matchedKey = p.key;
+                    }
+                }
+                if (!matchedKey.isEmpty()) {
+                    targetKey = matchedKey;
+                    msg = rest;
+                }
+            }
+        }
+        return spawnAgent(targetKey, msg, true);
     } else if (a.startsWith(QLatin1String("cua_"))) {
         const CuaCommand c = parseCuaAction(a, arg);
         if (!c.valid)
