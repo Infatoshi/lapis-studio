@@ -82,6 +82,10 @@ int snapSlowmix(const QString &outPath);
 // --snap-map OUT.png: the clustered Constellation (Work · Projects · Apps · Quick Qs) with the
 // free pad cursor drawing a marquee and a finished multi-selection, offscreen at 1920x1080.
 int snapMap(const QString &outPath);
+// --snap-half OUT.png: the Constellation in a half-screen window (960x1080), 11 cards in four
+// clusters; also writes OUT-saved.png with full-screen saved card positions. Exit 0 only when
+// no card pair is closer than 14 px and no card's text lines collide.
+int snapHalf(const QString &outPath);
 int benchFps();
 // --bench-fps --metal: QQuickRenderControl into an offscreen Metal texture at dpr 2, 240 Hz
 // budget. shotDir non-empty: also save one GPU frame (read back from the texture) there.

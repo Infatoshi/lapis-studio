@@ -397,6 +397,24 @@ QString stripMarkup(const QString &s)
     return out;
 }
 
+QString stripMarkdownLinks(const QString &s)
+{
+    if (!s.contains(QLatin1Char('[')) && !s.contains(QLatin1Char('<')))
+        return s;
+    QString out = s;
+    // [label](url "title"), ![alt](url), [label](<path with spaces>); one level of parens in the URL.
+    static const QRegularExpression link(QStringLiteral(
+        "!?\\[([^\\]\\n]*)\\]\\((?:<[^>\\n]*>|[^()\\s]*(?:\\([^()\\s]*\\)[^()\\s]*)*)(?:\\s+\"[^\"\\n]*\")?\\)"));
+    out.replace(link, QStringLiteral("\\1"));
+    // A link the line was cut inside: "[app.toml](file:///Use" or "[app.toml](file:///Use…".
+    static const QRegularExpression dangling(QStringLiteral("!?\\[([^\\]\\n]*)\\]\\([^)\\s]*$"));
+    out.replace(dangling, QStringLiteral("\\1"));
+    // Autolinks: <https://x.y>, <file:///a/b>.
+    static const QRegularExpression autolink(QStringLiteral("<((?:https?|file)://[^>\\s]*)>"));
+    out.replace(autolink, QStringLiteral("\\1"));
+    return out;
+}
+
 int countWords(const QString &s)
 {
     int n = 0;

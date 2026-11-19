@@ -34,6 +34,10 @@ Item {
     Behavior on x { enabled: root.glide; SpringAnimation { spring: 3.2; damping: 0.28; epsilon: 0.25 } }
     Behavior on y { enabled: root.glide; SpringAnimation { spring: 3.2; damping: 0.28; epsilon: 0.25 } }
     readonly property bool hovered: mouse.containsMouse || cursorOver
+    // A short card (half-screen window, a crowded map): smaller type, the number on the title
+    // line, tighter margins. The roomy layout needs about 56 + 26 px of margin plus three lines.
+    readonly property bool compact: height < 56 + 26 + 8 + 1.25 * (Theme.px(31) + Theme.px(18) + Theme.px(17))
+    readonly property real padX: compact ? 18 : 28
 
     readonly property int fresh: proj && proj.fresh ? proj.fresh : 0
     readonly property bool active: proj ? proj.active === true : false
@@ -83,10 +87,13 @@ Item {
             antialiasing: true
         }
 
+        // Card number: above the title on a roomy card; on a compact card (a half-screen window)
+        // it sits on the title line, left of the name, so the three text lines keep their room.
         Text {
+            id: numberText
             objectName: "islandNumber"
-            x: 28
-            y: 24
+            x: root.compact ? textCol.x : 28
+            y: root.compact ? textCol.y + (titleRow.height - height) / 2 : 24
             visible: root.showNumber
             text: root.number <= 9 ? String(root.number) : ""
             color: Theme.faint
@@ -97,9 +104,10 @@ Item {
         // Top right: the pinned metric (only when pinned) and "+3", turns the agent wrote while
         // this island was off screen. Opening the island clears the badge.
         Row {
+            id: badges
             anchors.right: parent.right
-            anchors.rightMargin: 28
-            y: 21
+            anchors.rightMargin: root.compact ? root.padX : 28
+            y: root.compact ? textCol.y + (titleRow.height - height) / 2 : 21
             spacing: 10
             Text {
                 objectName: "islandMetric"
@@ -152,52 +160,80 @@ Item {
             }
         }
 
-        Text {
-            id: name
-            x: 28
-            y: 56
-            width: parent.width - 56
-            text: root.proj ? root.proj.name : ""
-            color: Theme.ink
-            elide: Text.ElideRight
-            // Tab islands are named by a phrase ("Add support to PS4 controller"): shrink before eliding.
-            fontSizeMode: Text.HorizontalFit
-            minimumPixelSize: Theme.px(22)
-            font.family: Theme.sans
-            font.pixelSize: Theme.px(31)
-            font.weight: Font.DemiBold
-        }
+        // Title, job line and state line stack in one clipped Column: each is a single elided
+        // line, so at any card height they can never draw over each other. A spacer keeps the
+        // state line pinned to the bottom edge when the card has room to spare.
+        Column {
+            id: textCol
+            objectName: "islandText"
+            anchors.fill: parent
+            anchors.leftMargin: root.padX
+            anchors.rightMargin: root.padX
+            anchors.topMargin: root.compact ? 14 : 56
+            anchors.bottomMargin: root.compact ? 12 : 26
+            spacing: 4
+            clip: true
 
-        // Line 1: what the agent is on ("Sweeping sm120 FP4 tile sizes"), from the job or goal.
-        Text {
-            objectName: "islandJob"
-            x: 28
-            y: name.y + name.height + 2
-            width: parent.width - 56
-            visible: root.nowLine.length > 0
-            text: root.nowLine
-            color: Theme.text
-            opacity: 0.85
-            elide: Text.ElideRight
-            maximumLineCount: 1
-            font.family: Theme.sans
-            font.pixelSize: Theme.px(18)
-        }
+            Item {
+                id: titleRow
+                width: textCol.width
+                height: name.height
+                Text {
+                    id: name
+                    objectName: "islandTitle"
+                    // Compact: the number and the badge row share this line.
+                    x: root.compact && numberText.visible && numberText.text.length > 0 ? numberText.implicitWidth + 10 : 0
+                    width: parent.width - x - (root.compact ? badges.width + 10 : 0)
+                    text: root.proj ? root.proj.name : ""
+                    color: Theme.ink
+                    elide: Text.ElideRight
+                    maximumLineCount: 1
+                    // Tab islands are named by a phrase ("Add support to PS4 controller"): shrink before eliding.
+                    fontSizeMode: Text.HorizontalFit
+                    minimumPixelSize: Theme.px(root.compact ? 15 : 22)
+                    font.family: Theme.sans
+                    font.pixelSize: Theme.px(root.compact ? 20 : 31)
+                    font.weight: Font.DemiBold
+                }
+            }
 
-        // Line 2: the latest completed step, or the decision the agent waits on (gold).
-        Text {
-            objectName: "islandLast"
-            x: 28
-            anchors.bottom: parent.bottom
-            anchors.bottomMargin: 26
-            width: parent.width - 56
-            visible: root.lastLine.length > 0
-            text: root.lastLine
-            color: root.blocker ? Theme.gold : Theme.dim
-            elide: Text.ElideRight
-            maximumLineCount: 1
-            font.family: Theme.sans
-            font.pixelSize: Theme.px(17)
+            // Line 1: what the agent is on ("Sweeping sm120 FP4 tile sizes"), from the job or goal.
+            Text {
+                id: jobLine
+                objectName: "islandJob"
+                width: textCol.width
+                visible: root.nowLine.length > 0
+                text: root.nowLine
+                color: Theme.text
+                opacity: 0.85
+                elide: Text.ElideRight
+                maximumLineCount: 1
+                font.family: Theme.sans
+                font.pixelSize: Theme.px(root.compact ? 15 : 18)
+            }
+
+            Item {
+                readonly property real free: textCol.height - titleRow.height
+                                             - (jobLine.visible ? jobLine.height + textCol.spacing : 0)
+                                             - (lastLine.visible ? lastLine.height + textCol.spacing : 0) - textCol.spacing
+                width: 1
+                height: Math.max(0, free)
+                visible: lastLine.visible && free > 0
+            }
+
+            // Line 2: the latest completed step, or the decision the agent waits on (gold).
+            Text {
+                id: lastLine
+                objectName: "islandLast"
+                width: textCol.width
+                visible: root.lastLine.length > 0
+                text: root.lastLine
+                color: root.blocker ? Theme.gold : Theme.dim
+                elide: Text.ElideRight
+                maximumLineCount: 1
+                font.family: Theme.sans
+                font.pixelSize: Theme.px(root.compact ? 14 : 17)
+            }
         }
     }
 

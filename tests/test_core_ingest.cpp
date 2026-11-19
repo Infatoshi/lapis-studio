@@ -903,6 +903,23 @@ void spotifyTests()
               && !parseSpotifyAppleScriptStatus("execution error: x").ok,
           "spotify app: not running / error is not ok");
 
+    // Web API JSON edge cases: podcasts, odd volumes, non-object roots, search id shapes.
+    const SpotifyPlayback episode = parseSpotifyPlayback(
+        R"({"is_playing":true,"currently_playing_type":"episode",
+            "item":{"name":"Ep 12","show":{"name":"Kernel Talk"}},"device":{"volume_percent":140}})");
+    check(episode.ok && episode.track == "Ep 12" && episode.artist == "Kernel Talk" && episode.volume == 100,
+          "spotify api: an episode names its show, volume clamps to 100", episode.artist);
+    const SpotifyPlayback noVol = parseSpotifyPlayback(R"({"is_playing":true,"item":{"name":"X","artists":[]},
+                                                            "device":{"volume_percent":null}})");
+    check(noVol.ok && noVol.artist.isEmpty() && noVol.volume == -1, "spotify api: empty artists and a null volume");
+    check(!parseSpotifyPlayback("[]").ok && !parseSpotifyPlayback(R"({"device":{"volume_percent":40}})").ok,
+          "spotify api: an array root or an object with no playback keys is not ok");
+    check(parseSpotifyFirstTrackId(R"({"tracks":{"items":[{"id":{"id":"objId42"}}]}})") == "objId42"
+              && parseSpotifyFirstTrackUri(R"({"tracks":{"items":[{"id":"spotify:track:Abc9"}]}})") == "spotify:track:Abc9"
+              && parseSpotifyFirstTrackUri(R"({"tracks":{"items":[{"id":"has space"}]}})").isEmpty()
+              && parseSpotifyFirstTrackUri("garbage").isEmpty(),
+          "spotify api: search id as an object, a prefixed id, non-base62 and garbage");
+
     QTemporaryDir td;
     const QString tokenPath = td.path() + "/user_client_token.json";
     const QString farFuture = QDateTime::currentDateTimeUtc().addSecs(3600).toString(Qt::ISODate);

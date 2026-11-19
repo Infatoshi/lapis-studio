@@ -175,7 +175,8 @@ FocusScope {
     readonly property rect predictedRect: {
         const p = predictedAction;
         const deps = [zoom, width, height, uiScale, artifactIndex, lens, answers.pickerOpen, answers.height,
-                      constellation.width, selectedIsland, stage.slideP, stage.opacity, ladder.opacity];
+                      constellation.width, constellation.height, constellation.scrollY, constellation.restCenters,
+                      selectedIsland, stage.slideP, stage.opacity, ladder.opacity];
         if (!p || deps.length === 0)
             return Qt.rect(0, 0, 0, 0);
         let r = Qt.rect(0, 0, 0, 0);
@@ -1499,6 +1500,7 @@ FocusScope {
     // Hidden in pure mouse mode, behind overlays, mid-zoom, and over the write-up.
     readonly property var cursorSpec: {
         const deps = [zoom, width, height, uiScale, lens, selectedIsland, artifactIndex, constellation.width,
+                      constellation.height, constellation.scrollY, constellation.islandH, constellation.restCenters,
                       constellation.count, constellation.slots, constellation.cardPositions, answers.inputFocused, answers.hasSelection, answers.inputText,
                       answers.height, answers.pickerOpen, stage.width, stage.height, stage.barH, stage.kind,
                       stage.terms.active, stage.terms.selected, stage.terms.count, stage.terms.expanded];
@@ -1520,6 +1522,8 @@ FocusScope {
             if (constellation.count === 0)
                 return null;
             const i = constellation.slotOf(selectedIsland) >= 0 ? selectedIsland : constellation.slots[0];
+            if (!constellation.islandInBand(i))
+                return null;  // scrolled out of view: no ring or hint over the top bar / footer
             return { item: constellation, r: constellation.islandRect(i), radius: 26, round: false, side: "bottom",
                      hint: confirmKey.length > 0 ? confirmKey + " Expand" : "" };
         }

@@ -403,6 +403,7 @@ QStringList sentencesOf(const QString &raw)
         if (line.isEmpty() || bullet.match(line).hasMatch())
             flush();
         line.remove(bullet);
+        line = stripMarkdownLinks(line);
         if (line.contains(QLatin1Char('<')))
             line = stripMarkup(line);
         line.replace(noise, QString());
@@ -440,7 +441,7 @@ IslandState islandState(const Extracted &ex, const QString &status)
 {
     IslandState st;
     if (!ex.jobName.isEmpty())
-        st.now = ex.jobName;
+        st.now = stripMarkdownLinks(ex.jobName);
     else if (!ex.goal.isEmpty())
         st.now = shortLine(sentencesOf(ex.goal).value(0, ex.goal), 9);
     // The latest assistant word: the full write-up when there is one, else the clipped turn.
@@ -795,7 +796,7 @@ HumanFilterReply parseFilterReply(const QString &reply)
             const QString val = m.captured(2).trimmed().remove(QStringLiteral("**"));
             inPoints = key == QLatin1String("POINTS");
             if (key == QLatin1String("STATE"))
-                r.stateLine = val.simplified();
+                r.stateLine = stripMarkdownLinks(val).simplified();
             else if (key == QLatin1String("FORM"))
                 r.form = val.toLower().contains(QLatin1String("chart")) ? QStringLiteral("chart") : QStringLiteral("summary");
             else if (!val.isEmpty())
@@ -2070,7 +2071,7 @@ QVariantMap Backend::projectMap(const Project &p) const
     QString stateLine;
     if (const auto f = m_humanFilter.constFind(p.key); f != m_humanFilter.cend() && f->mtime == p.mtime) {
         summary = f->summary;
-        stateLine = f->stateLine;
+        stateLine = stripMarkdownLinks(f->stateLine);
         if (!stateLine.isEmpty() && !is.blocker)
             m[QStringLiteral("lastLine")] = stateLine;
         if (!summary.isEmpty())

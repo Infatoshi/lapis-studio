@@ -99,6 +99,10 @@ QVariantMap tableFromCsv(const QString &csv);
 QVariantMap chartFromTable(const QVariantMap &table);
 QVariantList audioPeaks(const QString &wavPath, int buckets = 160);
 QString stripMarkup(const QString &s);
+// Markdown links and images down to their label: "[app.toml](file:///Users/x/app.toml)" ->
+// "app.toml", "![plot](out.png)" -> "plot", "<https://x.y>" -> "https://x.y". A link cut off
+// mid-URL ("[app.toml](file:///Use") still becomes its label. Card lines never show raw links.
+QString stripMarkdownLinks(const QString &s);
 // Raw tool-call markup a model can leak into its thinking or answer stream (<tool_call>...,
 // <function_calls>, <|tool_call_begin|> tokens, JSON {"name":..,"arguments":..} lines), removed
 // so the quick line, the trace and the conversation show only prose. Unclosed blocks (mid-stream)

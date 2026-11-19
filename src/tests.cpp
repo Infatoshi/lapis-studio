@@ -4602,9 +4602,11 @@ void slowmixUiTests()
         click(firstItem(win, "spotifyPrev"));
         click(chip("spotifyVolume", "60%"));
         const QStringList log = sp->commandLog();
-        check(log.mid(log.size() - 4) == QStringList{"playback play-pause", "playback next", "playback previous", "playback volume 60"}
+        check(log.mid(log.size() - 4)
+                      == QStringList{"api PUT /v1/me/player/play", "api POST /v1/me/player/next", "api POST /v1/me/player/previous",
+                                     "api PUT /v1/me/player/volume?volume_percent=60"}
                   && sp->volume() == 60,
-              "music ui: Play / Next / Prev / 60% map to spotify_player commands", log.join(" | "));
+              "music ui: Play / Next / Prev / 60% map to Spotify Web API calls", log.join(" | "));
         if (QQuickItem *in = firstItem(win, "spotifySearch")) {
             in->forceActiveFocus();
             in->setProperty("text", QStringLiteral("midnight city"));
@@ -4612,7 +4614,8 @@ void slowmixUiTests()
             settle(60);
         }
         QQuickItem *searchBox = firstItem(win, "spotifySearch");
-        check(sp->commandLog().contains("search midnight city") && sp->track() == "midnight city" && overlay->hasActiveFocus()
+        check(sp->commandLog().contains("api GET /v1/search?type=track&limit=1&q=midnight%20city") && sp->track() == "midnight city"
+                  && overlay->hasActiveFocus()
                   && searchBox && !searchBox->hasActiveFocus(),
               "music ui: the search box runs search-and-play and hands focus back",
               QStringLiteral("overlayFocus=%1 searchFocus=%2 track=%3 focusItem=%4")
@@ -5264,7 +5267,8 @@ void studioControlTests()
         tap([](S &s) { s.l1 = true; });
         tap([](S &s) { s.dpadY = 1; });  // up: volume one chip higher (unknown volume starts at 60)
         const QStringList log = sp->commandLog().mid(n0);
-        check(log == QStringList{"playback play-pause", "playback next", "playback previous", "playback volume 80"},
+        check(log == QStringList{"api PUT /v1/me/player/play", "api POST /v1/me/player/next", "api POST /v1/me/player/previous",
+                                 "api PUT /v1/me/player/volume?volume_percent=80"},
               "pad spotify: □ / R1 / L1 / ↑ map to play-pause / next / previous / volume", log.join(" | "));
         tap([](S &s) { s.r3 = true; });
         check(overlay->property("tab").toString() == "slowmix", "pad music: R3 again returns to Slowmix");
@@ -5317,7 +5321,9 @@ void finalWiringTests()
         sp.setVolume(145);
         sp.nextTrack();
         check(sp.playing() && started == 1 && sp.volume() == 100 && sp.spawnCount() == 0
-                  && sp.commandLog() == QStringList{"playback play-pause", "playback volume 100", "playback next"},
+                  && sp.commandLog()
+                         == QStringList{"api PUT /v1/me/player/play", "api PUT /v1/me/player/volume?volume_percent=100",
+                                        "api POST /v1/me/player/next"},
               "spotify: dry run updates state, clamps volume, logs commands, spawns nothing", sp.commandLog().join(" | "));
     }
 
@@ -5340,6 +5346,10 @@ void finalWiringTests()
         }
         SpotifyController sp;
         sp.setBinary(stub);
+        // CLI route only: no token file and no Spotify.app, so a live test never reaches the
+        // real Web API or the user's Spotify.app (both exist on a dev Mac).
+        sp.setTokenPath(tmp.path() + "/no-token.json");
+        sp.setAppPath(tmp.path() + "/NoSpotify.app");
         sp.setSpawnAllowed(true);  // one refresh at startup
         const bool refreshed = waitUntil([&] { return sp.track() == "Night Drive"; }, 5000);
         check(refreshed && sp.playing() && sp.artist() == "Lapis" && sp.volume() == 55 && !sp.busy(),
@@ -5347,15 +5357,17 @@ void finalWiringTests()
         sp.searchAndPlay(QStringLiteral("night drive"));
         const bool started = waitUntil([&] {
             QFile l(log);
-            return l.open(QIODevice::ReadOnly) && l.readAll().contains("playback start track --id abc123");
+            return l.open(QIODevice::ReadOnly) && l.readAll().contains("playback start track --name night drive");
         }, 5000);
         QFile l(log);
         const QString args = l.open(QIODevice::ReadOnly) ? QString::fromUtf8(l.readAll()) : QString();
-        check(started, "spotify live: search -> playback start track --id <first id>", args);
+        // No token, no Spotify.app: no Web API search, spotify_player resolves the name itself.
+        check(started, "spotify live: no token -> playback start track --name <query> via the CLI", args);
         waitUntil([&] { return !sp.busy(); }, 3000);
         sp.setBinary(tmp.path() + "/missing");
         sp.nextTrack();
-        check(sp.error().contains("not found") && sp.spawnCount() >= 3,
+        // Two real spawns so far (get key playback, playback start); the missing binary adds none.
+        check(sp.error().contains("not found") && sp.spawnCount() == 2,
               "spotify live: a missing binary reports instead of spawning", sp.error());
         check(SpotifyController::findBinary().isEmpty() || QFileInfo(SpotifyController::findBinary()).isExecutable(),
               "spotify: findBinary returns an executable or nothing", SpotifyController::findBinary());
@@ -5372,7 +5384,7 @@ void finalWiringTests()
         b.dispatchStudioAction("spotify_play");
         const bool handedOver = sp->playing() && !mix->playing();
         b.dispatchStudioAction("resume_music");
-        check(mixOn && handedOver && mix->playing() && !sp->playing() && sp->commandLog().last() == "playback pause",
+        check(mixOn && handedOver && mix->playing() && !sp->playing() && sp->commandLog().last() == "api PUT /v1/me/player/pause",
               "exclusive: Spotify starting pauses slowmix, slowmix starting pauses Spotify", sp->commandLog().join(" | "));
     }
 
@@ -5519,7 +5531,7 @@ void finalWiringTests()
                   && sys.contains("CTX-AMBIENT") && leaf.endsWith("Spoken: turn it down and skip this one"),
               "ambient: only the new You: line goes out, after the 800 ms debounce, no-think, Tier 0 context",
               QString::number(debounceMs) + "ms " + leaf.right(60));
-        check(done && std::abs(mix->volume() - 0.4) < 1e-9 && sp->commandLog().mid(n0).contains("playback next")
+        check(done && std::abs(mix->volume() - 0.4) < 1e-9 && sp->commandLog().mid(n0).contains("api POST /v1/me/player/next")
                   && b.ambientAnswer() == "Done.",
               "ambient: a compound reply runs both actions in one turn and shows the clean answer", b.ambientAnswer());
 
@@ -5535,7 +5547,7 @@ void finalWiringTests()
         b.feedAmbientTail("0:09 You: lol yeah totally\n0:12 You: pause spotify");
         b.flushAmbient();
         settle(50);
-        check(bodies.size() == 2 && sp->commandLog().last() == "playback pause" && b.ambientAnswer() == "Paused Spotify.",
+        check(bodies.size() == 2 && sp->commandLog().last() == "api PUT /v1/me/player/pause" && b.ambientAnswer() == "Paused Spotify.",
               "ambient: a plain UI command runs locally, no model call", b.ambientAnswer());
         b.setAmbientVoiceEnabled(false);
         b.feedAmbientTail("0:12 You: pause spotify\n0:15 You: open music");
@@ -6055,7 +6067,239 @@ void mapUiTests()
     settle(60);
 }
 
+// --- Half-screen window (960x1080, 11 cards in 4 clusters) ------------------------------------
+// The cluster scene plus four more cards: Work 2, Projects 3, Apps 3, Quick Qs 3.
+void seedHalfScreenScene(Backend &b)
+{
+    seedClusterScene(b);
+    b.mockAddProject("lapis-studio", "lapis-studio", "~/dev/lapis-studio", "apps", "working");
+    b.mockAddProject("netherite-v2", "netherite-v2", "~/dev/netherite-v2", "", "idle");
+    b.mockAddProject("infinity-agy", "infinity-agy", "~/dev/infinity-agy", "infinity", "working");
+    b.mockAddProject("~tab:ee55ff66", "Benchmark", "~", "quick Qs", "idle");
+    Turn t;
+    t.role = QStringLiteral("assistant");
+    t.text = QStringLiteral("Updated [app.toml](file:///Users/someone/dev/lapis-studio/app.toml) so the port is 8080.");
+    b.mockAppendTurn("lapis-studio", t);
+    t.text = QStringLiteral("Swept the [tile sizes](https://example.com/sweep?run=4) and the 128x64 tile wins.");
+    b.mockAppendTurn("netherite-v2", t);
+}
+// Card positions saved in a full-screen session: as fractions they put cards on top of each other
+// once the window is half as wide (the screenshot that started this: lapis-studio x netherite-v2).
+void seedFullScreenPositions(Backend &b)
+{
+    b.setCardPosition("lapis-studio", 0.5824, 0.3381);
+    b.setCardPosition("netherite-v2", 0.7267, 0.3381);
+    b.setCardPosition("~tab:ee55ff66", 0.6007, 0.5123);
+    b.setCardPosition("infinity-agy", 0.6007, 0.6717);
+    b.setCardPosition("~tab:aa11bb22", 0.4913, 0.8630);
+    b.setCardPosition("cluster-serving", 0.7988, 0.7268);
+    b.setCardPosition("lapis", 0.2677, 0.7774);
+    b.setCardPosition("phonon", 0.1608, 0.8850);
+    b.setCardPosition("~tab:cc33dd44", 0.1743, 0.6736);
+}
+// Pairs of map cards closer than `gap` px (0: intersecting).
+int crowdedPairs(const QList<QQuickItem *> &isl, qreal gap, QStringList *pairs)
+{
+    int n = 0;
+    const qreal g = gap / 2 - 0.01;
+    for (int i = 0; i < isl.size(); ++i)
+        for (int j = i + 1; j < isl.size(); ++j)
+            if (itemRect(isl[i]).adjusted(-g, -g, g, g).intersects(itemRect(isl[j]).adjusted(-g, -g, g, g))) {
+                ++n;
+                *pairs << isl[i]->property("key").toString() + " x " + isl[j]->property("key").toString();
+            }
+    return n;
+}
+// Inside every card: the title, job and state lines never share a vertical pixel, and none is
+// cut by the card's bottom edge.
+int islandLineCollisions(const QList<QQuickItem *> &isl, QStringList *bad)
+{
+    int n = 0;
+    for (QQuickItem *card : isl) {
+        QQuickItem *body = findItems(card, "islandBody").value(0);
+        if (!body)
+            continue;
+        const QRectF b = body->mapRectToScene(QRectF(0, 0, body->width(), body->height()));
+        QList<QPair<QString, QRectF>> lines;
+        for (const char *name : {"islandTitle", "islandJob", "islandLast"})
+            for (QQuickItem *t : findItems(card, QString::fromLatin1(name)))
+                if (t->isVisible() && !t->property("text").toString().isEmpty())
+                    lines << qMakePair(QString::fromLatin1(name), t->mapRectToScene(QRectF(0, 0, t->width(), t->height())));
+        const QString key = card->property("key").toString();
+        for (int i = 0; i < lines.size(); ++i) {
+            if (lines[i].second.bottom() > b.bottom() + 0.5) {
+                ++n;
+                *bad << key + ": " + lines[i].first + " below the card";
+            }
+            for (int j = i + 1; j < lines.size(); ++j)
+                if (std::min(lines[i].second.bottom(), lines[j].second.bottom())
+                        - std::max(lines[i].second.top(), lines[j].second.top()) > 0.5) {
+                    ++n;
+                    *bad << key + ": " + lines[i].first + " x " + lines[j].first;
+                }
+        }
+    }
+    return n;
+}
+
+void halfScreenUiTests()
+{
+    Backend backend(Backend::Mode::Mock);
+    QTemporaryDir tmp;
+    backend.setPrefsPath(tmp.path() + "/studio_prefs.json");
+    backend.completeOnboarding("controller");  // the longest nav pill label ("nav controller")
+    QQmlApplicationEngine engine;
+    QQuickWindow *win = createStudioWindow(engine, &backend, false, QSize(960, 1080));
+    check(win != nullptr, "half: QML loads at 960x1080");
+    if (!win)
+        return;
+    QObject *map = win->findChild<QObject *>("constellation");
+    if (!map) {
+        check(false, "half: constellation present");
+        return;
+    }
+    settle(450);
+    seedHalfScreenScene(backend);
+    settle(400);
+
+    auto audit = [&](const QString &where) {
+        auto check = [](bool ok, const QString &name, const QString &detail) {
+            studio::check(ok, qPrintable(name), detail);
+        };
+        const QList<QQuickItem *> isl = mapIslands(win);
+        QStringList pairs, lines, tp;
+        qreal minH = 1e9;
+        for (QQuickItem *it : isl)
+            minH = std::min(minH, it->height());
+        check(isl.size() == 11, "half: 11 cards on the map (" + where + ")", QString::number(isl.size()));
+        check(overlapPairs(isl) == 0 && crowdedPairs(isl, 14, &pairs) == 0,
+              "half: zero card overlaps, every pair >= 14 px apart (" + where + ")", pairs.join("; "));
+        check(minH >= 108, "half: every card >= 108 px tall (" + where + ")", QString::number(minH));
+        check(islandLineCollisions(isl, &lines) == 0, "half: zero title / job / state line collisions in any card (" + where + ")",
+              lines.join("; "));
+        check(textOverlaps(win, &tp) == 0, "half: no overlapping text anywhere (" + where + ")", tp.join("; "));
+    };
+
+    // Auto-layout.
+    audit("auto layout");
+    std::printf("info  half: card %.0fx%.0f, %d cluster column(s), content %.0f px, scrollable %d\n",
+                map->property("islandW").toReal(), map->property("islandH").toReal(),
+                map->property("layout").toMap().value("ccols").toInt(), map->property("contentH").toReal(),
+                map->property("scrollable").toBool());
+
+    // Every card can be reached: scrolled to the far end, the last card sits fully in the window.
+    if (map->property("scrollable").toBool()) {
+        QMetaObject::invokeMethod(map, "scrollBy", Q_ARG(QVariant, 100000.0));
+        settle(400);
+        audit("scrolled to the end");
+        qreal lowest = 0;
+        QQuickItem *last = nullptr;
+        for (QQuickItem *it : mapIslands(win)) {
+            const QRectF r = it->mapRectToScene(QRectF(0, 0, it->width(), it->height()));
+            if (r.bottom() > lowest) { lowest = r.bottom(); last = it; }
+        }
+        check(last && lowest <= 1080 - 40 + 0.5, "half: scrolled to the end, the lowest card is fully on screen",
+              QString::number(lowest));
+        QMetaObject::invokeMethod(map, "scrollBy", Q_ARG(QVariant, -100000.0));
+        settle(400);
+    }
+
+    // Markdown links on a card read as their label.
+    {
+        QStringList shown;
+        for (QQuickItem *it : mapIslands(win))
+            for (const char *name : {"islandJob", "islandLast"})
+                for (QQuickItem *t : findItems(it, QString::fromLatin1(name)))
+                    if (t->isVisible())
+                        shown << t->property("text").toString();
+        const QString all = shown.join(" | ");
+        check(all.contains("Updated app.toml so the port is 8080") && all.contains("Swept the tile sizes")
+                  && !all.contains("](") && !all.contains("file://") && !all.contains("https://"),
+              "half: card lines show link labels, never raw [label](url)", all.left(400));
+    }
+
+    // Positions saved full-screen, then the window halves: still no overlap, re-run on resize.
+    seedFullScreenPositions(backend);
+    settle(300);
+    audit("full-screen positions at half width");
+    win->resize(1920, 1080);
+    settle(300);
+    {
+        QStringList pairs;
+        check(crowdedPairs(mapIslands(win), 14, &pairs) == 0, "half: saved positions at 1920 wide stay clear", pairs.join("; "));
+    }
+    win->resize(960, 1080);
+    settle(400);
+    audit("resized 1920 -> 960 with saved positions");
+    win->resize(960, 700);
+    settle(400);
+    audit("resized to 960x700");
+    win->resize(1100, 1080);
+    settle(400);
+    audit("resized to 1100x1080");
+    win->resize(720, 600);  // the window minimum
+    settle(400);
+    audit("resized to the 720x600 minimum");
+    win->resize(960, 1080);
+    settle(400);
+
+    // Bottom-right nav pill: fully inside the window with its 18 px margin, text unclipped.
+    if (QQuickItem *nav = firstItem(win, "navPill")) {
+        const QRectF r = nav->mapRectToScene(QRectF(0, 0, nav->width(), nav->height()));
+        bool textFits = true;
+        for (QQuickItem *t : findItems(nav, "navOption"))
+            if (t->isVisible()) {
+                const QRectF tr = t->mapRectToScene(QRectF(0, 0, t->width(), t->height()));
+                textFits = textFits && tr.right() <= r.right() + 0.5 && t->width() + 0.5 >= t->property("implicitWidth").toReal();
+            }
+        check(nav->isVisible() && r.right() <= 960 - 18 + 0.5 && r.left() >= 0 && textFits,
+              "half: bottom-right nav pill keeps its 18 px margin, text unclipped",
+              QStringLiteral("right %1").arg(r.right()));
+    } else {
+        check(false, "half: nav pill present");
+    }
+}
+
 }  // namespace
+
+// --snap-half OUT.png: the Constellation in a half-screen window (960x1080), 11 cards in four
+// clusters, dark. The visual twin of halfScreenUiTests.
+int snapHalf(const QString &outPath)
+{
+    Backend backend(Backend::Mode::Mock);
+    QTemporaryDir tmp;
+    backend.setPrefsPath(tmp.path() + "/studio_prefs.json");
+    backend.completeOnboarding("controller");
+    QQmlApplicationEngine engine;
+    QQuickWindow *win = createStudioWindow(engine, &backend, false, QSize(960, 1080));
+    if (!win) {
+        std::fprintf(stderr, "snap-half: QML failed to load\n");
+        return 2;
+    }
+    QDir().mkpath(QFileInfo(outPath).absolutePath());
+    settle(450);
+    seedHalfScreenScene(backend);
+    mouseMove(win, QPointF(4, 600));
+    settle(900);
+    QImage img = win->grabWindow();
+    bool saved = img.save(outPath);
+    QStringList pairs, lines, tp;
+    const int cards = int(mapIslands(win).size());
+    const int crowded = crowdedPairs(mapIslands(win), 14, &pairs);
+    const int collide = islandLineCollisions(mapIslands(win), &lines);
+    const int textHits = textOverlaps(win, &tp);
+    std::printf("snap-half: %s (%dx%d) cards=%d crowded=%d lineCollisions=%d textOverlaps=%d forbidden=%d\n",
+                qPrintable(outPath), img.width(), img.height(), cards, crowded, collide, textHits, forbiddenPixels(img));
+    // The same window with the full-screen saved positions (the screenshot's failure case).
+    seedFullScreenPositions(backend);
+    settle(600);
+    const QString posPath = QFileInfo(outPath).absolutePath() + "/" + QFileInfo(outPath).completeBaseName() + "-saved.png";
+    img = win->grabWindow();
+    saved = img.save(posPath) && saved;
+    pairs.clear();
+    std::printf("snap-half: %s (saved positions) crowded=%d\n", qPrintable(posPath), crowdedPairs(mapIslands(win), 14, &pairs));
+    return saved && crowded == 0 && collide == 0 && textHits == 0 ? 0 : 1;
+}
 
 // --snap-map OUT.png: the clustered Constellation with the free pad cursor mid-marquee and a
 // finished multi-selection (rings), dark, 1920x1080.
@@ -6104,6 +6348,30 @@ int snapMap(const QString &outPath)
 // Quick polish: view-state persistence, $HOME spawn, Tier 3 clock, OpenRouter request.
 void polishTests()
 {
+    // Card lines: markdown links read as their label, never raw [label](url).
+    {
+        check(stripMarkdownLinks("Edited [app.toml](file:///Users/x/dev/app.toml) and pushed") == "Edited app.toml and pushed",
+              "links: file:// link -> label");
+        check(stripMarkdownLinks("See [the PR](https://github.com/o/r/pull/12) and [docs](http://x.y/a_(b))")
+                  == "See the PR and docs",
+              "links: http(s) links, parens inside the URL", stripMarkdownLinks("See [the PR](https://github.com/o/r/pull/12) and [docs](http://x.y/a_(b))"));
+        check(stripMarkdownLinks("![loss curve](out/loss.png) shows it") == "loss curve shows it", "links: image -> alt text");
+        check(stripMarkdownLinks("Wrote [notes](<file:///a b/notes.md> \"t\")") == "Wrote notes", "links: <path with spaces> and title");
+        check(stripMarkdownLinks("Updated [app.toml](file:///Use") == "Updated app.toml", "links: a link cut mid-URL -> label",
+              stripMarkdownLinks("Updated [app.toml](file:///Use"));
+        check(stripMarkdownLinks("open <https://x.y/z>") == "open https://x.y/z", "links: autolink brackets dropped");
+        check(stripMarkdownLinks("arr[0] (the first) stays") == "arr[0] (the first) stays"
+                  && stripMarkdownLinks("plain line") == "plain line",
+              "links: brackets that are not links stay");
+        const HumanFilterReply r = parseFilterReply(
+            "STATE: Moved the port into [app.toml](file:///Users/x/dev/lapis/app.toml)\nFORM: summary\nPOINTS:\n- one");
+        check(r.stateLine == "Moved the port into app.toml", "links: the human-filter state line is plain", r.stateLine);
+        Extracted ex;
+        ex.prose = "Updated [app.toml](file:///Users/x/dev/app.toml) so the port is 8080.";
+        const IslandState st = islandState(ex, "idle");
+        check(!st.now.contains("](") && st.now.contains("app.toml"), "links: the island state line is plain", st.now);
+    }
+
     // viewState: normalized, persisted, reloaded; junk never lands.
     QTemporaryDir tmp;
     const QString path = tmp.path() + "/studio_prefs.json";
@@ -6124,7 +6392,8 @@ void polishTests()
         b.setViewState({{"lens", "stage"}, {"focusedProject", stageKey}, {"artifactIndex", 99}, {"needsMeOnly", true}});
         check(b.savePrefs(), "viewState: prefs flush");
         QFile f(path);
-        f.open(QIODevice::ReadOnly);
+        const bool opened = f.open(QIODevice::ReadOnly);
+        check(opened, "viewState: prefs file opens", path);
         const QJsonObject vs = QJsonDocument::fromJson(f.readAll()).object().value("viewState").toObject();
         check(vs.value("lens").toString() == "stage" && vs.value("focusedProject").toString() == stageKey
                   && vs.value("artifactIndex").toInt() == 99 && vs.value("needsMeOnly").toBool(),
@@ -6159,7 +6428,8 @@ void polishTests()
     {
         // A saved project that no longer exists falls back to the Constellation.
         QFile f(path);
-        f.open(QIODevice::WriteOnly | QIODevice::Truncate);
+        const bool opened = f.open(QIODevice::WriteOnly | QIODevice::Truncate);
+        check(opened, "viewState: prefs file opens for writing", path);
         f.write(R"({"viewState":{"lens":"ladder","focusedProject":"gone-project","artifactIndex":0,"needsMeOnly":false}})");
         f.close();
         Backend b(Backend::Mode::Mock);
@@ -6254,6 +6524,7 @@ int runTests()
     phase3UnitTests();
     phase3UiTests();
     mapUiTests();
+    halfScreenUiTests();
     slowmixUiTests();
     omnibarUiTests();
     memoryTierTests();

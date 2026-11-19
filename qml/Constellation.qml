@@ -202,8 +202,10 @@ Item {
     }
     // Where the predicted target sits, in this item's coordinates.
     function targetRect(id) {
-        if (id.startsWith("island:"))
-            return islandRect(parseInt(id.slice(7)));
+        if (id.startsWith("island:")) {
+            const i = parseInt(id.slice(7));
+            return islandInBand(i) ? islandRect(i) : Qt.rect(0, 0, 0, 0);
+        }
         if (id === "newSession")
             return Qt.rect(newHint.x, newHint.y, newHint.width, newHint.height);
         return Qt.rect(0, 0, 0, 0);
@@ -249,6 +251,7 @@ Item {
     readonly property real clusterLabelH: 34
     readonly property real clusterGapX: 34
     readonly property real clusterGapY: 28
+    readonly property real flowGapY: 40  // flow layout: the focus hint chip fits between rows
 
     // Auto-layout centre of slot s (single-cluster grid).
     function slotCenter(s) {
@@ -262,11 +265,104 @@ Item {
         return Qt.point(ox + c * cellW + cellW / 2 + jx, oy + r * cellH + cellH / 2 + jy);
     }
 
+    // Readability floor. A card is never shorter than minCardH (its three text lines fit in the
+    // compact Island layout) and cards keep at least cardGap between them. When the window is too
+    // small for that (a half-screen window with 11 cards), the clusters re-flow (two columns to
+    // one when that is roomier) and, if they still do not fit, the map scrolls vertically.
+    readonly property real minCardH: 108
+    readonly property real cardGap: 14
+    // Packs groups ([[project index]]) at a card scale into ccols cluster columns. Rows of
+    // clusters take the height of their tallest cluster, so content height is exact.
+    function packAt(groups, ccols, scale, labelH) {
+        const mx = 56, top = topBarH + 12, bottom = 60, pad = 18;
+        const aw = Math.max(1, width - 2 * mx), rw = aw / ccols;
+        const gx = clusterGapX, gy = flowGapY;
+        const w = Math.max(60, Math.min(400 * scale, rw - 2 * pad)), h = 206 * scale;
+        const shapes = [];
+        for (const g of groups) {
+            const k = g.length;
+            let sc = 1;
+            for (let c = Math.min(k, 4); c >= 1; --c)
+                if (c * w + (c - 1) * gx <= rw - 2 * pad + 0.01) { sc = c; break; }
+            const sr = Math.ceil(k / sc);
+            shapes.push({ sc: sc, sr: sr, bw: sc * w + (sc - 1) * gx, bh: labelH + sr * h + (sr - 1) * gy });
+        }
+        const rowsH = [];
+        for (let ci = 0; ci < groups.length; ++ci) {
+            const r = Math.floor(ci / ccols);
+            rowsH[r] = Math.max(rowsH[r] || 0, shapes[ci].bh + 2 * pad);
+        }
+        let sum = 0;
+        for (const r of rowsH) sum += r;
+        return { ccols: ccols, scale: scale, w: w, h: h, shapes: shapes, rowsH: rowsH, mx: mx, top: top, aw: aw, rw: rw,
+                 sum: sum, contentH: top + sum + bottom, fits: top + sum + bottom <= height + 0.5 };
+    }
+    // The largest scale in [minCardH / 206, maxScale] whose packing fits the window (binary search:
+    // a smaller scale only ever packs tighter), else the floor scale (the map then scrolls).
+    function bestPack(groups, ccols, maxScale, labelH) {
+        const lo0 = minCardH / 206;
+        if (maxScale <= lo0)
+            return packAt(groups, ccols, lo0, labelH);
+        if (packAt(groups, ccols, maxScale, labelH).fits)
+            return packAt(groups, ccols, maxScale, labelH);
+        let lo = lo0, hi = maxScale;
+        if (!packAt(groups, ccols, lo, labelH).fits)
+            return packAt(groups, ccols, lo, labelH);
+        for (let it = 0; it < 18; ++it) {
+            const mid = (lo + hi) / 2;
+            if (packAt(groups, ccols, mid, labelH).fits) lo = mid; else hi = mid;
+        }
+        return packAt(groups, ccols, lo, labelH);
+    }
+    // Flow layout: the busy-window fallback. Two cluster columns, or one when that gives bigger
+    // cards (or a shorter scroll); centred in the window when it fits, top-aligned when it scrolls.
+    function flowLayout(groups, names) {
+        const fs = Theme.fontScale;
+        const labelH = names.length > 0 ? clusterLabelH : 0;
+        const n = groups.length;
+        const a = bestPack(groups, Math.min(2, n), fs, labelH);
+        const b = n > 1 ? bestPack(groups, 1, fs, labelH) : a;
+        let p = a;
+        if (a.fits && b.fits) p = b.scale > a.scale + 1e-6 ? b : a;
+        else if (b.fits) p = b;
+        else if (!a.fits) p = b.contentH < a.contentH - 0.5 ? b : a;
+        const centers = {}, edges = [], labels = [];
+        const free = p.fits ? Math.max(0, height - p.contentH) : 0;
+        let ry = p.top + free / 2;
+        const pad = 18, gx = clusterGapX, gy = flowGapY, w = p.w, h = p.h;
+        for (let ci = 0; ci < n; ++ci) {
+            const row = Math.floor(ci / p.ccols), col = ci % p.ccols;
+            if (col === 0 && ci > 0)
+                ry += p.rowsH[row - 1];
+            const inRow = Math.min(p.ccols, n - row * p.ccols);
+            const sh = p.shapes[ci], members = groups[ci], k = members.length;
+            const rx = p.mx + (p.aw - inRow * p.rw) / 2 + col * p.rw;
+            const bx = rx + (p.rw - sh.bw) / 2, by = ry + (p.rowsH[row] - sh.bh) / 2;
+            if (labelH > 0)
+                labels.push({ name: names[ci], x: bx + 6, y: by, w: sh.bw, count: k });
+            for (let j = 0; j < k; ++j) {
+                const r = Math.floor(j / sh.sc), c = j % sh.sc;
+                const rowCount = Math.min(sh.sc, k - r * sh.sc);
+                const off = (sh.sc - rowCount) * (w + gx) / 2;
+                centers[members[j]] = Qt.point(bx + off + c * (w + gx) + w / 2, by + labelH + r * (h + gy) + h / 2);
+                if (c < rowCount - 1)
+                    edges.push([members[j], members[j + 1]]);
+                if (j + sh.sc < k)
+                    edges.push([members[j], members[j + sh.sc]]);
+            }
+        }
+        return { w: w, h: h, centers: centers, labels: labels, edges: edges, contentH: Math.max(height, p.contentH),
+                 flow: true, ccols: p.ccols };
+    }
+
     readonly property var layout: {
         const fs = Theme.fontScale;
         const centers = {};
         const edges = [];
         if (!clustered) {
+            const gw = Math.min(400 * fs, cellW - 90), gh = Math.min(206 * fs, cellH - 70);
+            if (gh < minCardH || gw < 2 * minCardH)
+                return flowLayout([slots.slice()], []);
             for (let s = 0; s < count; ++s) {
                 centers[slots[s]] = slotCenter(s);
                 if ((s % columns) < columns - 1 && s + 1 < count)
@@ -274,8 +370,7 @@ Item {
                 if (s + columns < count)
                     edges.push([slots[s], slots[s + columns]]);
             }
-            return { w: Math.min(400 * fs, cellW - 90), h: Math.min(206 * fs, cellH - 70), centers: centers,
-                     labels: [], edges: edges };
+            return { w: gw, h: gh, centers: centers, labels: [], edges: edges, contentH: height, flow: false, ccols: 0 };
         }
         const n = clusters.length, ccols = 2, crows = Math.ceil(n / ccols);
         const mx = 56, top = topBarH + 12, bottom = 60, pad = 18;
@@ -297,7 +392,9 @@ Item {
             shapes.push(best);
             scale = Math.min(scale, best.fit);
         }
-        scale = Math.max(scale, 0.25);
+        // Too small to read: re-flow (one column, or a vertical scroll) instead of shrinking.
+        if (206 * scale < minCardH)
+            return flowLayout(clusters.map((cl) => cl.members), clusters.map((cl) => cl.name));
         const w = 400 * scale, h = 206 * scale;
         const labels = [];
         for (let ci = 0; ci < n; ++ci) {
@@ -319,29 +416,149 @@ Item {
                     edges.push([cl.members[j], cl.members[j + sh.sc]]);
             }
         }
-        return { w: w, h: h, centers: centers, labels: labels, edges: edges };
+        return { w: w, h: h, centers: centers, labels: labels, edges: edges, contentH: height, flow: false, ccols: ccols };
     }
     // Islands grow with the UI zoom until their cell is full.
     readonly property real islandW: layout.w
     readonly property real islandH: layout.h
 
-    // A centre kept fully on screen, clear of the top bar and the bottom pills.
-    function clampCenter(x, y) {
+    // --- Vertical scroll (flow layout only) -------------------------------------------------------
+    // Layout centres live in content coordinates (0..contentH); everything on screen is in view
+    // coordinates, content minus scrollY. When the map fits, contentH == height and scrollY == 0,
+    // so the two are the same. A press-drag on empty space is the marquee, so the map scrolls by
+    // wheel / trackpad and follows the keyboard / pad selection instead of being a Flickable.
+    readonly property real contentH: layout.contentH !== undefined ? Math.max(height, layout.contentH) : height
+    readonly property real maxScroll: Math.max(0, contentH - height)
+    readonly property bool scrollable: maxScroll > 0.5
+    property real scrollPos: 0
+    Behavior on scrollPos { enabled: root.layoutReady; NumberAnimation { duration: 160; easing.type: Easing.OutCubic } }
+    readonly property real scrollY: Math.max(0, Math.min(maxScroll, scrollPos))
+    // The band cards scroll inside: under the top bar, above the bottom pills.
+    readonly property real viewTop: scrollable ? topBarH : 0
+    readonly property real viewBottom: scrollable ? height - 40 : height
+    function scrollBy(dy) { scrollPos = Math.max(0, Math.min(maxScroll, scrollY + dy)); }
+    // Keep island i fully inside the scroll band (keyboard / pad travel to an off-screen card),
+    // with room above for the predictor badge and below for the focus cursor's hint chip.
+    function ensureVisible(i) {
+        if (!scrollable || slotOf(i) < 0)
+            return;
+        const c = restCenter(i);
+        const top = c.y - islandH / 2 - 52, bot = c.y + islandH / 2 + 40;
+        if (top - scrollY < viewTop)
+            scrollPos = Math.max(0, top - viewTop);
+        else if (bot - scrollY > viewBottom)
+            scrollPos = Math.min(maxScroll, bot - viewBottom);
+    }
+    // Island i lies wholly inside the visible band (always true when the map does not scroll).
+    // The focus cursor and the predictor badge only wrap a card the user can see in full.
+    function islandInBand(i) {
+        if (!scrollable)
+            return true;
+        const c = islandCenter(i);
+        return c.y - islandH / 2 >= viewTop - 1 && c.y + islandH / 2 <= viewBottom + 1;
+    }
+    // A cluster label a card has been dragged over (custom layouts) hides instead of showing
+    // through the card.
+    function labelCovered(lx0, ly0, lw, lh) {
+        const lx1 = lx0 + lw, ly1 = ly0 + lh;
+        for (let s = 0; s < count; ++s) {
+            const c = restCenter(slots[s]);
+            if (c.x + islandW / 2 > lx0 && c.x - islandW / 2 < lx1 && c.y + islandH / 2 > ly0 && c.y - islandH / 2 < ly1)
+                return true;
+        }
+        return false;
+    }
+    // A resize re-runs the layout, the separation pass and the clamps (all bindings on width /
+    // height); the scroll offset is re-clamped here so it never points past the new content.
+    onWidthChanged: { scrollPos = scrollY; Qt.callLater(ensureSelectionVisible); }
+    onHeightChanged: { scrollPos = scrollY; Qt.callLater(ensureSelectionVisible); }
+    onScrollableChanged: Qt.callLater(ensureSelectionVisible)
+    function ensureSelectionVisible() { ensureVisible(selectedIndex); }
+
+    // A centre (content coordinates) kept inside the map, clear of the top bar and bottom pills.
+    function clampContent(x, y) {
         const hw = islandW / 2 + 16, hh = islandH / 2;
         return Qt.point(Math.max(hw, Math.min(width - hw, x)),
-                        Math.max(topBarH + hh + 8, Math.min(height - hh - 48, y)));
+                        Math.max(topBarH + hh + 8, Math.min(contentH - hh - 48, y)));
     }
-    // Resting centre of project i: its saved position, else its auto-layout slot.
-    function islandCenter(i) {
-        const s = slotOf(i);
-        if (s < 0)
-            return Qt.point(width / 2, height / 2);
-        const p = projects[i];
-        const pos = p ? cardPositions[p.key] : undefined;
-        if (pos !== undefined && width > 0 && height > 0)
-            return clampCenter(pos.x * width, pos.y * height);
-        const c = layout.centers[i];
+    // The same clamp in view coordinates (drags, flicks and the pad cursor work on screen).
+    function clampCenter(x, y) {
+        const c = clampContent(x, y + scrollY);
+        return Qt.point(c.x, c.y - scrollY);
+    }
+    // Resting centres (content coordinates) of every card on screen: saved positions (fractions of
+    // width x contentH) and auto-layout slots, then a separation pass. Saved fractions from a big
+    // window can land cards on top of each other in a small one: overlapping pairs are pushed
+    // apart along their shallower axis until every pair keeps cardGap. If the window is too
+    // crowded to separate them, the auto-layout (which never overlaps) wins.
+    readonly property var restCenters: {
+        const out = {};
+        let custom = false;
+        for (let s = 0; s < count; ++s) {
+            const i = slots[s], p = projects[i];
+            const pos = p ? cardPositions[p.key] : undefined;
+            if (pos !== undefined && width > 0 && height > 0) {
+                out[i] = clampContent(pos.x * width, pos.y * contentH);
+                custom = true;
+            } else {
+                const c = layout.centers[i];
+                out[i] = c !== undefined ? Qt.point(c.x, c.y) : Qt.point(width / 2, height / 2);
+            }
+        }
+        if (!custom)
+            return out;
+        const needX = islandW + cardGap, needY = islandH + cardGap;
+        const ids = slots.slice();
+        const pts = ids.map((i) => ({ x: out[i].x, y: out[i].y }));
+        let clean = false;
+        for (let it = 0; it < 120 && !clean; ++it) {
+            clean = true;
+            for (let a = 0; a < pts.length; ++a)
+                for (let b = a + 1; b < pts.length; ++b) {
+                    const dx = pts[b].x - pts[a].x, dy = pts[b].y - pts[a].y;
+                    const ox = needX - Math.abs(dx), oy = needY - Math.abs(dy);
+                    if (ox <= 0.01 || oy <= 0.01)
+                        continue;
+                    clean = false;
+                    // Ties (identical centres) split sideways in slot order.
+                    if (ox / needX < oy / needY) {
+                        const sx = dx > 0 || (dx === 0 && b > a) ? 1 : -1;
+                        pts[a].x -= sx * (ox / 2 + 0.5);
+                        pts[b].x += sx * (ox / 2 + 0.5);
+                    } else {
+                        const sy = dy > 0 || (dy === 0 && b > a) ? 1 : -1;
+                        pts[a].y -= sy * (oy / 2 + 0.5);
+                        pts[b].y += sy * (oy / 2 + 0.5);
+                    }
+                }
+            for (const q of pts) {
+                const c = clampContent(q.x, q.y);
+                q.x = c.x;
+                q.y = c.y;
+            }
+        }
+        if (!clean) {
+            const grid = {};
+            for (const i of ids) {
+                const c = layout.centers[i];
+                grid[i] = c !== undefined ? Qt.point(c.x, c.y) : Qt.point(width / 2, height / 2);
+            }
+            return grid;
+        }
+        for (let k = 0; k < ids.length; ++k)
+            out[ids[k]] = Qt.point(pts[k].x, pts[k].y);
+        return out;
+    }
+    function restCenter(i) {
+        const c = restCenters[i];
         return c !== undefined ? c : Qt.point(width / 2, height / 2);
+    }
+    // Resting centre of project i in view coordinates: its saved position, else its slot.
+    function islandCenter(i) {
+        if (slotOf(i) < 0)
+            return Qt.point(width / 2, height / 2);
+        const c = restCenter(i);
+        return Qt.point(c.x, c.y - scrollY);
     }
 
     // A layout reset (Cmd+0, the Reset pill, a re-sort) wins over any card still in flight.
@@ -396,13 +613,19 @@ Item {
     }
     Timer { id: glideTimer; interval: 1100; onTriggered: root.gliding = false }
 
-    // Nothing scrolls on the Constellation, so a plain wheel or two-finger scroll zooms the UI.
+    // A map that fits does not scroll, so a plain wheel or two-finger scroll zooms the UI. A map
+    // that overflows (flow layout in a small window) scrolls vertically instead.
     // (Cmd+wheel and pinch zoom anywhere; StudioApp handles those.)
     WheelHandler {
         objectName: "constellationWheel"
         enabled: root.recede < 0.01
         acceptedModifiers: Qt.NoModifier
         onWheel: (ev) => {
+            if (root.scrollable) {
+                const py = ev.pixelDelta.y !== 0 ? ev.pixelDelta.y : ev.angleDelta.y / 120 * 60;
+                root.scrollBy(-py);
+                return;
+            }
             const dy = ev.angleDelta.y !== 0 ? ev.angleDelta.y : ev.pixelDelta.y;
             if (dy !== 0)
                 root.zoomBy(Math.pow(1.0012, dy));
@@ -447,6 +670,17 @@ Item {
         }
     }
 
+    // The scene: labels, lines, cards and the focus ring. Children position in this item's
+    // coordinates (view minus scene.y). When the map scrolls it becomes the clipped band between
+    // the top bar and the bottom pills, so a card scrolled away never slides under either.
+    Item {
+    id: scene
+    objectName: "constellationScene"
+    y: root.viewTop
+    width: root.width
+    height: root.viewBottom - root.viewTop
+    clip: root.scrollable
+
     // Cluster micro-labels: uppercase, tracked, low contrast, above each cluster's cards.
     Repeater {
         model: root.layout.labels
@@ -454,7 +688,8 @@ Item {
             required property var modelData
             objectName: "clusterLabel"
             x: modelData.x
-            y: modelData.y + 4
+            y: modelData.y + 4 - root.scrollY - scene.y
+            visible: !root.hasCustomLayout || !root.labelCovered(modelData.x, modelData.y, implicitWidth, implicitHeight + 8)
             text: modelData.name.toUpperCase()
             color: Theme.muted
             opacity: 1 - root.recede
@@ -471,7 +706,7 @@ Item {
             readonly property point a: root.liveCenter(modelData[0])
             readonly property point b: root.liveCenter(modelData[1])
             x: a.x
-            y: a.y
+            y: a.y - scene.y
             width: Math.hypot(b.x - a.x, b.y - a.y)
             height: 1
             color: Theme.line
@@ -516,7 +751,7 @@ Item {
             readonly property point c: root.live[projIndex] !== undefined ? Qt.point(root.live[projIndex].x, root.live[projIndex].y)
                                                                          : root.islandCenter(projIndex)
             x: c.x - width / 2
-            y: c.y - height / 2
+            y: c.y - height / 2 - scene.y
             onClicked: root.enter(projIndex)
             onDragMoved: (dx, dy) => root.mouseDragMoved(projIndex, dx, dy)
             onDragEnded: (dx, dy) => root.mouseDragEnded(projIndex, dx, dy)
@@ -535,7 +770,7 @@ Item {
         readonly property rect target: root.islandRect(target_i)
         visible: root.count > 0 && !root.dragging && root.flightCount === 0
         x: target.x - 9
-        y: target.y - 9
+        y: target.y - 9 - scene.y
         width: root.islandW + 18
         height: root.islandH + 18
         radius: 34
@@ -549,6 +784,7 @@ Item {
         Behavior on x { enabled: root.recede < 0.01; NumberAnimation { duration: Theme.hopMs; easing.type: Easing.OutExpo } }
         Behavior on y { enabled: root.recede < 0.01; NumberAnimation { duration: Theme.hopMs; easing.type: Easing.OutExpo } }
     }
+    }  // scene
 
     // --- Rubber-band multi-select ------------------------------------------------------------
     property bool marqueeActive: false
@@ -717,7 +953,11 @@ Item {
         }
     }
     // Discrete nav (d-pad, keys, L1 / △) moves the selection: the cursor glides onto that card.
-    onSelectedIndexChanged: if (!cursorDriving) placeCursorOnSelection(false)
+    onSelectedIndexChanged: {
+        ensureVisible(selectedIndex);
+        if (!cursorDriving)
+            placeCursorOnSelection(false);
+    }
     onCursorVisibleChanged: if (cursorVisible) placeCursorOnSelection(!cursorPlaced)
     function placeCursorOnSelection(jump) {
         if (!freeCursor || count === 0 || grabMode !== "")
@@ -857,7 +1097,7 @@ Item {
         if (width > 0 && height > 0)
             for (const f of landed)
                 if (projects[f.i] && projects[f.i].key === f.key)
-                    cardMoved(f.key, f.x / width, f.y / height);
+                    cardMoved(f.key, f.x / width, (f.y + scrollY) / contentH);
     }
     // Start cards flying from absolute centres with a shared velocity (0, 0: a drop that only
     // needs to settle, i.e. clear an overlap).
@@ -1028,7 +1268,8 @@ Item {
             objectName: "needsBell"
             readonly property bool on: root.needsMeOnly
             readonly property int n: root.needsCount
-            anchors.horizontalCenter: parent.horizontalCenter
+            // Centred; in a narrow window it steps left so it never sits under the pill row.
+            x: Math.max(16, Math.min((parent.width - width) / 2, pillRow.x - width - 16))
             anchors.verticalCenter: parent.verticalCenter
             width: 44
             height: 30
@@ -1086,6 +1327,7 @@ Item {
             TapHandler { onTapped: root.filterPicked(root.needsMeOnly ? "all" : "needs") }
         }
         Row {
+            id: pillRow
             anchors.right: parent.right
             anchors.rightMargin: 24
             anchors.verticalCenter: parent.verticalCenter
