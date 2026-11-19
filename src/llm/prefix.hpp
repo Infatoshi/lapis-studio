@@ -28,6 +28,7 @@ struct TieredPrompt {
     QString model;
     QString effort;               // reasoning_effort; empty = omit
     QString systemPrompt;         // Tier 0
+    QString extraSystemContext;   // Tier 0 tail: optional local studio context (loadLocalStudioContext)
     QString trunk;                // Tier 1
     QVector<ChatTurn> history;    // Tier 2
     // Tier 3 (volatile)
@@ -38,6 +39,14 @@ struct TieredPrompt {
     QString memory;               // cross-session recall ("Relevant past conversations:")
     QString question;
 };
+
+// Optional local studio context (default ~/.lapis-next/studio_context.md), capped at 4 KB.
+// Returns empty when the file is missing or unreadable. Lives in Tier 0, so it stays APC-hot.
+QString loadLocalStudioContext(const QString &path = {});
+
+// The full Tier 0 system text: systemPrompt, then (when model is non-empty) the model identity
+// anchor, then extraSystemContext. Deterministic, so warm, ask and ambient share it byte for byte.
+QString tier0SystemText(const QString &systemPrompt, const QString &model, const QString &extraSystemContext);
 
 // Tiers 0 + 1 (+ 2 when history is non-empty), in order.
 QJsonArray tieredPrefixMessages(const QString &systemPrompt, const QString &trunk,
@@ -55,5 +64,19 @@ QByteArray buildOpenAiCompatRequest(const QString &model, const QString &systemP
                                     const QString &effort = QString());
 QByteArray buildOpenAiWarmRequest(const QString &model, const QString &systemPrompt,
                                   const QString &context);
+
+// Model output post-processing: [[IGNORE]] and compound [[ACTION:name]] / [[ACTION:name:arg]] tags.
+struct StudioAction {
+    QString name;
+    QString arg;
+};
+
+struct ParsedModelOutput {
+    QVector<StudioAction> actions;  // every action tag, in order
+    QString cleanText;              // raw with all tags stripped and whitespace tidied
+    bool ignore = false;            // [[IGNORE]] seen: actions empty, cleanText empty
+};
+
+ParsedModelOutput parseStudioModelOutput(const QString &raw);
 
 }  // namespace studio

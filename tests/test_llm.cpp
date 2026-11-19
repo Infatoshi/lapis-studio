@@ -8,10 +8,12 @@
 
 #include <QCoreApplication>
 #include <QElapsedTimer>
+#include <QFile>
 #include <QHash>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QTemporaryDir>
 
 #include <arpa/inet.h>
 #include <cerrno>
@@ -363,8 +365,9 @@ void prefixTests()
     QByteArray wBytes = compact(wm);
     wBytes.chop(1);
     check(compact(am).startsWith(wBytes), "prefix: warm messages are a raw byte prefix of the ask's messages");
-    check(am[0].toObject().value("role") == "system" && am[0].toObject().value("content") == kCompatSystemPrompt,
-          "prefix: Tier 0 is the static system prompt");
+    check(am[0].toObject().value("role") == "system"
+              && am[0].toObject().value("content") == tier0SystemText(kCompatSystemPrompt, p.model, QString()),
+          "prefix: Tier 0 is the static system prompt plus the model identity");
     check(am[1].toObject().value("content").toString() == "Pinned context:\n" + p.trunk, "prefix: Tier 1 is the trunk");
     check(am[2].toObject().value("role") == "user" && am[3].toObject().value("role") == "assistant",
           "prefix: Tier 2 history in order");
@@ -421,6 +424,104 @@ void prefixTests()
                               .object().value("messages").toArray();
     check(cw.size() == 2 && compact(cw[0]) == compact(cm[0]) && compact(cw[1]) == compact(cm[1]),
           "prefix: buildOpenAiWarmRequest wrapper is a prefix of the compat ask");
+}
+
+// --- Tier 0 identity, local studio context, compound action parser ------------------------
+
+void tier0Tests()
+{
+    TieredPrompt p;
+    p.model = QStringLiteral("qwen3.8-flash-next");
+    p.systemPrompt = kCompatSystemPrompt;
+    p.extraSystemContext = QStringLiteral("Projects: lapis, phonon, slowmix.");
+    p.trunk = QStringLiteral("Project: lapis");
+    p.history = {ChatTurn{QStringLiteral("user"), QStringLiteral("hi")}};
+    p.targetSlice = QStringLiteral("chart decode tok/s");
+    p.question = QStringLiteral("who are you?");
+
+    const QJsonArray am = QJsonDocument::fromJson(buildTieredChatRequest(p)).object().value("messages").toArray();
+    const QJsonArray wm = QJsonDocument::fromJson(buildTieredWarmRequest(p)).object().value("messages").toArray();
+    const QString sys = am[0].toObject().value("content").toString();
+    check(sys.startsWith(kCompatSystemPrompt + "\n\nYour model ID is qwen3.8-flash-next (running locally via "
+                                               "OpenAI-compatible vLLM)."),
+          "tier0: identity follows the static system prompt", sys);
+    check(sys.contains("never claim to be Claude or any other model") && sys.contains("compound [[ACTION:...]] tags"),
+          "tier0: identity forbids claiming Claude and asks for compound actions");
+    check(sys.endsWith("\n\nLocal studio context:\nProjects: lapis, phonon, slowmix."),
+          "tier0: extraSystemContext is the Tier 0 tail", sys);
+    bool same = wm.size() == 3 && am.size() == 4;
+    for (qsizetype i = 0; same && i < wm.size(); ++i)
+        same = compact(wm[i]) == compact(am[i]);
+    QByteArray wBytes = compact(wm);
+    wBytes.chop(1);
+    check(same && compact(am).startsWith(wBytes), "tier0: identity + extra context byte-identical in warm and ask");
+
+    TieredPrompt anon = p;
+    anon.model.clear();
+    anon.extraSystemContext.clear();
+    check(QJsonDocument::fromJson(buildTieredChatRequest(anon)).object().value("messages").toArray()[0]
+              .toObject().value("content") == kCompatSystemPrompt,
+          "tier0: no model and no extra context -> static prompt only");
+    check(tier0SystemText(QString(), QString(), QString()).isEmpty()
+              && tier0SystemText(QString(), QString(), "X") == "Local studio context:\nX",
+          "tier0: empty parts are skipped");
+
+    // loadLocalStudioContext: missing, small, and capped at 4 KB without splitting UTF-8.
+    QTemporaryDir td;
+    check(loadLocalStudioContext(td.path() + "/none.md").isEmpty(), "context: missing file -> empty");
+    {
+        QFile f(td.path() + "/small.md");
+        if (f.open(QIODevice::WriteOnly))
+            f.write("  # Studio\nlapis is the main project.\n\n");
+    }
+    check(loadLocalStudioContext(td.path() + "/small.md") == "# Studio\nlapis is the main project.",
+          "context: small file read and trimmed");
+    {
+        QByteArray big(4095, 'a');
+        big += QStringLiteral("ééé").toUtf8();  // first 2-byte char straddles the 4096 cap
+        big += QByteArray(10000, 'b');
+        QFile f(td.path() + "/big.md");
+        if (f.open(QIODevice::WriteOnly))
+            f.write(big);
+        QByteArray exact(4094, 'a');
+        exact += QStringLiteral("é").toUtf8();  // complete char ends exactly at the cap: kept
+        exact += QByteArray(100, 'b');
+        QFile g(td.path() + "/exact.md");
+        if (g.open(QIODevice::WriteOnly))
+            g.write(exact);
+    }
+    const QString capped = loadLocalStudioContext(td.path() + "/big.md");
+    check(capped.size() == 4095 && !capped.contains(QChar::ReplacementCharacter),
+          "context: capped at 4 KB, straddling UTF-8 char dropped", QString::number(capped.size()));
+    const QString exact = loadLocalStudioContext(td.path() + "/exact.md");
+    check(exact.size() == 4095 && exact.endsWith(QChar(0xE9)), "context: complete UTF-8 char at the cap kept",
+          QString::number(exact.size()));
+
+    // parseStudioModelOutput.
+    const ParsedModelOutput ig = parseStudioModelOutput(QStringLiteral("[[IGNORE]]"));
+    check(ig.ignore && ig.cleanText.isEmpty() && ig.actions.isEmpty(), "parse: [[IGNORE]]");
+    const ParsedModelOutput ig2 = parseStudioModelOutput(QStringLiteral("  just chatting [[IGNORE]] \n"));
+    check(ig2.ignore && ig2.cleanText.isEmpty(), "parse: [[IGNORE]] anywhere wins");
+
+    const ParsedModelOutput c = parseStudioModelOutput(QStringLiteral(
+        "[[ACTION:focus_project:lapis]] [[ACTION:play_track:Nights (slowed)]]\n"
+        "Opening lapis and starting music. [[ACTION:spawn_agent:profile the KV cache: c1 vs c8]]"));
+    check(!c.ignore && c.actions.size() == 3, "parse: 3-action compound batch", QString::number(c.actions.size()));
+    if (c.actions.size() == 3) {
+        check(c.actions[0].name == "focus_project" && c.actions[0].arg == "lapis"
+                  && c.actions[1].name == "play_track" && c.actions[1].arg == "Nights (slowed)"
+                  && c.actions[2].name == "spawn_agent" && c.actions[2].arg == "profile the KV cache: c1 vs c8",
+              "parse: actions in order, args kept (colons inside arg allowed)");
+    }
+    check(c.cleanText == "Opening lapis and starting music.", "parse: tags stripped from cleanText", c.cleanText);
+
+    const ParsedModelOutput na = parseStudioModelOutput(QStringLiteral("Going home [[ACTION:go_home]] now."));
+    check(na.actions.size() == 1 && na.actions[0].name == "go_home" && na.actions[0].arg.isEmpty()
+              && na.cleanText == "Going home now.",
+          "parse: no-arg action stripped mid-sentence", na.cleanText);
+    const ParsedModelOutput plain = parseStudioModelOutput(QStringLiteral("  It is 126 tok/s.\n    indented  code\n"));
+    check(!plain.ignore && plain.actions.isEmpty() && plain.cleanText == "It is 126 tok/s.\n    indented  code",
+          "parse: plain text untouched apart from outer trim", plain.cleanText);
 }
 
 void sseTests()
@@ -621,6 +722,7 @@ int main(int argc, char **argv)
     std::signal(SIGPIPE, SIG_IGN);
     QCoreApplication app(argc, argv);
     prefixTests();
+    tier0Tests();
     sseTests();
     concurrencyTest(10);
     concurrencyTest(16);

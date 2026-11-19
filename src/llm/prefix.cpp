@@ -1,7 +1,10 @@
 #include "llm/prefix.hpp"
 
+#include <QDir>
+#include <QFile>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QRegularExpression>
 
 namespace studio {
 
@@ -20,7 +23,46 @@ QJsonObject message(const QString &role, const QString &content)
     return QJsonObject{{QStringLiteral("role"), role}, {QStringLiteral("content"), content}};
 }
 
+constexpr qint64 kStudioContextCapBytes = 4096;
+
 }  // namespace
+
+QString loadLocalStudioContext(const QString &path)
+{
+    const QString p = path.isEmpty() ? QDir::homePath() + QStringLiteral("/.lapis-next/studio_context.md") : path;
+    QFile f(p);
+    if (!f.open(QIODevice::ReadOnly))
+        return {};
+    QByteArray bytes = f.read(kStudioContextCapBytes);
+    // Never split a UTF-8 sequence at the cap: drop a trailing incomplete multi-byte sequence.
+    if (bytes.size() == kStudioContextCapBytes && !f.atEnd()) {
+        qsizetype lead = bytes.size() - 1;
+        while (lead > 0 && (quint8(bytes[lead]) & 0xC0) == 0x80)
+            --lead;
+        const quint8 b = quint8(bytes[lead]);
+        const qsizetype need = b >= 0xF0 ? 4 : b >= 0xE0 ? 3 : b >= 0xC0 ? 2 : 1;
+        if (bytes.size() - lead < need)
+            bytes.truncate(lead);
+    }
+    return QString::fromUtf8(bytes).trimmed();
+}
+
+QString tier0SystemText(const QString &systemPrompt, const QString &model, const QString &extraSystemContext)
+{
+    QStringList parts;
+    if (!systemPrompt.isEmpty())
+        parts << systemPrompt;
+    if (!model.isEmpty())
+        parts << QStringLiteral("Your model ID is ") + model
+                     + QStringLiteral(" (running locally via OpenAI-compatible vLLM). Transcripts in context come from "
+                                      "other agent sessions (Claude, Codex, Antigravity); never claim to be Claude or "
+                                      "any other model. Answer directly from context whenever sufficient to minimize "
+                                      "latency; emit compound [[ACTION:...]] tags together in one turn when multiple "
+                                      "UI actions or agent spawns are needed.");
+    if (!extraSystemContext.isEmpty())
+        parts << QStringLiteral("Local studio context:\n") + extraSystemContext;
+    return parts.join(QStringLiteral("\n\n"));
+}
 
 QJsonArray tieredPrefixMessages(const QString &systemPrompt, const QString &trunk, const QVector<ChatTurn> &history)
 {
@@ -61,7 +103,8 @@ QString tieredLeafText(const TieredPrompt &p)
 
 QByteArray buildTieredChatRequest(const TieredPrompt &p)
 {
-    QJsonArray msgs = tieredPrefixMessages(p.systemPrompt, p.trunk, p.history);
+    QJsonArray msgs = tieredPrefixMessages(tier0SystemText(p.systemPrompt, p.model, p.extraSystemContext), p.trunk,
+                                           p.history);
     msgs << message(QStringLiteral("user"), tieredLeafText(p));
     QJsonObject body;
     body.insert(QStringLiteral("model"), p.model);
@@ -78,7 +121,8 @@ QByteArray buildTieredWarmRequest(const TieredPrompt &p)
     body.insert(QStringLiteral("model"), p.model);
     body.insert(QStringLiteral("stream"), false);
     body.insert(QStringLiteral("max_tokens"), 1);
-    body.insert(QStringLiteral("messages"), tieredPrefixMessages(p.systemPrompt, p.trunk, p.history));
+    body.insert(QStringLiteral("messages"),
+                tieredPrefixMessages(tier0SystemText(p.systemPrompt, p.model, p.extraSystemContext), p.trunk, p.history));
     return QJsonDocument(body).toJson(QJsonDocument::Compact);
 }
 
@@ -101,6 +145,42 @@ QByteArray buildOpenAiWarmRequest(const QString &model, const QString &systemPro
     p.systemPrompt = systemPrompt;
     p.trunk = context;
     return buildTieredWarmRequest(p);
+}
+
+ParsedModelOutput parseStudioModelOutput(const QString &raw)
+{
+    ParsedModelOutput out;
+    if (raw.contains(QStringLiteral("[[IGNORE]]"))) {
+        out.ignore = true;
+        return out;
+    }
+    // [[ACTION:name]] or [[ACTION:name:arg]]; the arg may itself contain ':' but not ']'.
+    static const QRegularExpression kAction(QStringLiteral(R"(\[\[ACTION:([^\]:]+)(?::([^\]]*))?\]\])"));
+    QString text;
+    qsizetype last = 0;
+    auto it = kAction.globalMatch(raw);
+    while (it.hasNext()) {
+        const QRegularExpressionMatch m = it.next();
+        const QString name = m.captured(1).trimmed();
+        if (!name.isEmpty())
+            out.actions.push_back(StudioAction{name, m.captured(2).trimmed()});
+        text += raw.mid(last, m.capturedStart() - last);
+        last = m.capturedEnd();
+        // "a [[ACTION:x]] b" -> "a b": drop the space before a tag when whitespace or punctuation follows it.
+        const QChar next = last < raw.size() ? raw.at(last) : QChar(u'\n');
+        if (next.isSpace() || next.isPunct())
+            while (text.endsWith(u' ') || text.endsWith(u'\t'))
+                text.chop(1);
+    }
+    text += raw.mid(last);
+
+    // Only tidy what tag removal can leave behind: trailing blanks and runs of empty lines.
+    static const QRegularExpression kTrailing(QStringLiteral("[ \\t]+\\n"));
+    static const QRegularExpression kBlankRuns(QStringLiteral("\\n{3,}"));
+    text.replace(kTrailing, QStringLiteral("\n"));
+    text.replace(kBlankRuns, QStringLiteral("\n\n"));
+    out.cleanText = text.trimmed();
+    return out;
 }
 
 }  // namespace studio
