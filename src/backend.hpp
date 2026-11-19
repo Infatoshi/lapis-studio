@@ -124,12 +124,6 @@ StreamProgress agyProgress(const QJsonObject &line);     // agy stream-json (ste
 StreamProgress claudeProgress(const QJsonObject &line);  // claude stream-json (stream_event deltas)
 // The newest `maxWords` words of a stream (the live thinking line scrolls, it never freezes).
 QString tailWords(const QString &s, int maxWords);
-// Raw tool-call markup a model can leak into its thinking or answer stream (<tool_call>...,
-// <function_calls>, <|tool_call_begin|> tokens, JSON {"name":..,"arguments":..} lines), removed
-// so the quick line and the trace show only thinking and answer. Unclosed blocks (mid-stream)
-// are cut to the end.
-QString stripToolNoise(const QString &s);
-
 // OpenAI-compatible HTTP/SSE fast-feedback helpers (unit-tested).
 struct OpenAiSseEvent {
     enum Kind { None, Delta, Done, Error };
@@ -167,6 +161,23 @@ struct ParsedCache {
     qint64 size = 0;
     Extracted ex;
 };
+
+// A Lapis tab title that names nothing: empty, "tmp", or still the $HOME folder's basename.
+bool isGenericTabTitle(const QString &title);
+// The island a live session joins. projectIdFor(), except a scratch-dir tab whose title is still
+// generic: each such tab is its own "~tab:<shortId>" island (distinct $HOME sessions never pool
+// into one category bucket), named from its first request, else its job name, else its
+// lapis-peers board snippet, else "tab <shortId>".
+ProjectId sessionProjectId(const SessionInfo &s, const Extracted &ex, const QString &boardSnippet = QString());
+
+// One agent row of `lapis-peers board --json`: its status and latest reply snippet ("" when the
+// board withholds it, as for infinity).
+struct BoardRow {
+    QString id;
+    QString status;
+    QString snippet;
+};
+QList<BoardRow> parseBoardJson(const QByteArray &json);
 
 class Backend : public QObject {
     Q_OBJECT
@@ -390,6 +401,13 @@ public:
     void benchInvalidateCache() { m_cache.clear(); }
     // Re-run applyScan() on the current registry and cache: what a landed live scan costs.
     void benchReapply();
+    // Tests: land a registry scan or a board poll exactly as the live paths do, without
+    // spawning lapis-peers or reading the registry.
+    void testApplyScan(const QList<SessionInfo> &sessions, const QHash<QString, ParsedCache> &cache)
+    {
+        applyScan(sessions, cache);
+    }
+    void applyBoard(const QList<BoardRow> &rows);
 
 signals:
     void projectsChanged();
@@ -571,6 +589,9 @@ private:
     bool m_rescanQueued = false;
     QHash<QString, ParsedCache> m_cache;
     QHash<QString, QString> m_statusById;
+    // Latest `lapis-peers board` reply snippet per agent: the only context a remote (SSH) session
+    // with no local transcript has.
+    QHash<QString, QString> m_snippetById;
     QHash<QString, Ladder> m_kickoffs;  // project key -> ladder seeded from the new-session dialog
     QTimer m_ageTimer;  // keeps "live · 3h 12m" island metrics current
     QHash<QString, Channel *> m_channels;  // owned; deleted in the destructor or when the process dies

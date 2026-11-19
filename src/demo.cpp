@@ -472,6 +472,10 @@ int probeLive(const QString &shotDir)
         }
         std::printf("%-28s   job='%s' long=%d pills=[%s]\n", "", qPrintable(p.value("jobName").toString()),
                     p.value("longRunning").toBool(), qPrintable(pills.join(", ")));
+        std::printf("%-28s   key=%s category='%s' turns=%d%s last='%s'\n", "", qPrintable(p.value("key").toString()),
+                    qPrintable(p.value("category").toString()), int(p.value("turns").toList().size()),
+                    p.value("boardSnippet").toString().isEmpty() ? "" : " +board",
+                    qPrintable(p.value("lastLine").toString()));
     }
     {
         QStringList k;

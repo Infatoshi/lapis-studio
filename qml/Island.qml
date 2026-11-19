@@ -121,6 +121,9 @@ Item {
             text: root.proj ? root.proj.name : ""
             color: Theme.ink
             elide: Text.ElideRight
+            // Tab islands are named by a phrase ("Add support to PS4 controller"): shrink before eliding.
+            fontSizeMode: Text.HorizontalFit
+            minimumPixelSize: Theme.px(22)
             font.family: Theme.sans
             font.pixelSize: Theme.px(31)
             font.weight: Font.DemiBold

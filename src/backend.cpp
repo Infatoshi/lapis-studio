@@ -285,13 +285,64 @@ ProjectId projectIdFor(const QString &directory, const QString &title, const QSt
         return ProjectId{base, base, false};
     }
     QString slug = slugFromTitle(title);
-    // A tab still named after the folder ("user") says nothing; its Lapis category does.
-    if (slug.isEmpty() || slug == QFileInfo(home()).fileName().toLower() || slug == QLatin1String("tmp"))
+    // A tab still named after the folder ("user") says nothing; its Lapis category does. Live
+    // sessions never land here: sessionProjectId() gives each such tab its own island.
+    if (isGenericTabTitle(title))
         slug = category.toLower().split(QRegularExpression(QStringLiteral("[^a-z0-9]+")), Qt::SkipEmptyParts)
                    .mid(0, 3).join(QLatin1Char('-'));
     if (slug.isEmpty())
         slug = QStringLiteral("scratch");
     return ProjectId{QStringLiteral("~") + slug, slug, true};
+}
+
+bool isGenericTabTitle(const QString &title)
+{
+    const QString slug = slugFromTitle(title);
+    return slug.isEmpty() || slug == QFileInfo(home()).fileName().toLower() || slug == QLatin1String("tmp");
+}
+
+ProjectId sessionProjectId(const SessionInfo &s, const Extracted &ex, const QString &boardSnippet)
+{
+    ProjectId pid = projectIdFor(s.directory, s.title, s.category);
+    if (!pid.fromTitle || !isGenericTabTitle(s.title) || s.id.isEmpty())
+        return pid;
+    pid.key = QStringLiteral("~tab:") + s.id.left(8);
+    QString name = ex.promptName;
+    if (name.isEmpty())
+        name = ex.jobName;
+    if (name.isEmpty() && !boardSnippet.isEmpty()) {
+        // The agent's latest reply is a statement, not a request: its opening words, clipped.
+        static const QRegularExpression firstSentence(QStringLiteral("^(.+?)([.!?:;](\\s|$)|$)"));
+        static const QRegularExpression noise(QStringLiteral("[`*_#>\\[\\]()~]"));
+        QString first = firstSentence.match(boardSnippet.simplified()).captured(1);
+        first.replace(noise, QStringLiteral(" "));
+        name = clampWords(first.simplified(), 5);
+    }
+    pid.name = name.isEmpty() ? QStringLiteral("tab ") + s.id.left(8) : name;
+    return pid;
+}
+
+QList<BoardRow> parseBoardJson(const QByteArray &json)
+{
+    QList<BoardRow> out;
+    const QJsonObject b = QJsonDocument::fromJson(json).object();
+    for (const QJsonValue &c : b.value(QLatin1String("categories")).toArray())
+        for (const QJsonValue &a : c.toObject().value(QLatin1String("agents")).toArray()) {
+            const QJsonObject ao = a.toObject();
+            BoardRow r;
+            r.id = ao.value(QLatin1String("id")).toString();
+            r.status = ao.value(QLatin1String("status")).toString();
+            // Never keep text the board marks as withheld (infinity).
+            if (!ao.value(QLatin1String("infinityRedacted")).toBool()) {
+                r.snippet = ao.value(QLatin1String("lastReplySnippet")).toString();
+                if (r.snippet.isEmpty())
+                    r.snippet = ao.value(QLatin1String("snippet")).toString();
+                r.snippet = cleanTurnText(r.snippet, 400);
+            }
+            if (!r.id.isEmpty())
+                out << r;
+        }
+    return out;
 }
 
 QString elapsedLabel(qint64 ms)
@@ -531,39 +582,6 @@ QString modelDisplayLabel(const QString &model)
         if (m.id == model)
             return m.speed.isEmpty() ? m.label : m.label + QStringLiteral(" · ") + m.speed;
     return model;
-}
-
-QString stripToolNoise(const QString &s)
-{
-    if (!s.contains(QLatin1Char('<')) && !s.contains(QLatin1Char('{')) && !s.contains(QLatin1Char('[')))
-        return s;  // the common case: plain prose, no regex work at all
-    using RE = QRegularExpression;
-    static const RE blocks(
-        QStringLiteral("<(?:\\w+:)?(tool_calls?|tool_use|tool_result|function_calls?|invoke)\\b[^>]*>"
-                       ".*?(</(?:\\w+:)?\\1>|$)"),
-        RE::DotMatchesEverythingOption | RE::CaseInsensitiveOption);
-    static const RE specialBlocks(
-        QStringLiteral("<[|\\x{FF5C}]tool[_\\x{2581}]calls?[_\\x{2581}](section[_\\x{2581}])?begin[|\\x{FF5C}]>"
-                       ".*?(<[|\\x{FF5C}]tool[_\\x{2581}]calls?[_\\x{2581}](section[_\\x{2581}])?end[|\\x{FF5C}]>|$)"),
-        RE::DotMatchesEverythingOption);
-    static const RE specialTokens(QStringLiteral("<[|\\x{FF5C}][^|\\x{FF5C}<>\\n]{1,48}[|\\x{FF5C}]>"));
-    static const RE strayTags(QStringLiteral("</?(?:\\w+:)?(tool_calls?|tool_use|tool_result|function_calls?|invoke|parameter)\\b[^>]*>"),
-                              RE::CaseInsensitiveOption);
-    static const RE jsonCall(QStringLiteral("^\\s*\\{\\s*\"(name|tool|tool_name|function)\"\\s*:.*\"(arguments|parameters|input|args)\"\\s*:"));
-    static const RE toolLine(QStringLiteral("^\\s*(\\[(tool|tool_call|tool_use|function_call)\\b[^\\]]*\\]|(tool call|calling tool|tool_call)\\s*[:(])"),
-                             RE::CaseInsensitiveOption);
-    QString out = s;
-    out.remove(blocks);
-    out.remove(specialBlocks);
-    out.remove(specialTokens);
-    out.remove(strayTags);
-    QStringList keep;
-    for (const QString &l : out.split(QLatin1Char('\n'))) {
-        if (jsonCall.match(l).hasMatch() || toolLine.match(l).hasMatch())
-            continue;
-        keep << l;
-    }
-    return keep.join(QLatin1Char('\n'));
 }
 
 QString tailWords(const QString &s, int maxWords)
@@ -1552,6 +1570,13 @@ QVariantMap Backend::projectMap(const Project &p) const
     m[QStringLiteral("metricPinned")] = m_pinnedMetrics.contains(p.key);
     const IslandState is = islandState(p.ex, status);
     m[QStringLiteral("nowLine")] = is.now;
+    // A tab island named from its request ("Add support to PS4 controller") would repeat itself
+    // as "Adding support to PS4 controller": the job line drops when it restates the name.
+    if (p.key.startsWith(QLatin1String("~tab:")) && !is.blocker) {
+        auto tail = [](const QString &s) { return s.section(QLatin1Char(' '), 1).simplified().toLower(); };
+        if (!is.now.isEmpty() && tail(is.now) == tail(p.name))
+            m[QStringLiteral("nowLine")] = QString();
+    }
     m[QStringLiteral("lastLine")] = is.last;
     m[QStringLiteral("lastLong")] = is.lastLong;
     m[QStringLiteral("blocker")] = is.blocker;
@@ -1598,6 +1623,26 @@ QVariantMap Backend::projectMap(const Project &p) const
     m[QStringLiteral("artifacts")] = artifacts;
     m[QStringLiteral("prose")] = p.ex.prose;
     m[QStringLiteral("thinking")] = p.ex.thinking;
+    // The conversation (Ladder). A session with no local transcript (remote over SSH) still has
+    // its newest lapis-peers board reply: it fills the island's latest line and the thread.
+    QVariantList turns = p.ex.threadTurns;
+    QString boardSnippet;
+    for (const SessionInfo &s : p.sessions)  // newest session first
+        if (boardSnippet.isEmpty())
+            boardSnippet = m_snippetById.value(s.id);
+    const bool noLocalText = turns.isEmpty() && p.ex.prose.isEmpty() && p.ex.recentTurns.isEmpty();
+    if (noLocalText && !boardSnippet.isEmpty()) {
+        turns << QVariantMap{{QStringLiteral("role"), QStringLiteral("assistant")},
+                             {QStringLiteral("text"), boardSnippet},
+                             {QStringLiteral("source"), QStringLiteral("board")}};
+        const QString first = sentencesOf(boardSnippet).value(0, boardSnippet.simplified());
+        if (!is.blocker && stateLine.isEmpty()) {
+            m[QStringLiteral("lastLine")] = shortLine(first, 9);
+            m[QStringLiteral("lastLong")] = shortLine(first, 16);
+        }
+    }
+    m[QStringLiteral("turns")] = turns;
+    m[QStringLiteral("boardSnippet")] = boardSnippet;
 
     QVariantMap ladder;
     ladder[QStringLiteral("goal")] = p.ladder.goal;
@@ -2942,7 +2987,7 @@ void Backend::applyScan(const QList<SessionInfo> &sessions, const QHash<QString,
     const QSet<QString> watched(watchedList.cbegin(), watchedList.cend());
     QStringList toWatch;
     for (const SessionInfo &s : sessions) {
-        const ProjectId pid = projectIdFor(s.directory, s.title, s.category);
+        const ProjectId pid = sessionProjectId(s, cache.value(s.transcript).ex, m_snippetById.value(s.id));
         const QString key = pid.key;
         if (!pid.fromTitle)
             folderNames.insert(pid.name);
@@ -2987,6 +3032,8 @@ void Backend::applyScan(const QList<SessionInfo> &sessions, const QHash<QString,
             if (merged.goal.isEmpty()) merged.goal = e.goal;
             if (merged.assumptions.isEmpty()) merged.assumptions = e.assumptions;
             if (merged.recentTurns.isEmpty()) merged.recentTurns = e.recentTurns;  // newest session first
+            if (merged.threadTurns.isEmpty()) merged.threadTurns = e.threadTurns;
+            if (merged.promptName.isEmpty()) merged.promptName = e.promptName;
             if (merged.files.isEmpty()) merged.files = e.files;
             if (merged.toolCalls.isEmpty()) merged.toolCalls = e.toolCalls;
             if (merged.params.isEmpty()) merged.params = e.params;
@@ -3038,35 +3085,31 @@ void Backend::pollBoard()
     clock.start();
     m_boardBusy = true;
     ++m_spawnCount;
-    using Statuses = QList<QPair<QString, QString>>;
-    auto *watcher = new QFutureWatcher<std::optional<Statuses>>(this);
-    connect(watcher, &QFutureWatcher<std::optional<Statuses>>::finished, this, [this, watcher] {
+    using Rows = QList<BoardRow>;
+    auto *watcher = new QFutureWatcher<std::optional<Rows>>(this);
+    connect(watcher, &QFutureWatcher<std::optional<Rows>>::finished, this, [this, watcher] {
         QElapsedTimer apply;
         apply.start();
         const double publishBefore = m_stall.publishMs;
-        const std::optional<Statuses> r = watcher->result();
+        const double applyBefore = m_stall.applyMs;
+        const std::optional<Rows> r = watcher->result();
         watcher->deleteLater();
         m_boardBusy = false;
         if (!r)
             return;
-        bool changed = false;
-        for (const auto &[id, st] : *r)
-            if (m_statusById.value(id) != st) {
-                m_statusById.insert(id, st);
-                changed = true;
-            }
-        if (changed)
-            publish();
+        applyBoard(*r);
         const double ms = apply.nsecsElapsed() / 1e6;
-        m_stall.boardMs += ms - (m_stall.publishMs - publishBefore);
+        m_stall.boardMs += ms - (m_stall.publishMs - publishBefore) - (m_stall.applyMs - applyBefore);
         m_stall.boards += 1;
         noteStall(ms);
     });
-    watcher->setFuture(QtConcurrent::run([program = lapisPeers(), cwd = home()]() -> std::optional<Statuses> {
+    watcher->setFuture(QtConcurrent::run([program = lapisPeers(), cwd = home()]() -> std::optional<Rows> {
         QProcess p;
         p.setWorkingDirectory(cwd);
+        // Snippets too: a remote (SSH) session has no local transcript, so the board's latest
+        // reply is all the context its island and conversation can show.
         p.start(program, {QStringLiteral("board"), QStringLiteral("--json"), QStringLiteral("--snippet-chars"),
-                          QStringLiteral("0")});
+                          QStringLiteral("400")});
         if (!p.waitForFinished(15000)) {
             p.kill();
             p.waitForFinished(1000);
@@ -3074,18 +3117,35 @@ void Backend::pollBoard()
         }
         if (p.exitStatus() != QProcess::NormalExit || p.exitCode() != 0)
             return std::nullopt;
-        Statuses out;
-        const QJsonObject b = QJsonDocument::fromJson(p.readAllStandardOutput()).object();
-        for (const QJsonValue &c : b.value(QLatin1String("categories")).toArray())
-            for (const QJsonValue &a : c.toObject().value(QLatin1String("agents")).toArray()) {
-                const QJsonObject ao = a.toObject();
-                out.append({ao.value(QLatin1String("id")).toString(), ao.value(QLatin1String("status")).toString()});
-            }
-        return out;
+        return parseBoardJson(p.readAllStandardOutput());
     }));
     const double ms = clock.nsecsElapsed() / 1e6;  // dispatch only
     m_stall.boardMs += ms;
     noteStall(ms);
+}
+
+void Backend::applyBoard(const QList<BoardRow> &rows)
+{
+    bool changed = false;
+    bool rename = false;  // a transcript-less generic tab takes its island name from its snippet
+    for (const BoardRow &r : rows) {
+        if (m_statusById.value(r.id) != r.status) {
+            m_statusById.insert(r.id, r.status);
+            changed = true;
+        }
+        if (r.snippet.isEmpty() || m_snippetById.value(r.id) == r.snippet)
+            continue;
+        m_snippetById.insert(r.id, r.snippet);
+        changed = true;
+        for (const Project &p : std::as_const(m_projects))
+            if (p.key.startsWith(QLatin1String("~tab:")) && p.ex.promptName.isEmpty() && p.ex.jobName.isEmpty()
+                && std::any_of(p.sessions.cbegin(), p.sessions.cend(), [&](const SessionInfo &s) { return s.id == r.id; }))
+                rename = true;
+    }
+    if (rename && !m_lastSessions.isEmpty())
+        applyScan(m_lastSessions, m_cache);
+    else if (changed)
+        publish();
 }
 
 // --- Human-interest filter -------------------------------------------------------------------

@@ -12,8 +12,35 @@ Item {
     readonly property string winner: ladder ? ladder.winner : ""
     readonly property int reached: !ladder ? 0 : (winner.length > 0 ? 4 : (arms.length > 0 ? 3 : (assumptions.length > 0 ? 2 : 1)))
 
+    // The session's conversation, oldest first: [{role: "user"|"assistant"|"peer", text}].
+    readonly property var turns: project && project.turns ? project.turns : []
+    readonly property bool hasTurns: turns.length > 0
+
     readonly property real colW: Math.min(1180, width - 160)
-    readonly property real rungH: Math.min(190, (height - 40) / 4)
+    // With a conversation the rungs tighten to the top and the thread takes the rest.
+    readonly property real rungH: hasTurns ? Math.max(112, Math.min(150, (height - 300) / 4))
+                                           : Math.min(190, (height - 40) / 4)
+
+    // R stick / wheel / arrows: the conversation scrolls, smooth and unanimated.
+    function scrollPixels(px) {
+        if (!hasTurns)
+            return;
+        const top = thread.originY;
+        const bottom = thread.originY + Math.max(0, thread.contentHeight - thread.height);
+        thread.contentY = Math.max(top, Math.min(bottom, thread.contentY + px));
+    }
+    function scrollBy(d) {
+        scrollPixels(d * 34 * 4);
+    }
+    // A different session opens at its newest turn.
+    property string shownKey: ""
+    onProjectChanged: {
+        const k = project ? project.key : "";
+        if (k !== shownKey) {
+            shownKey = k;
+            Qt.callLater(thread.positionViewAtEnd);
+        }
+    }
 
     // Tab predictor, a small state machine over the rung reached: a finished ladder with
     // artifacts opens the Stage; otherwise it suggests the question that moves the current rung.
@@ -56,10 +83,75 @@ Item {
         Behavior on height { NumberAnimation { duration: 420; easing.type: Easing.OutCubic } }
     }
 
+    // Conversation: what the session said, newest at the bottom ("You" in the accent, the
+    // assistant in ink), so the Ladder carries the context Lapis's visual view shows.
+    Item {
+        id: convo
+        objectName: "conversation"
+        visible: root.hasTurns
+        x: rungs.x
+        y: rungs.y + rungs.height + 8
+        width: root.colW
+        height: Math.max(0, root.height - y)
+
+        Text {
+            x: 76
+            text: "Conversation"
+            color: Theme.dim
+            font.family: Theme.sans
+            font.pixelSize: Theme.px(17)
+            font.weight: Font.Medium
+            font.letterSpacing: 1.6
+            font.capitalization: Font.AllUppercase
+        }
+        ListView {
+            id: thread
+            objectName: "threadView"
+            x: 76
+            y: 34
+            width: parent.width - 76
+            height: Math.max(0, parent.height - 34)
+            clip: true
+            spacing: 22
+            boundsBehavior: Flickable.StopAtBounds
+            // A count, not the array: each publish hands QML a fresh array; delegates rebind in place.
+            model: root.turns.length
+            onCountChanged: Qt.callLater(positionViewAtEnd)
+            delegate: Column {
+                required property int index
+                readonly property var turn: root.turns[index] || ({ role: "", text: "" })
+                readonly property bool mine: turn.role === "user"
+                width: thread.width
+                spacing: 6
+                Text {
+                    objectName: "turnRole"
+                    text: parent.mine ? "You" : (parent.turn.role === "peer" ? "Peer" : "Assistant")
+                    color: parent.mine ? Theme.gold : Theme.dim
+                    font.family: Theme.sans
+                    font.pixelSize: Theme.px(16)
+                    font.weight: Font.DemiBold
+                    font.letterSpacing: 1.2
+                    font.capitalization: Font.AllUppercase
+                }
+                Text {
+                    objectName: "turnText"
+                    width: parent.width
+                    text: parent.turn.text
+                    textFormat: Text.PlainText
+                    wrapMode: Text.Wrap
+                    color: parent.mine ? Theme.text : Theme.ink
+                    font.family: Theme.sans
+                    font.pixelSize: Theme.px(21)
+                    lineHeight: 1.3
+                }
+            }
+        }
+    }
+
     Column {
         id: rungs
         x: (root.width - root.colW) / 2
-        y: Math.max(0, (root.height - root.rungH * 4) / 2)
+        y: root.hasTurns ? 0 : Math.max(0, (root.height - root.rungH * 4) / 2)
         width: root.colW
 
         // 1. Goal

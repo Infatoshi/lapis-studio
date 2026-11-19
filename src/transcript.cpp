@@ -352,6 +352,39 @@ QString shortModel(const QString &model)
     return m;
 }
 
+QString stripToolNoise(const QString &s)
+{
+    if (!s.contains(QLatin1Char('<')) && !s.contains(QLatin1Char('{')) && !s.contains(QLatin1Char('[')))
+        return s;  // the common case: plain prose, no regex work at all
+    using RE = QRegularExpression;
+    static const RE blocks(
+        QStringLiteral("<(?:\\w+:)?(tool_calls?|tool_use|tool_result|function_calls?|invoke)\\b[^>]*>"
+                       ".*?(</(?:\\w+:)?\\1>|$)"),
+        RE::DotMatchesEverythingOption | RE::CaseInsensitiveOption);
+    static const RE specialBlocks(
+        QStringLiteral("<[|\\x{FF5C}]tool[_\\x{2581}]calls?[_\\x{2581}](section[_\\x{2581}])?begin[|\\x{FF5C}]>"
+                       ".*?(<[|\\x{FF5C}]tool[_\\x{2581}]calls?[_\\x{2581}](section[_\\x{2581}])?end[|\\x{FF5C}]>|$)"),
+        RE::DotMatchesEverythingOption);
+    static const RE specialTokens(QStringLiteral("<[|\\x{FF5C}][^|\\x{FF5C}<>\\n]{1,48}[|\\x{FF5C}]>"));
+    static const RE strayTags(QStringLiteral("</?(?:\\w+:)?(tool_calls?|tool_use|tool_result|function_calls?|invoke|parameter)\\b[^>]*>"),
+                              RE::CaseInsensitiveOption);
+    static const RE jsonCall(QStringLiteral("^\\s*\\{\\s*\"(name|tool|tool_name|function)\"\\s*:.*\"(arguments|parameters|input|args)\"\\s*:"));
+    static const RE toolLine(QStringLiteral("^\\s*(\\[(tool|tool_call|tool_use|function_call)\\b[^\\]]*\\]|(tool call|calling tool|tool_call)\\s*[:(])"),
+                             RE::CaseInsensitiveOption);
+    QString out = s;
+    out.remove(blocks);
+    out.remove(specialBlocks);
+    out.remove(specialTokens);
+    out.remove(strayTags);
+    QStringList keep;
+    for (const QString &l : out.split(QLatin1Char('\n'))) {
+        if (jsonCall.match(l).hasMatch() || toolLine.match(l).hasMatch())
+            continue;
+        keep << l;
+    }
+    return keep.join(QLatin1Char('\n'));
+}
+
 QString stripMarkup(const QString &s)
 {
     QString out = s;
@@ -1271,6 +1304,42 @@ Extracted extractArtifacts(const QList<Turn> &turns, PathCheck pathExists)
         ex.files = files.mid(std::max<qsizetype>(0, files.size() - 25));
         ex.toolCalls = tools.mid(std::max<qsizetype>(0, tools.size() - 15));
     }
+    // The readable conversation (Ladder): the last 16 turns that still say something once tool
+    // noise is stripped; machine-written user records (compaction summaries) are not the user.
+    {
+        static const QStringList machine = {
+            QStringLiteral("This session is being continued"), QStringLiteral("Caveat:"),
+            QStringLiteral("[Request interrupted"), QStringLiteral("Continue from where"), QStringLiteral("Project: ")};
+        QVariantList thread;
+        for (qsizetype i = turns.size() - 1; i >= 0 && thread.size() < 16; --i) {
+            const Turn &t = turns[i];
+            const QString raw = t.text.trimmed();
+            if (raw.isEmpty())
+                continue;
+            if (t.role == QLatin1String("user")
+                && std::any_of(machine.begin(), machine.end(), [&](const QString &p) { return raw.startsWith(p); }))
+                continue;
+            const QString text = cleanTurnText(raw, 800);
+            if (text.isEmpty())
+                continue;
+            // A relay from another agent arrives as a user record; it is not the user talking.
+            const bool peer = t.role == QLatin1String("user") && raw.startsWith(QLatin1String("[lapis-peers"));
+            thread.prepend(QVariantMap{{QStringLiteral("role"), peer ? QStringLiteral("peer") : t.role},
+                                       {QStringLiteral("text"), text}});
+        }
+        ex.threadTurns = thread;
+        for (const Turn &t : turns) {
+            if (t.role != QLatin1String("user"))
+                continue;
+            const QString first = t.text.trimmed().section(QLatin1Char('\n'), 0, 0);
+            if (first.isEmpty() || first.startsWith(QLatin1Char('<'))
+                || std::any_of(machine.begin(), machine.end(), [&](const QString &p) { return first.startsWith(p); }))
+                continue;
+            ex.promptName = promptTitle(first, 5);
+            if (!ex.promptName.isEmpty())
+                break;
+        }
+    }
     ex.params = extractParams(turns, ex.artifacts);
     ex.jobName = synthesizeJobName(turns, ex.goal);
     ex.tailSigs = turnSignatures(turns);
@@ -1406,7 +1475,248 @@ bool isMetaRequest(const QString &line)
     return meta.match(line.trimmed()).hasMatch() || line.contains(QLatin1String("session"), Qt::CaseInsensitive);
 }
 
+// A request's leading verb and its gerund: "fix the fn key toggle" -> Fixing.
+const QHash<QString, QString> &leadVerbs()
+{
+    static const QHash<QString, QString> v = {
+        {"fix", "Fixing"}, {"debug", "Debugging"}, {"sweep", "Sweeping"}, {"train", "Training"},
+        {"finetune", "Training"}, {"fine-tune", "Training"}, {"profile", "Profiling"}, {"review", "Reviewing"},
+        {"bench", "Benchmarking"}, {"benchmark", "Benchmarking"}, {"serve", "Serving"}, {"search", "Searching"},
+        {"record", "Rendering"}, {"render", "Rendering"}, {"test", "Testing"}, {"build", "Building"},
+        {"compile", "Building"}, {"write", "Writing"}, {"draft", "Writing"}, {"port", "Porting"},
+        {"migrate", "Porting"}, {"upgrade", "Improving"}, {"improve", "Improving"}, {"optimize", "Optimizing"},
+        {"optimise", "Optimizing"}, {"tune", "Tuning"}, {"compare", "Comparing"}, {"investigate", "Investigating"},
+        {"add", "Adding"}, {"implement", "Implementing"}, {"find", "Finding"}, {"check", "Checking"},
+        {"create", "Creating"}, {"run", "Running"}, {"update", "Updating"}, {"clean", "Cleaning"},
+        {"install", "Installing"}, {"deploy", "Deploying"}, {"refactor", "Refactoring"}, {"merge", "Merging"},
+        {"rewrite", "Rewriting"}, {"explore", "Exploring"}, {"analyze", "Analyzing"}, {"analyse", "Analyzing"},
+        {"measure", "Measuring"}, {"wire", "Wiring"}, {"launch", "Launching"}, {"start", "Starting"},
+        {"stop", "Stopping"}, {"kill", "Stopping"}, {"delete", "Deleting"}, {"remove", "Removing"},
+        {"move", "Moving"}, {"rename", "Renaming"}, {"convert", "Converting"}, {"generate", "Generating"},
+        {"design", "Designing"}, {"plan", "Planning"}, {"research", "Researching"}, {"summarize", "Summarizing"},
+        {"send", "Sending"}, {"ship", "Shipping"}, {"publish", "Publishing"}, {"read", "Reading"},
+        {"configure", "Configuring"}, {"restore", "Restoring"}, {"upload", "Uploading"},
+        {"download", "Downloading"}, {"translate", "Translating"}, {"transcribe", "Transcribing"},
+        {"make", "Making"}, {"setup", "Setting up"}, {"set", "Setting"}, {"audit", "Auditing"},
+        {"evaluate", "Evaluating"}, {"eval", "Evaluating"}, {"recreate", "Recreating"}, {"edit", "Editing"},
+        {"listen", "Listening"}, {"watch", "Watching"}, {"open", "Opening"}, {"triage", "Triaging"},
+        {"organize", "Organizing"}, {"summarise", "Summarizing"}, {"collect", "Collecting"}};
+    return v;
+}
+
+// The clause of a request line that can name its job, word order kept:
+//   verb   the leading imperative verb as typed ("fix"), "" for a noun phrase ("Kneron H3 blind review")
+//   words  its subject, articles / possessives / filler dropped, connectors ("for", "on") kept between
+//          content words, at most `maxContent` content words
+// ok is false for chat that does not name a job: questions, "I mean it's ...", "dont even ask ...".
+struct RequestClause {
+    QString verb;
+    QStringList words;
+    QString text;  // the clause the words came from, for verb inference
+    bool ok = false;
+};
+
+// `title`: the line is a Lapis tab title, a label by construction, so any length of noun phrase
+// names the job; a request line names one as a noun phrase only when short ("roblox game 2"):
+// a long non-imperative sentence is conversation ("Another agent stated the mismatch plainly").
+// `minContent`: content words a clause needs ("Fix bug" names nothing; "Fix fn key toggle" does).
+RequestClause requestClause(const QString &line, int maxContent, bool title = false, int minContent = 2)
+{
+    static const QSet<QString> filler = {"ok", "okay", "so", "hey", "hi", "yo", "please", "pls", "can", "could",
+                                         "would", "will", "you", "u", "i", "we", "want", "wanna", "need", "to",
+                                         "lets", "let's", "let", "us", "now", "also", "then", "just", "go", "ahead",
+                                         "and", "quickly", "kindly", "first", "next", "finally", "alright", "right"};
+    // A noun phrase never holds these; a line that does is conversation, not a job name.
+    static const QSet<QString> chatty = {
+        "i", "i'm", "im", "i've", "i'd", "me", "you", "you're", "your", "we", "he", "she", "they", "it", "it's",
+        "its", "dont", "don't", "didnt", "didn't", "doesnt", "doesn't", "isnt", "isn't", "cant", "can't", "wont",
+        "won't", "mean", "how", "what", "why", "who", "whats", "what's", "did", "does", "do", "is", "are", "was",
+        "were", "am", "be", "been", "these", "those", "this", "that", "there", "here", "if", "because", "but",
+        "even", "really", "should", "would", "could", "have", "has", "had", "got", "my", "our", "ask", "asked"};
+    static const QSet<QString> skip = {"a", "an", "the", "my", "our", "your", "his", "her", "their", "some", "any",
+                                       "all", "this", "these", "those", "that", "its", "own", "most", "though",
+                                       "anyway", "too", "again", "everything", "something", "anything", "stuff",
+                                       "actually", "basically", "maybe", "probably"};
+    // An embedded question ends the request ("check what jobs the server is running"): what follows is
+    // not the object, so a clause with nothing before it names nothing.
+    static const QSet<QString> embedded = {"what", "how", "why", "whether", "who", "whom", "whose", "what's", "whats"};
+    static const QSet<QString> connectors = {"for", "on", "in", "to", "with", "at", "from", "into", "of", "about",
+                                             "vs", "via", "across", "over", "under", "per", "by", "using", "against"};
+    static const QSet<QString> breakers = {"and", "then", "so", "but", "or", "because", "which", "while", "plus",
+                                           "after", "before", "if", "when", "where", "until", "since", "like"};
+    static const QRegularExpression numUnit(QStringLiteral("\\b(\\d+(?:\\.\\d+)?) (Hz|fps|ms|GB|MB|k)\\b"),
+                                            QRegularExpression::CaseInsensitiveOption);
+    static const QRegularExpression sentenceEnd(QStringLiteral("[.?!;]+(\\s+|$)"));
+    static const QRegularExpression bareInt(QStringLiteral("^[0-9,]+$"));
+    // "240 Hz" stays one word (a no-break space, set per clause below), so the number survives the
+    // bare-number filter.
+    const QString s = cleanSubjectLine(line);
+    // Sentences with their terminators ("6.2" never splits: an end needs whitespace or the line end).
+    QList<QPair<QString, bool>> sentences;
+    {
+        qsizetype from = 0;
+        for (auto it = sentenceEnd.globalMatch(s); it.hasNext();) {
+            const auto m = it.next();
+            sentences.append({s.mid(from, m.capturedStart() - from), m.captured(0).contains(QLatin1Char('?'))});
+            from = m.capturedEnd();
+        }
+        if (from < s.size())
+            sentences.append({s.mid(from), false});
+    }
+    int tried = 0;
+    for (const auto &[sentence, question] : std::as_const(sentences)) {
+        if (sentence.trimmed().isEmpty())
+            continue;
+        if (++tried > 3)
+            break;
+        // Leading clauses that are pure filler ("Okay, ...") give way to the next one.
+        for (const QString &part : sentence.split(QLatin1Char(','), Qt::SkipEmptyParts)) {
+            // simplified() first: it would turn the "240 Hz" no-break space back into a space.
+            QString clause = part.simplified();
+            clause.replace(numUnit, QStringLiteral("\\1") + QChar(0x00a0) + QStringLiteral("\\2"));
+            QStringList toks = clause.split(QLatin1Char(' '), Qt::SkipEmptyParts);
+            while (!toks.isEmpty() && filler.contains(cleanWord(toks.first()).toLower()))
+                toks.removeFirst();
+            if (toks.isEmpty())
+                continue;
+            RequestClause c;
+            c.text = toks.join(QLatin1Char(' '));
+            // Chat about the chat ("you are replacing the Phonon session", "[lapis-peers ...").
+            if (isMetaRequest(c.text))
+                break;
+            const QString first = cleanWord(toks.first()).toLower();
+            if (leadVerbs().contains(first)) {
+                c.verb = cleanWord(toks.takeFirst());
+                if (first == QLatin1String("set") && !toks.isEmpty() && cleanWord(toks.first()).toLower() == QLatin1String("up")) {
+                    toks.removeFirst();
+                    c.verb = QStringLiteral("setup");
+                }
+            } else {
+                // Only a line's opening sentence can be a label; later ones are context.
+                if (question || (!title && (toks.size() > 6 || tried > 1)))
+                    break;
+                bool chat = false;
+                for (const QString &t : std::as_const(toks))
+                    chat = chat || chatty.contains(cleanWord(t).toLower());
+                if (chat)
+                    break;
+            }
+            QStringList pending;
+            int content = 0;
+            for (const QString &raw : std::as_const(toks)) {
+                const QString w = cleanWord(raw);
+                if (w.isEmpty())
+                    continue;
+                const QString l = w.toLower();
+                // "fix the fact that it's unreachable": a relative clause or a pronoun after the
+                // object starts a new thought; the object ends there.
+                if (content > 0 && (l == QLatin1String("that") || (chatty.contains(l) && !skip.contains(l))))
+                    break;
+                if (skip.contains(l) || bareInt.match(l).hasMatch())
+                    continue;
+                if (embedded.contains(l))
+                    break;
+                if (breakers.contains(l)) {
+                    if (content > 0)
+                        break;
+                    continue;
+                }
+                if (connectors.contains(l)) {
+                    // "listen to ...": a connector straight after the verb belongs to it.
+                    if (content > 0 || (!c.verb.isEmpty() && c.words.isEmpty() && pending.isEmpty()))
+                        pending << l;
+                    continue;
+                }
+                if (stopWords().contains(l) || chatty.contains(l))
+                    continue;
+                if (content >= maxContent) {
+                    // Cut mid-phrase ("support to PS4 controller with obvious | keybinds"): fall
+                    // back to the last connector so the name ends on a whole phrase.
+                    if (pending.isEmpty())
+                        for (qsizetype k = c.words.size() - 1; k > 0; --k)
+                            if (connectors.contains(c.words[k]) && k >= 2) {
+                                content -= int(c.words.size() - k - 1);
+                                c.words = c.words.mid(0, k);
+                                break;
+                            }
+                    break;
+                }
+                c.words += pending;
+                pending.clear();
+                c.words << properCase(w);
+                ++content;
+            }
+            c.ok = content >= std::max(1, minContent);
+            if (c.ok)
+                return c;
+            break;  // the sentence's first real clause names nothing: try the next sentence
+        }
+    }
+    return {};
+}
+
+// Connectors left hanging at the end of a cut name ("Sweeping tile sizes for FP4 GEMM on").
+void trimTrailingConnectors(QStringList &words)
+{
+    static const QSet<QString> hang = {"for", "on", "in", "to", "with", "at", "from", "into", "of", "about", "vs",
+                                       "via", "across", "over", "under", "per", "by", "using", "against", "up"};
+    while (words.size() > 1 && hang.contains(words.last().toLower()))
+        words.removeLast();
+}
+
 }  // namespace
+
+QString promptTitle(const QString &request, int maxWords)
+{
+    const QString line = request.trimmed().section(QLatin1Char('\n'), 0, 0);
+    if (line.isEmpty() || line.startsWith(QLatin1Char('[')) || line.startsWith(QLatin1Char('<')))
+        return {};
+    const RequestClause c = requestClause(line, std::max(1, maxWords - 1));
+    if (!c.ok)
+        return {};
+    QStringList words;
+    if (!c.verb.isEmpty())
+        words << (c.verb.toLower() == QLatin1String("setup") ? QStringLiteral("Set up") : c.verb);
+    words += c.words;
+    // maxWords counts meaningful words; connectors between them ("for", "on") ride along.
+    while (words.size() > maxWords + 2)
+        words.removeLast();
+    trimTrailingConnectors(words);
+    if (words.size() < 2)
+        return {};
+    QString out = words.join(QLatin1Char(' '));
+    out[0] = out.at(0).toUpper();
+    return out;
+}
+
+QString cleanTurnText(const QString &text, int maxChars)
+{
+    static const QRegularExpression harnessBlocks(
+        QStringLiteral("<(system-reminder|command-[a-z]+|local-command-[a-z]+|ADDITIONAL_METADATA|USER_SETTINGS_CHANGE|"
+                       "user-prompt-submit-hook)>.*?(</\\1>|$)"),
+        QRegularExpression::DotMatchesEverythingOption);
+    static const QRegularExpression fenceLine(QStringLiteral("^\\s*```[\\w+-]*\\s*$"), QRegularExpression::MultilineOption);
+    static const QRegularExpression blankRuns(QStringLiteral("\\n{3,}"));
+    static const QRegularExpression trailingWs(QStringLiteral("[ \\t]+\\n"));
+    QString s = text;
+    s.remove(harnessBlocks);
+    s = stripToolNoise(s);
+    if (s.contains(QLatin1Char('<')))
+        s = stripMarkup(s);
+    s.remove(fenceLine);
+    s.remove(QStringLiteral("**"));
+    s.remove(QLatin1Char('`'));
+    s.replace(trailingWs, QStringLiteral("\n"));
+    s.replace(blankRuns, QStringLiteral("\n\n"));
+    s = s.trimmed();
+    if (s.size() > maxChars) {
+        qsizetype cut = s.lastIndexOf(QLatin1Char(' '), maxChars - 1);
+        if (cut < maxChars / 2)
+            cut = maxChars - 1;
+        s = s.left(cut).trimmed() + QChar(0x2026);
+    }
+    return s;
+}
 
 QString synthesizeJobName(const QList<Turn> &turns, const QString &goal, const QString &title)
 {
@@ -1423,59 +1733,6 @@ QString synthesizeJobName(const QList<Turn> &turns, const QString &goal, const Q
         recent += lines.join(QLatin1Char(' ')).remove(pathTok) + QLatin1Char(' ');
     }
     recent = recentTools + recent;
-    // Subject source: a Lapis tab title that reads as a phrase ("GPT 6.2 Astra KernelBench run"),
-    // else the goal, else the first real request (meta requests about the chat itself skipped).
-    QString g;
-    const QString t = cleanSubjectLine(title);
-    if (t.contains(QLatin1Char(' ')) && contentWords(t) >= 2)
-        g = t;
-    if (g.isEmpty() && !isMetaRequest(goal) && contentWords(cleanSubjectLine(goal)) >= 2)
-        g = cleanSubjectLine(goal);
-    if (g.isEmpty())
-        for (const Turn &u : turns) {
-            if (u.role != QLatin1String("user"))
-                continue;
-            const QString rawLine = u.text.trimmed().section(QLatin1Char('\n'), 0, 0);
-            const QString line = cleanSubjectLine(rawLine);
-            if (!isMetaRequest(rawLine) && !isMetaRequest(line) && contentWords(line) >= 2) {
-                g = line;
-                break;
-            }
-        }
-    if (g.trimmed().isEmpty())
-        return {};
-    // "240 Hz" stays one word (a no-break space), so the number survives the bare-number filter.
-    static const QRegularExpression numUnit(QStringLiteral("\\b(\\d+(?:\\.\\d+)?) (Hz|fps|ms|GB|MB|k)\\b"),
-                                            QRegularExpression::CaseInsensitiveOption);
-    g = g.simplified();
-    g.replace(numUnit, QStringLiteral("\\1") + QChar(0x00a0) + QStringLiteral("\\2"));
-
-    // Verb: the goal's own verb when it has one (the intent), else what the latest turns are doing.
-    static const QList<QRegularExpression> verbRes = [] {
-        QList<QRegularExpression> out;
-        for (const VerbRule &r : verbRules())
-            out << QRegularExpression(QString::fromLatin1(r.pattern), QRegularExpression::CaseInsensitiveOption);
-        return out;
-    }();
-    // A goal that opens with a verb says the intent outright: "fix the fn key toggle" -> Fixing.
-    static const QHash<QString, QString> leadVerb = {
-        {"fix", "Fixing"}, {"debug", "Debugging"}, {"sweep", "Sweeping"}, {"train", "Training"},
-        {"finetune", "Training"}, {"fine-tune", "Training"}, {"profile", "Profiling"}, {"review", "Reviewing"},
-        {"bench", "Benchmarking"}, {"benchmark", "Benchmarking"}, {"serve", "Serving"}, {"search", "Searching"},
-        {"record", "Rendering"}, {"render", "Rendering"}, {"test", "Testing"}, {"build", "Building"},
-        {"compile", "Building"}, {"write", "Writing"}, {"draft", "Writing"}, {"port", "Porting"},
-        {"migrate", "Porting"}, {"upgrade", "Improving"}, {"improve", "Improving"}, {"optimize", "Optimizing"},
-        {"optimise", "Optimizing"}, {"tune", "Tuning"}, {"compare", "Comparing"}, {"investigate", "Investigating"},
-        {"add", "Adding"}, {"implement", "Implementing"}, {"find", "Finding"}, {"check", "Checking"},
-        {"create", "Creating"}};
-    QString verb = leadVerb.value(cleanWord(g.section(QLatin1Char(' '), 0, 0)).toLower());
-    for (int pass = 0; pass < 2 && verb.isEmpty(); ++pass)
-        for (int k = 0; k < verbRes.size(); ++k)
-            if (verbRes[k].match(pass == 0 ? g : recent).hasMatch()) {
-                verb = QString::fromLatin1(verbRules()[k].gerund);
-                break;
-            }
-
     // Progress: the newest "step N" (training) or "N/M" counter in the recent turns.
     QString progress;
     static const QRegularExpression stepRe(QStringLiteral("\\bstep[ =:]+(\\d{2,7})\\b"), QRegularExpression::CaseInsensitiveOption);
@@ -1488,32 +1745,60 @@ QString synthesizeJobName(const QList<Turn> &turns, const QString &goal, const Q
             progress = QStringLiteral("step ") + last;
     }
 
-    // Subject: the goal's content words, technical tokens properly cased.
-    QStringList subject;
-    const int maxSubject = progress.isEmpty() ? 4 : 2;
-    for (const QString &raw : g.split(QLatin1Char(' '), Qt::SkipEmptyParts)) {
-        const QString w = cleanWord(raw);
-        if (w.isEmpty())
+    // Subject source, first that reads as a job: a Lapis tab title phrase ("GPT 6.2 Astra
+    // KernelBench run"), the goal, then each request in order. Word order is kept ("Fixing fn key
+    // toggle latency"), so a name never reads as a bag of content words; chat that names no job
+    // ("dont even ask ...", "I mean it's ...", questions) is skipped rather than mangled.
+    const int maxContent = progress.isEmpty() ? 5 : 2;
+    QStringList candidates;
+    const QString t = cleanSubjectLine(title);
+    const bool titled = t.contains(QLatin1Char(' ')) && contentWords(t) >= 2;
+    if (titled)
+        candidates << title;
+    candidates << goal;
+    for (const Turn &u : turns)
+        if (u.role == QLatin1String("user"))
+            candidates << u.text.trimmed().section(QLatin1Char('\n'), 0, 0);
+    RequestClause clause;
+    for (qsizetype i = 0; i < candidates.size(); ++i) {
+        const QString c = candidates[i].trimmed();
+        // "Project: quick-qs (~). On screen: ..." is Lapis Studio's own context preamble, not a request.
+        if (c.isEmpty() || c.startsWith(QLatin1Char('[')) || c.startsWith(QLatin1Char('<'))
+            || c.startsWith(QLatin1String("Project: ")))
             continue;
-        const QString l = w.toLower();
-        if (stopWords().contains(l))
-            continue;
-        static const QRegularExpression bareInt(QStringLiteral("^[0-9,]+$"));
-        if (bareInt.match(l).hasMatch())
-            continue;  // "on 4 cards" -> a lone "4" says nothing ("GPT 6.2" keeps its version)
-        // Actions are the verb's job, not the subject's ("compare ... and add MTP"); words that are
-        // nouns as often as verbs ("benchmark", "test", "build") drop only when they lead.
-        static const QSet<QString> nounish = {"benchmark", "bench", "test", "build", "review", "search", "record",
-                                              "port", "check", "run", "profile", "draft"};
-        const bool echoesVerb = l.size() >= 3 && verb.toLower().startsWith(l.left(qMin<qsizetype>(l.size(), 5)));
-        if (isVerbWord(l) && (subject.isEmpty() || !nounish.contains(l) || echoesVerb))
-            continue;
-        if (subject.contains(properCase(w), Qt::CaseInsensitive))
-            continue;
-        subject << properCase(w);
-        if (subject.size() >= maxSubject)
+        // A training step counter carries a one-word subject ("Training LoRA step 400").
+        clause = requestClause(c, maxContent, titled && i == 0, progress.isEmpty() ? 2 : 1);
+        if (clause.ok)
             break;
     }
+    if (!clause.ok)
+        return {};
+
+    // Verb: the request's own verb when it has one (the intent), else what the latest turns are doing.
+    static const QList<QRegularExpression> verbRes = [] {
+        QList<QRegularExpression> out;
+        for (const VerbRule &r : verbRules())
+            out << QRegularExpression(QString::fromLatin1(r.pattern), QRegularExpression::CaseInsensitiveOption);
+        return out;
+    }();
+    QString verb = leadVerbs().value(clause.verb.toLower());
+    for (int pass = 0; pass < 2 && verb.isEmpty(); ++pass)
+        for (int k = 0; k < verbRes.size(); ++k)
+            if (verbRes[k].match(pass == 0 ? clause.text : recent).hasMatch()) {
+                verb = QString::fromLatin1(verbRules()[k].gerund);
+                break;
+            }
+    QStringList subject;
+    for (const QString &w : std::as_const(clause.words)) {
+        const QString l = w.toLower();
+        // An inferred verb already says the action ("Kneron H3 blind review" -> Reviewing ...).
+        const bool echoesVerb = clause.verb.isEmpty() && l.size() >= 3
+            && verb.toLower().startsWith(l.left(qMin<qsizetype>(l.size(), 5)));
+        if ((echoesVerb && isVerbWord(l)) || subject.contains(w, Qt::CaseInsensitive))
+            continue;
+        subject << w;
+    }
+    trimTrailingConnectors(subject);
     if (verb.isEmpty())
         verb = QStringLiteral("Working on");
     QStringList words = verb.split(QLatin1Char(' ')) + subject;
@@ -1533,8 +1818,22 @@ QString synthesizeJobName(const QList<Turn> &turns, const QString &goal, const Q
     }
     if (subject.isEmpty() && progress.isEmpty())
         return {};  // a verb alone ("Fixing") names nothing: better no job line than a vague one
-    while (words.size() > 7)
-        words.removeLast();
+    if (words.size() > 7) {
+        // Cut on a phrase boundary: a word past the cap that is not a connector means the 7th
+        // word sits mid-phrase ("... controller with obvious | keybinds"), so back off to the
+        // last connector.
+        static const QSet<QString> conn = {"for", "on", "in", "to", "with", "at", "from", "into", "of", "about",
+                                           "vs", "via", "across", "over", "under", "per", "by", "using", "against"};
+        const bool midPhrase = !conn.contains(words[7].toLower());
+        words = words.mid(0, 7);
+        if (midPhrase)
+            for (qsizetype k = words.size() - 1; k >= 3; --k)
+                if (conn.contains(words[k].toLower())) {
+                    words = words.mid(0, k);
+                    break;
+                }
+    }
+    trimTrailingConnectors(words);
     return words.join(QLatin1Char(' '));
 }
 

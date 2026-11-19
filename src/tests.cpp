@@ -170,6 +170,117 @@ void unitTests()
         }
         check(keys.size() == 8, "grouping: 9 $HOME tabs -> 8 islands (two Roblox tabs share one)",
               QStringList(keys.values()).join(','));
+
+        // Live sessions: $HOME tabs still titled after the folder are separate islands, not one
+        // "quick-qs" bucket (the --probe-live 14e5ecb8 / de6cd690 / 933d3ac5 case).
+        auto session = [&](const QString &id, const QString &title, const QString &dir, const QString &cat) {
+            SessionInfo s;
+            s.id = id;
+            s.title = title;
+            s.directory = dir;
+            s.category = cat;
+            s.harness = "agy";
+            return s;
+        };
+        const QString homeName = QFileInfo(h).fileName();
+        check(isGenericTabTitle(homeName) && isGenericTabTitle("") && isGenericTabTitle("tmp")
+                  && !isGenericTabTitle("Kneron H3 blind review"),
+              "grouping: generic tab titles");
+        check(promptTitle("can you fix the fn key toggle latency?") == "Fix fn key toggle latency",
+              "grouping: prompt title from the first request", promptTitle("can you fix the fn key toggle latency?"));
+        check(promptTitle("Okay, you are replacing the Phonon session.").isEmpty()
+                  && promptTitle("`https://x.com/a/status/1` How did they do it?").isEmpty(),
+              "grouping: meta requests and questions name no tab");
+        Extracted e1;
+        e1.promptName = promptTitle("please sweep tile sizes for the fp4 gemm on sm120");
+        Extracted e2;
+        e2.jobName = "Benchmarking Qwen 3.8 decode";
+        const ProjectId t1 = sessionProjectId(session("14e5ecb8-aaaa-bbbb-cccc-000000000001", homeName, h, "quick Qs"), e1);
+        const ProjectId t2 = sessionProjectId(session("de6cd690-aaaa-bbbb-cccc-000000000002", homeName, h, "quick Qs"), e2);
+        const ProjectId t3 = sessionProjectId(session("933d3ac5-aaaa-bbbb-cccc-000000000003", homeName, h, "quick Qs"), Extracted());
+        const ProjectId t4 = sessionProjectId(session("4d4cfbff-aaaa-bbbb-cccc-000000000004", homeName, h, "quick Qs"), Extracted(),
+                                              "Deleted 86G of reproducible training checkpoints on the box.");
+        check(t1.key == "~tab:14e5ecb8" && t2.key == "~tab:de6cd690" && t3.key == "~tab:933d3ac5" && t1.fromTitle,
+              "grouping: each generic $HOME tab keys by its short id", t1.key + " " + t2.key + " " + t3.key);
+        check(t1.name == "Sweep tile sizes for FP4 GEMM" && t2.name == "Benchmarking Qwen 3.8 decode" && t3.name == "tab 933d3ac5"
+                  && t4.name.startsWith("Deleted 86G"),
+              "grouping: tab islands named from the first request, else job name, else board snippet",
+              t1.name + " | " + t2.name + " | " + t3.name + " | " + t4.name);
+        check(sessionProjectId(session("aaaaaaaa-1", "Kneron H3 blind review", h, "apps"), e1).key == "~kneron-h3"
+                  && sessionProjectId(session("bbbbbbbb-1", homeName, h + "/dev/lapis", "apps"), e1).key == "lapis",
+              "grouping: titled tabs and real folders keep their islands");
+
+        // Through the live scan path: three generic tabs + a titled one + a remote session with no
+        // local transcript. Categories stay; the remote island takes the board snippet.
+        QTemporaryDir td;
+        QHash<QString, ParsedCache> cache;
+        QList<SessionInfo> sessions;
+        const QStringList ids = {"14e5ecb8-0000-0000-0000-000000000001", "de6cd690-0000-0000-0000-000000000002",
+                                 "933d3ac5-0000-0000-0000-000000000003"};
+        const QStringList asks = {"fix the fn key toggle latency", "sweep tile sizes for the fp4 gemm",
+                                  "write the release notes for lapis studio"};
+        for (int i = 0; i < ids.size(); ++i) {
+            SessionInfo s = session(ids[i], homeName, h, "quick Qs");
+            s.transcript = td.filePath(QStringLiteral("t%1.jsonl").arg(i));
+            QFile f(s.transcript);
+            if (f.open(QIODevice::WriteOnly))
+                f.close();
+            Turn u;
+            u.role = "user";
+            u.text = asks[i];
+            Turn a;
+            a.role = "assistant";
+            a.text = QStringLiteral("Done with step %1.").arg(i);
+            ParsedCache c;
+            c.ex = extractArtifacts({u, a});
+            cache.insert(s.transcript, c);
+            sessions << s;
+        }
+        sessions << session("1a0d1a39-0000-0000-0000-000000000009", "netherite-v2", "~/dev/netherite-v2", "minecraft");
+        Backend b(Backend::Mode::Mock);
+        b.testApplyScan(sessions, cache);
+        QHash<QString, QVariantMap> byKey;
+        for (const QVariant &v : b.projects())
+            byKey.insert(v.toMap().value("key").toString(), v.toMap());
+        check(byKey.size() == 4 && byKey.contains("~tab:14e5ecb8") && byKey.contains("~tab:de6cd690")
+                  && byKey.contains("~tab:933d3ac5") && !byKey.contains("~quick-qs"),
+              "grouping: three generic $HOME tabs -> three islands, no quick-qs bucket", QStringList(byKey.keys()).join(','));
+        check(byKey.value("~tab:14e5ecb8").value("name").toString() == "Fix fn key toggle latency"
+                  && byKey.value("~tab:933d3ac5").value("name").toString() == "Write release notes for lapis studio",
+              "grouping: tab islands named from their first request",
+              byKey.value("~tab:14e5ecb8").value("name").toString() + " | " + byKey.value("~tab:933d3ac5").value("name").toString());
+        check(byKey.value("~tab:de6cd690").value("category").toString() == "quick Qs"
+                  && byKey.value("netherite-v2").value("category").toString() == "minecraft",
+              "grouping: categories stay on the project");
+        check(byKey.value("~tab:14e5ecb8").value("turns").toList().size() == 2,
+              "turns: projectMap exposes the conversation", QString::number(byKey.value("~tab:14e5ecb8").value("turns").toList().size()));
+        const QVariantMap before = byKey.value("netherite-v2");
+        check(before.value("lastLine").toString().isEmpty() && before.value("turns").toList().isEmpty(),
+              "board: a remote session starts with no local text");
+        const QByteArray board = R"({"categories":[{"name":"minecraft","agents":[
+            {"id":"1a0d1a39-0000-0000-0000-000000000009","status":"working","infinityRedacted":false,
+             "lastReplySnippet":"lane/wood didn't land: its branch conflicts with lane/choice. I'm merging master into it now."}]},
+            {"name":"infinity","agents":[{"id":"ba7843e9-0000","status":"working","infinityRedacted":true,"lastReplySnippet":"secret"}]}]})";
+        const QList<BoardRow> rows = parseBoardJson(board);
+        check(rows.size() == 2 && rows[0].status == "working" && rows[0].snippet.startsWith("lane/wood") && rows[1].snippet.isEmpty(),
+              "board: parse status + lastReplySnippet, withheld snippets dropped");
+        b.applyBoard(rows);
+        QVariantMap after;
+        for (const QVariant &v : b.projects())
+            if (v.toMap().value("key").toString() == "netherite-v2")
+                after = v.toMap();
+        const QVariantList rt = after.value("turns").toList();
+        check(after.value("lastLine").toString().startsWith("lane/wood didn't land") && after.value("status").toString() == "working",
+              "board: the snippet fills lastLine when the local transcript is empty", after.value("lastLine").toString());
+        check(rt.size() == 1 && rt[0].toMap().value("text").toString().startsWith("lane/wood")
+                  && rt[0].toMap().value("source").toString() == "board",
+              "board: the snippet is the remote session's conversation");
+        // A session with its own transcript keeps its own lines.
+        b.applyBoard({{ids[0], "idle", "Something the board says"}});
+        for (const QVariant &v : b.projects())
+            if (v.toMap().value("key").toString() == "~tab:14e5ecb8")
+                check(v.toMap().value("turns").toList().size() == 2 && !v.toMap().value("lastLine").toString().contains("board says"),
+                      "board: a local transcript wins over the snippet");
     }
     // Never a blank island.
     check(elapsedLabel(30 * 1000) == "just now" && elapsedLabel(42 * 60000) == "42m"
@@ -734,6 +845,62 @@ void unitTests()
             v.tools = {"Bash: cmake --build build -j 2"};
             check(synthesizeJobName({v}, "").isEmpty(), "jobname: a verb with no subject gives no name (never just 'Building')",
                   synthesizeJobName({v}, ""));
+            // Word salad seen in --probe-live ("Rendering dont even ask fable", "Fixing mean it's
+            // unreachable fact"): chat is skipped, a real request keeps its word order.
+            auto user = [](const QString &text) {
+                Turn t;
+                t.role = "user";
+                t.text = text;
+                return t;
+            };
+            Turn r;
+            r.role = "assistant";
+            r.tools = {"Bash: ffmpeg -i in.mov out.mp4"};
+            check(synthesizeJobName({user("dont even ask fable, just do it yourself"), r}, "").isEmpty(),
+                  "jobname: chat ('dont even ask ...') never becomes a name", synthesizeJobName({user("dont even ask fable"), r}, ""));
+            check(synthesizeJobName({user("I mean it's unreachable in fact")}, "").isEmpty(),
+                  "jobname: 'I mean it's ...' never becomes a name");
+            const QString slack = synthesizeJobName({user("can you write a slack to Alex about her own blog")}, "");
+            check(slack == "Writing slack to Alex about blog", "jobname: a request keeps its word order", slack);
+            const QString fact = synthesizeJobName(
+                {user("What do you mean it's unreachable? Fix the fact that it's unreachable. There's gotta be a way.")}, "");
+            check(!fact.contains("unreachable") || fact.contains("fact that"), "jobname: a relative clause never glues on ('Fixing fact unreachable')", fact);
+            const QString ps4 = promptTitle("Add support to my PS4 controller with the most obvious keybinds and setups for things.");
+            check(ps4 == "Add support to PS4 controller", "jobname: a cut name ends on a whole phrase", ps4);
+            const QString later = synthesizeJobName({user("I mean it's unreachable in fact"), user("ok, render the demo video at 240 Hz")}, "");
+            check(later == "Rendering demo video at 240 Hz", "jobname: the first request that names a job wins", later);
+        }
+        // The readable conversation: last 16 turns, tool noise stripped, <= 800 chars each.
+        {
+            QList<Turn> conv;
+            for (int i = 0; i < 20; ++i) {
+                Turn t;
+                t.role = i % 2 ? "assistant" : "user";
+                t.text = QStringLiteral("turn %1 ").arg(i) + QString(i == 19 ? 1200 : 20, QLatin1Char('x'));
+                if (i == 17)
+                    t.text = "<tool_call>{\"name\": \"Bash\", \"arguments\": {}}</tool_call>\nRebuilt cleanly, **0 warnings**.";
+                conv << t;
+                if (i == 10) {
+                    Turn tool;  // tool-only step: nothing to read
+                    tool.role = "assistant";
+                    tool.tools = {"Bash: ls"};
+                    conv << tool;
+                }
+            }
+            const Extracted ce = extractArtifacts(conv, noFiles);
+            const QVariantList tt = ce.threadTurns;
+            bool noNoise = true;
+            for (const QVariant &v : tt)
+                noNoise = noNoise && !v.toMap().value("text").toString().contains("tool_call")
+                    && !v.toMap().value("text").toString().contains("\"arguments\"");
+            check(tt.size() == 16 && tt.first().toMap().value("text").toString().startsWith("turn 4 ")
+                      && tt.last().toMap().value("role").toString() == "assistant",
+                  "turns: the last 16 readable turns, oldest first", QString::number(tt.size()));
+            check(noNoise && tt.value(13).toMap().value("text").toString() == "Rebuilt cleanly, 0 warnings.",
+                  "turns: tool-call markup and bold markers stripped", tt.value(13).toMap().value("text").toString());
+            check(tt.last().toMap().value("text").toString().size() <= 801
+                      && tt.last().toMap().value("text").toString().endsWith(QChar(0x2026)),
+                  "turns: a long turn is cut at 800 chars", QString::number(tt.last().toMap().value("text").toString().size()));
         }
         bool allShort = true;
         QStringList names;
@@ -2939,6 +3106,62 @@ void formFactorTests()
             const QVariantMap pred = stage->property("predictedAction").toMap();
             check(pred.value("actionKind").toString() == "prompt" && !pred.value("promptSuggestion").toString().isEmpty(),
                   "summary ui: Tab predictor has a prompt for a summary");
+        }
+    }
+    // Ladder conversation: real turns, "You" in the accent, scrollable by scrollPixels / scrollBy.
+    {
+        QQmlEngine engine;
+        QQmlComponent comp(&engine);
+        comp.loadFromModule("Studio", "Ladder");
+        QVariantList turns;
+        for (int i = 0; i < 16; ++i)
+            turns << QVariantMap{{"role", i % 2 ? "assistant" : "user"},
+                                 {"text", QStringLiteral("Turn %1: the scheduler owns retries so the worker stays stateless, "
+                                                         "restarts fast and never double-applies a step.").arg(i)}};
+        const QVariantMap ladder{{"goal", "Fix fn key toggle latency"}, {"assumptions", QVariantList()},
+                                 {"arms", QVariantList()}, {"armsLabel", ""}, {"winner", ""}};
+        const QVariantMap project{{"key", "~tab:14e5ecb8"}, {"name", "Fix fn key toggle latency"}, {"ladder", ladder},
+                                  {"artifacts", QVariantList()}, {"turns", turns}};
+        std::unique_ptr<QObject> obj(comp.createWithInitialProperties({{"width", 1600}, {"height", 900}, {"project", project}}));
+        check(obj != nullptr, "ladder ui: Ladder loads", comp.errorString());
+        auto *lad = qobject_cast<QQuickItem *>(obj.get());
+        if (lad) {
+            for (int i = 0; i < 5; ++i)
+                QCoreApplication::processEvents();
+            QQuickItem *view = findItems(lad, "threadView").value(0);
+            const QList<QQuickItem *> roles = view ? findItems(view, "turnRole") : QList<QQuickItem *>();
+            const QList<QQuickItem *> texts = view ? findItems(view, "turnText") : QList<QQuickItem *>();
+            check(view && view->isVisible() && !roles.isEmpty() && roles.size() == texts.size(),
+                  "ladder ui: the conversation renders its turns", QString::number(texts.size()));
+            bool labels = !roles.isEmpty();
+            for (QQuickItem *r : roles) {
+                const QString t = r->property("text").toString();
+                const QString c = r->property("color").value<QColor>().name();
+                labels = labels && ((t == "You" && c == "#e09f3e") || (t == "Assistant" && c != "#e09f3e"));
+            }
+            check(labels, "ladder ui: 'You' labels in gold, 'Assistant' otherwise");
+            bool wrapped = !texts.isEmpty();
+            for (QQuickItem *t : texts)
+                wrapped = wrapped && t->property("wrapMode").toInt() == 4 /* Text.Wrap */
+                    && t->property("text").toString().startsWith("Turn ");
+            check(wrapped, "ladder ui: turn text is wrapped plain text");
+            if (view) {
+                const double origin = view->property("originY").toDouble();
+                const double y0 = view->property("contentY").toDouble();
+                QMetaObject::invokeMethod(lad, "scrollPixels", Q_ARG(QVariant, QVariant(-120.0)));
+                const double y1 = view->property("contentY").toDouble();
+                QMetaObject::invokeMethod(lad, "scrollBy", Q_ARG(QVariant, QVariant(1)));
+                const double y2 = view->property("contentY").toDouble();
+                QMetaObject::invokeMethod(lad, "scrollPixels", Q_ARG(QVariant, QVariant(-1e6)));
+                const double y3 = view->property("contentY").toDouble();
+                check(y0 > origin + 100 && qAbs(y1 - (y0 - 120)) < 0.5 && qAbs(y2 - y0) < 0.5 && qAbs(y3 - origin) < 0.5,
+                      "ladder ui: opens at the newest turn; scrollPixels / scrollBy scroll the conversation",
+                      QStringLiteral("origin %1: %2 -> %3 -> %4 -> %5").arg(origin).arg(y0).arg(y1).arg(y2).arg(y3));
+            }
+            QQuickItem *convo = findItems(lad, "conversation").value(0);
+            const QList<QQuickItem *> rungs = findItems(lad, "rung");
+            check(convo && !rungs.isEmpty() && convo->y() >= rungs.last()->mapToItem(lad, QPointF(0, rungs.last()->height())).y() - 0.5,
+                  "ladder ui: the conversation sits below the four rungs");
         }
     }
 }

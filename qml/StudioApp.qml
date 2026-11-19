@@ -182,6 +182,8 @@ FocusScope {
         return null;
     }
     readonly property var artifacts: project ? project.artifacts : []
+    // The session's readable conversation ([{role, text}], oldest first), shown on the Ladder.
+    readonly property var turns: project && project.turns ? project.turns : []
     readonly property var artifact: artifacts.length > 0 ? artifacts[Math.min(artifactIndex, artifacts.length - 1)] : null
 
     // Shared-element zoom. The island of the current project (ix, iy, iw, ih) grows into the
@@ -469,14 +471,14 @@ FocusScope {
             e.accepted = true;
         } else if (nav !== 0) {
             // A nav letter with nothing to do on this lens (h/l on the Ladder) never starts a question.
-            if (k === Qt.Key_Down) { if (proseOpen) prose.scrollBy(1); else if (lens === 2) stage.scrollBy(1); }
-            else if (k === Qt.Key_Up) { if (proseOpen) prose.scrollBy(-1); else if (lens === 2) stage.scrollBy(-1); }
+            if (k === Qt.Key_Down) lensScrollBy(1);
+            else if (k === Qt.Key_Up) lensScrollBy(-1);
             e.accepted = true;
         } else if (k === Qt.Key_Down || k === Qt.Key_PageDown) {
-            if (proseOpen) prose.scrollBy(1); else if (lens === 2) stage.scrollBy(1);
+            lensScrollBy(1);
             e.accepted = true;
         } else if (k === Qt.Key_Up || k === Qt.Key_PageUp) {
-            if (proseOpen) prose.scrollBy(-1); else if (lens === 2) stage.scrollBy(-1);
+            lensScrollBy(-1);
             e.accepted = true;
         } else if (e.text.length === 1 && e.text > " " && !(e.modifiers & Qt.AltModifier)) {
             composer.focusInput(e.text);
@@ -545,11 +547,21 @@ FocusScope {
             else selectedIsland = Math.max(0, selectedIsland - constellation.columns);
         } else if (dx !== 0) {
             if (lens === 2) stepArtifact(dx);
-        } else if (proseOpen) {
-            prose.scrollBy(dy);
-        } else if (lens === 2) {
-            stage.scrollBy(dy);
+        } else {
+            lensScrollBy(dy);
         }
+    }
+    // Scroll whatever reads on this lens: the prose panel when open, else the Stage, else the
+    // Ladder's conversation.
+    function lensScrollBy(d) {
+        if (proseOpen && lens > 0) prose.scrollBy(d);
+        else if (lens === 2) stage.scrollBy(d);
+        else if (lens === 1) ladder.scrollBy(d);
+    }
+    function lensScrollPixels(px) {
+        if (proseOpen && lens > 0) prose.scrollPixels(px);
+        else if (lens === 2) stage.scrollPixels(px);
+        else if (lens === 1) ladder.scrollPixels(px);
     }
     function padConfirm() {
         poke();
@@ -641,8 +653,7 @@ FocusScope {
     function padScroll(dy) {
         if (onboarding.open || dialog.open || settings.open)
             return;
-        if (proseOpen && lens > 0) prose.scrollPixels(dy);
-        else if (lens === 2) stage.scrollPixels(dy);
+        lensScrollPixels(dy);
     }
     function padVoiceHold(active) {
         poke();
@@ -685,6 +696,7 @@ FocusScope {
                 return;
             if (app.proseOpen && app.lens > 0) prose.scrollPixels(dy);
             else if (app.lens === 2) stage.panPixels(dx, dy);
+            else if (app.lens === 1) ladder.scrollPixels(dy);
         }
         function onHorizontalInspect(dir) {
             app.poke();
