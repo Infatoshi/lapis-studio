@@ -64,11 +64,14 @@ add_library(lapis_mac STATIC
   src/gamepad.hpp src/gamepad.cpp src/gamepad_mac.mm
   src/metalbench.hpp src/metalbench.mm
   src/mac/window_state.hpp src/mac/window_state.mm
+  src/mac/cua.hpp src/mac/cua.mm
+  src/mac/cua_reticle.hpp src/mac/cua_reticle.mm
 )
 target_include_directories(lapis_mac PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(lapis_mac PUBLIC lapis_core Qt6::Core Qt6::Gui Qt6::Quick
   "-framework ApplicationServices" "-framework PDFKit" "-framework AppKit" "-framework CoreGraphics" "-framework Metal" "-framework GameController")
 lapis_warnings(lapis_mac)
+target_link_libraries(lapis_mac PRIVATE "-framework ScreenCaptureKit")
 
 # --- App -----------------------------------------------------------------------------------
 
@@ -141,3 +144,8 @@ qt_add_executable(test_targets tests/test_targets.cpp)
 set_target_properties(test_targets PROPERTIES MACOSX_BUNDLE OFF)
 target_link_libraries(test_targets PRIVATE lapis_targets lapis_core Qt6::Core Qt6::Gui)
 lapis_warnings(test_targets)
+
+qt_add_executable(test_cua tests/test_cua.cpp)
+set_target_properties(test_cua PROPERTIES MACOSX_BUNDLE OFF)
+target_link_libraries(test_cua PRIVATE lapis_mac Qt6::Core)
+lapis_warnings(test_cua)
