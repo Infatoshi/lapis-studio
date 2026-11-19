@@ -76,6 +76,9 @@ int snapOmnibar(const QString &outPath);
 // --snap-review OUT.png: the session review card over the mock Constellation; also writes
 // OUT-constellation.png (a dragged card, the Needs Me pill) and OUT-stage.png (visual-first slide).
 int snapReview(const QString &outPath);
+// Offscreen dark frames: the Music (slowmix) overlay over the Constellation, plus OUT-bar.png
+// (the top bar's ♪ pill while a track plays). Mock backend, dry run: no audio.
+int snapSlowmix(const QString &outPath);
 int benchFps();
 // --bench-fps --metal: QQuickRenderControl into an offscreen Metal texture at dpr 2, 240 Hz
 // budget. shotDir non-empty: also save one GPU frame (read back from the texture) there.

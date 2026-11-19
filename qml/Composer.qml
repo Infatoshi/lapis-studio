@@ -334,7 +334,7 @@ Item {
             }
         }
 
-        // Inline Model & Effort strip (Cmd+M, or Up / k (vim) / w (wasd) in an empty composer).
+        // Inline Model & Effort strip (Cmd+Shift+M, or Up / k (vim) / w (wasd) in an empty composer).
         // Up/Down (w/s, k/j) cycle the model across all three providers; Left/Right (a/d, h/l)
         // cycle the efforts that model accepts; Enter sends with them; Esc closes the strip only.
         Rectangle {
@@ -531,7 +531,8 @@ Item {
                 Keys.onPressed: (e) => {
                     const ctrl = (e.modifiers & Qt.ControlModifier) !== 0;
                     const plain = (e.modifiers & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier | Qt.ShiftModifier)) === 0;
-                    if (ctrl && e.key === Qt.Key_M) {
+                    // Cmd+Shift+M: the model strip. Plain Cmd+M passes up to the app (music).
+                    if (ctrl && e.key === Qt.Key_M && (e.modifiers & Qt.ShiftModifier) !== 0) {
                         root.pickerOpen = !root.pickerOpen;
                         e.accepted = true;
                         return;
@@ -588,7 +589,7 @@ Item {
                     }
                 }
             }
-            // The model the next Enter goes to; click (or Cmd+M) opens the strip.
+            // The model the next Enter goes to; click (or Cmd+Shift+M) opens the strip.
             Rectangle {
                 id: modelChip
                 objectName: "modelChip"

@@ -194,7 +194,7 @@ int textOverlaps(QQuickWindow *win, QStringList *pairs)
     QList<TextBox> boxes;
     // An open modal covers everything beneath it; audit only the modal then.
     QQuickItem *root = win->contentItem();
-    for (const char *modal : {"newSessionDialog", "settingsOverlay", "onboardingModal"})
+    for (const char *modal : {"newSessionDialog", "settingsOverlay", "onboardingModal", "slowmixOverlay"})
         for (QQuickItem *d : findItems(win->contentItem(), QString::fromLatin1(modal)))
             if (d->isVisible() && d->opacity() > 0.5)
                 root = d;
@@ -316,11 +316,11 @@ QList<DemoEvent> demoScript(Backend *backend)
     letter(25.6 + s, Qt::Key_J, "j");
     letter(26.1 + s, Qt::Key_J, "j");
     key(27.3 + s, Qt::Key_Escape);
-    // 32.3-36.4 s: type a question, Cmd+M opens the inline Model & Effort strip with speed tags:
+    // 32.3-36.4 s: type a question, Cmd+Shift+M opens the inline Model & Effort strip with speed tags:
     // s s (Sonnet · Fast -> Opus · Frontier -> Fable · Frontier), d d (low -> medium -> high),
     // w (back to Opus); Enter sends with Opus · high.
     type(27.8 + s, QStringLiteral("best arm?"), 0.04);
-    key(28.5 + s, Qt::Key_M, Qt::ControlModifier);
+    key(28.5 + s, Qt::Key_M, Qt::ControlModifier | Qt::ShiftModifier);
     letter(29.1 + s, Qt::Key_S, "s");
     letter(29.6 + s, Qt::Key_S, "s");
     letter(30.1 + s, Qt::Key_D, "d");

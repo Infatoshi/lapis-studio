@@ -29,13 +29,13 @@ FocusScope {
             ["L1 R1", "slide"], ["L2 R2", "zoom"], ["☰", "settings"], ["pad", "new session"]]
         : mode === "vim" ? [
             ["h j k l", "move"], ["g  G", "first / last"], ["⏎", "zoom in"], ["esc", "back"],
-            ["space", "write-up"], ["⇥ tab", "accept prediction"], ["⌘M", "model & effort"], ["⌘N", "new session"]]
+            ["space", "write-up"], ["⇥ tab", "accept prediction"], ["⇧⌘M", "model & effort"], ["⌘N", "new session"]]
         : mode === "wasd" ? [
             ["w a s d", "move"], ["e  ⏎", "interact"], ["q  esc", "back"], ["space", "write-up"],
-            ["⇥ tab", "accept prediction"], ["⌘M", "model & effort"], ["⌘N", "new session"], ["⌘,", "settings"]]
+            ["⇥ tab", "accept prediction"], ["⇧⌘M", "model & effort"], ["⌘N", "new session"], ["⌘,", "settings"]]
         : [
             ["click", "open"], ["wheel", "zoom islands"], ["⌘ wheel", "zoom anywhere"], ["esc", "back"],
-            ["⇥ tab", "accept prediction"], ["⌘M", "model & effort"], ["⌘N", "new session"], ["⌘,", "settings"]]
+            ["⇥ tab", "accept prediction"], ["⇧⌘M", "model & effort"], ["⌘N", "new session"], ["⌘,", "settings"]]
 
     readonly property QtObject gamepad: backend ? backend.gamepad : null
     readonly property bool padConnected: gamepad ? gamepad.connected : false

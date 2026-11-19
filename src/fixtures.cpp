@@ -1,6 +1,7 @@
 #include "fixtures.hpp"
 
 #include <QCoreApplication>
+#include <QDateTime>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
@@ -188,6 +189,68 @@ void ensureFixtureFiles()
         writeWav(wavPath());
     if (!QFileInfo::exists(svgPath()))
         writeSvg(svgPath());
+}
+
+QString ensureSlowmixFixture()
+{
+    const QString dir = fixtureDir() + QStringLiteral("/slowmix");
+    QDir().mkpath(dir + QStringLiteral("/gen/takes"));
+    // Names only: the mock backend never decodes or plays them.
+    const QStringList files{"night_drive.wav", "afterglow_extended.wav", "tidal_lock.wav", "glass_harbor.wav",
+                            "low_orbit.wav", "old_signal.wav", "unplayed.wav", "night_drive_runnerup.wav",
+                            "night_drive_nightcore_hall.wav", "gen/takes/night_drive_take3.wav"};
+    for (const QString &f : files) {
+        QFile out(dir + QLatin1Char('/') + f);
+        if (!out.exists() && out.open(QIODevice::WriteOnly))
+            out.close();
+    }
+    // Rewritten every time so "last 30 days" stays relative to now.
+    const qint64 now = QDateTime::currentSecsSinceEpoch();
+    const struct { qint64 ago; int secs; const char *speed, *reverb, *track; } rows[] = {
+        {3600, 600, "slowed", "hall", "night_drive.wav"},
+        {7200, 600, "slowed", "hall", "night_drive.wav"},
+        {86400, 600, "slowed", "hall", "night_drive.wav"},
+        {2 * 86400, 600, "slowed", "heavy", "night_drive.wav"},
+        {2 * 86400 + 900, 600, "slowed", "hall", "night_drive.wav"},
+        {3 * 86400, 600, "slowed", "hall", "night_drive.wav"},
+        {5 * 86400, 600, "slowed", "hall", "night_drive.wav"},
+        {9 * 86400, 600, "slowed", "hall", "night_drive.wav"},
+        {9 * 86400 + 900, 600, "slowed", "hall", "night_drive.wav"},
+        {10 * 86400, 600, "slowed", "hall", "night_drive.wav"},
+        {11 * 86400, 600, "slowed", "hall", "night_drive.wav"},
+        {12 * 86400, 600, "slowed", "hall", "night_drive.wav"},
+        {13 * 86400, 600, "slowed", "hall", "night_drive.wav"},
+        {14 * 86400, 600, "slowed", "hall", "night_drive.wav"},
+        {4 * 3600, 600, "nightcore", "hall", "afterglow_extended.wav"},
+        {4 * 86400, 600, "nightcore", "hall", "afterglow_extended.wav"},
+        {6 * 86400, 600, "nightcore", "hall", "afterglow_extended.wav"},
+        {6 * 86400 + 900, 600, "nightcore", "hall", "afterglow_extended.wav"},
+        {8 * 86400, 600, "normal", "hall", "afterglow_extended.wav"},
+        {15 * 86400, 600, "nightcore", "hall", "afterglow_extended.wav"},
+        {16 * 86400, 600, "nightcore", "hall", "afterglow_extended.wav"},
+        {17 * 86400, 600, "nightcore", "hall", "afterglow_extended.wav"},
+        {18 * 86400, 600, "nightcore", "hall", "afterglow_extended.wav"},
+        {2 * 86400, 600, "1.10x", "heavy", "tidal_lock.wav"},
+        {7 * 86400, 600, "1.10x", "heavy", "tidal_lock.wav"},
+        {20 * 86400, 600, "1.10x", "heavy", "tidal_lock.wav"},
+        {21 * 86400, 600, "1.10x", "heavy", "tidal_lock.wav"},
+        {22 * 86400, 600, "normal", "hall", "tidal_lock.wav"},
+        {3 * 86400, 600, "normal", "off", "glass_harbor.wav"},
+        {25 * 86400, 480, "normal", "off", "glass_harbor.wav"},
+        {26 * 86400, 420, "fast", "hall", "low_orbit.wav"},
+        {60 * 86400, 600, "slowed", "hall", "old_signal.wav"},
+        {61 * 86400, 600, "slowed", "hall", "old_signal.wav"},
+    };
+    QFile plays(dir + QStringLiteral("/.plays.tsv"));
+    if (plays.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        plays.write("end_unix\tseconds\tspeed\treverb\ttrack\n");
+        for (const auto &r : rows)
+            plays.write(QStringLiteral("%1\t%2\t%3\t%4\t%5\n")
+                            .arg(now - r.ago).arg(r.secs).arg(QLatin1String(r.speed), QLatin1String(r.reverb),
+                                                              QLatin1String(r.track)).toUtf8());
+        plays.close();
+    }
+    return dir;
 }
 
 QStringList fixtureFolders()

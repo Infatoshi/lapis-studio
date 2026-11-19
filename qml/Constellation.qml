@@ -21,6 +21,9 @@ Item {
     signal filterPicked(string filter)
     signal resetLayout()
     signal reviewRequested()
+    signal musicRequested()
+    property string musicLabel: "♪"     // "♪ night drive" while a track plays
+    property bool musicPlaying: false
 
     // Which projects have a slot on screen, in order (project indices). The filter never
     // reorders: islands keep their relative order, so muscle memory survives toggling it.
@@ -344,6 +347,12 @@ Item {
                 objectName: "reviewPill"
                 label: "Review"
                 onTapped: root.reviewRequested()
+            }
+            BarPill {
+                objectName: "musicPill"
+                label: root.musicLabel
+                on: root.musicPlaying
+                onTapped: root.musicRequested()
             }
         }
     }

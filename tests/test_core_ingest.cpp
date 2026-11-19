@@ -2,9 +2,11 @@
 #include "core/ring_buffer.hpp"
 #include "core/types.hpp"
 #include "ingest/phonon.hpp"
+#include "ingest/slowmix.hpp"
 
 #include <QCoreApplication>
 #include <QDateTime>
+#include <QDir>
 #include <QFile>
 #include <QTemporaryDir>
 
@@ -197,6 +199,128 @@ void phononTests()
     check(sg.tail == "0:01 You: new" && sg.status == "complete", "phonon: atomic file rename -> new content");
 }
 
+void slowmixTests()
+{
+    QTemporaryDir td;
+    const QString clips = td.path() + "/clips";
+    QDir().mkpath(clips + "/gen/takes");
+    QDir().mkpath(clips + "/sub");
+    QDir().mkpath(clips + "/.hidden");
+    for (const char *f : {"song_a.wav", "song_b.flac", "gen/takes/song_a_take2.wav", "song_a_runnerup.wav",
+                          "song_a_nightcore_hall.wav", "song_c_0.90x_hall.wav", "never.wav", "stale.wav",
+                          "sub/deep_cut.mp3", "notes.txt", ".hidden/x.wav", "my-sfx_hit.wav"})
+        writeFile(clips + "/" + f, "");
+    // Real "now": the controller below curates against the wall clock.
+    const qint64 now = QDateTime::currentSecsSinceEpoch();
+    const qint64 day = 86400;
+    auto row = [&](qint64 ago, int secs, const char *speed, const char *reverb, const QString &track) {
+        return QString("%1\t%2\t%3\t%4\t%5\n").arg(now - ago).arg(secs).arg(speed, reverb, track).toUtf8();
+    };
+    QByteArray plays = "end_unix\tseconds\tspeed\treverb\ttrack\n";
+    plays += row(1 * day, 600, "slowed", "hall", "song_a.wav");
+    plays += row(2 * day, 300, "slowed", "heavy", "song_a.wav");
+    plays += row(3 * day, 120, "normal", "hall", "song_a.wav");
+    plays += row(1 * day, 600, "1.10x", "heavy", "song_b.flac");
+    plays += row(5 * day, 600, "1.10x", "heavy", "song_b.flac");
+    plays += row(6 * day, 300, "nightcore", "off", "song_b.flac");
+    // Old habits never outvote the last 30 days.
+    plays += row(40 * day, 3000, "normal", "hall", "song_b.flac");
+    plays += row(2 * day, 180, "fast", "off", "sub/deep_cut.mp3");
+    plays += row(45 * day, 900, "slowed", "hall", "stale.wav");
+    plays += row(1 * day, 900, "slowed", "hall", "gen/takes/song_a_take2.wav");
+    plays += row(1 * day, 900, "slowed", "hall", "song_a_runnerup.wav");
+    plays += row(1 * day, 900, "slowed", "hall", "song_a_nightcore_hall.wav");
+    plays += row(1 * day, 900, "slowed", "hall", "song_c_0.90x_hall.wav");
+    plays += "garbage line\n\n1799999999\tnotanumber\tslowed\thall\tsong_a.wav\n";
+    const QString playsPath = clips + "/.plays.tsv";
+    writeFile(playsPath, plays);
+
+    check(slowmixSpeedFromTag("slowed") == 0.85 && slowmixSpeedFromTag("normal") == 1.0
+              && slowmixSpeedFromTag("nightcore") == 1.25 && slowmixSpeedFromTag("fast") == 1.6
+              && qFuzzyCompare(slowmixSpeedFromTag("1.10x"), 1.10) && slowmixSpeedFromTag("weird") == 0,
+          "slowmix: speed tags map to multipliers");
+
+    const auto stats = parseSlowmixPlays(playsPath, now, 30);
+    const SlowmixPlayStats a = stats.value("song_a.wav");
+    check(a.totalSeconds == 1020 && a.recentSeconds == 1020 && a.lastPlayed == now - day,
+          "slowmix: per-track total / recent seconds and last played",
+          QString("%1 %2 %3").arg(a.totalSeconds).arg(a.recentSeconds).arg(a.lastPlayed));
+    check(a.favoriteSpeed == 0.85 && a.favoriteReverb == "hall", "slowmix: favorite preset weighted by seconds",
+          QString("%1 %2").arg(a.favoriteSpeed).arg(a.favoriteReverb));
+    const SlowmixPlayStats b = stats.value("song_b.flac");
+    check(b.totalSeconds == 4500 && b.recentSeconds == 1500 && qFuzzyCompare(b.favoriteSpeed, 1.10)
+              && b.favoriteReverb == "heavy",
+          "slowmix: favorites come from the last 30 days, not 40-day-old habits",
+          QString("%1 %2 %3 %4").arg(b.totalSeconds).arg(b.recentSeconds).arg(b.favoriteSpeed).arg(b.favoriteReverb));
+    const SlowmixPlayStats st = stats.value("stale.wav");
+    check(st.totalSeconds == 900 && st.recentSeconds == 0 && st.favoriteSpeed == 0.85,
+          "slowmix: stale track keeps all-time favorites, zero recent seconds");
+    check(parseSlowmixPlays(td.path() + "/missing.tsv", now).isEmpty(), "slowmix: missing log -> no stats");
+
+    for (const char *junk : {"gen/takes/x.wav", "takes/x.wav", "experiments/a/x.wav", "decompiled/x.wav",
+                             "graft/x.wav", "ddsp/x.wav", "x_runnerup.wav", "x_raw_mix.wav", "boom_sfx.wav",
+                             "x_take3.wav", "x_slowed_hall.wav", "x_normal_off.wav", "x_0.90x_hall.wav",
+                             "x_1.10x_heavy.wav", "x_nightcore.wav", "X_NIGHTCORE_HALL.WAV", ".hidden/x.wav"})
+        check(isSlowmixJunk(junk), "slowmix: junk filtered", junk);
+    for (const char *song : {"song.wav", "sub/song.mp3", "general_song.wav", "takeoff.wav", "nightcore_dream.wav"})
+        check(!isSlowmixJunk(song), "slowmix: real song kept", song);
+
+    const QList<SlowmixTrack> cur = curateSlowmixTracks(clips, playsPath, false, now);
+    QStringList names;
+    for (const SlowmixTrack &t : cur)
+        names << t.relPath;
+    check(names == QStringList({"song_b.flac", "song_a.wav", "sub/deep_cut.mp3"}),
+          "slowmix: curated = recent songs only, by 30-day minutes (no junk, never-played or stale)",
+          names.join(", "));
+    if (cur.size() == 3) {
+        check(cur[0].recentMinutes == 25 && qFuzzyCompare(cur[0].favoriteSpeed, 1.10) && cur[0].favoriteReverb == "heavy"
+                  && cur[0].name == "song b" && cur[0].fileName == "song_b.flac" && cur[0].path == clips + "/song_b.flac",
+              "slowmix: top track carries minutes, name, path and favorite preset",
+              QString("%1 %2 %3 %4").arg(cur[0].recentMinutes).arg(cur[0].favoriteSpeed).arg(cur[0].favoriteReverb, cur[0].name));
+        check(cur[1].recentMinutes == 17 && cur[1].favoriteSpeed == 0.85 && cur[1].favoriteReverb == "hall",
+              "slowmix: second track favorite 0.85x hall");
+        check(cur[2].name == "deep cut" && cur[2].favoriteSpeed == 1.6 && cur[2].favoriteReverb == "off",
+              "slowmix: nested track favorite 1.6x off", cur[2].name);
+    }
+
+    const QList<SlowmixTrack> all = curateSlowmixTracks(clips, playsPath, true, now);
+    QStringList allNames;
+    for (const SlowmixTrack &t : all)
+        allNames << t.relPath;
+    check(allNames == QStringList({"song_b.flac", "song_a.wav", "sub/deep_cut.mp3", "stale.wav", "never.wav"}),
+          "slowmix: archive adds stale then never-played, junk still out", allNames.join(", "));
+    check(curateSlowmixTracks(td.path() + "/nope", playsPath).isEmpty(), "slowmix: missing clips dir -> empty");
+
+    // Dry-run controller: never spawns, still tracks state for the UI.
+    SlowmixController c;
+    c.setLibrary(clips, playsPath);
+    c.refresh();
+    check(c.tracks().size() >= 3 && !c.spawnAllowed() && c.available(), "slowmix: dry-run controller lists tracks");
+    c.togglePlay();  // nothing selected: plays the top of the rotation, at its favorite preset
+    check(c.playing() && c.currentPath() == clips + "/song_b.flac" && c.currentTrack() == "song b"
+              && qFuzzyCompare(c.speed(), 1.10) && c.reverb() == "heavy",
+          "slowmix: toggle with nothing loaded plays the top track at its favorite preset",
+          c.currentPath() + " " + QString::number(c.speed()) + " " + c.reverb());
+    c.selectTrack(clips + "/song_a.wav");
+    check(c.currentTrack() == "song a" && c.speed() == 0.85 && c.reverb() == "hall" && c.playing(),
+          "slowmix: selectTrack applies that track's favorite speed / reverb");
+    c.togglePlay();
+    c.setSpeed(9.0);
+    c.setReverb("cathedral");
+    c.setReverb("OFF");
+    c.setBass(4);
+    c.setLooping(false);
+    check(!c.playing() && c.speed() == 2.0 && c.reverb() == "off" && c.bass() == 4 && !c.looping(),
+          "slowmix: pause, clamp speed, reject unknown reverb, bass, loop");
+    c.setShowArchive(true);
+    check(c.tracks().size() == 5, "slowmix: showArchive lists the archive", QString::number(c.tracks().size()));
+    check(c.spawnCount() == 0 && !c.running(), "slowmix: dry run never spawns a process");
+    SlowmixController live;
+    live.setBinary(td.path() + "/no-such-slowmix");
+    live.setSpawnAllowed(true);
+    check(!live.available(), "slowmix: spawn allowed but binary missing -> unavailable");
+}
+
 }  // namespace
 
 int main(int argc, char **argv)
@@ -204,6 +328,7 @@ int main(int argc, char **argv)
     QCoreApplication app(argc, argv);
     coreTests();
     phononTests();
+    slowmixTests();
     std::printf("test_core_ingest: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

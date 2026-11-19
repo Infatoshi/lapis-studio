@@ -10,7 +10,8 @@
 //   lapis_studio --snap-omnibar OUT.png  offscreen dark frame: Stage + hovered cell + floating ask card
 //   lapis_studio --snap-review OUT.png   offscreen dark frames: session review card, plus
 //                                        OUT-constellation.png (dragged card, Needs Me) and OUT-stage.png
-//   lapis_studio --harness codex     quick asks (Enter) go to a warm codex app-server instead of claude
+//   lapis_studio --snap-slowmix OUT.png  offscreen dark frames: Music overlay, plus OUT-bar.png (♪ pill)
+//   lapis_studio --harness codex    quick asks (Enter) go to a warm codex app-server instead of claude
 //
 // A PS4 DualShock 4 (GameController.framework) drives every lens in the interactive window only;
 // no offscreen mode ever touches GameController (src/gamepad.hpp).
@@ -42,6 +43,7 @@ int main(int argc, char **argv)
     QString demoOut;
     QString snapOut;
     QString reviewOut;
+    QString slowmixOut;
     QString quickHarness = QStringLiteral("claude");
     QString chatModel;
     QString chatEffort = QStringLiteral("low");
@@ -91,15 +93,21 @@ int main(int argc, char **argv)
                 return 64;
             }
             reviewOut = QString::fromLocal8Bit(argv[++i]);
+        } else if (std::strcmp(argv[i], "--snap-slowmix") == 0) {
+            if (i + 1 >= argc) {
+                std::fprintf(stderr, "--snap-slowmix needs an output .png path\n");
+                return 64;
+            }
+            slowmixOut = QString::fromLocal8Bit(argv[++i]);
         } else if (std::strcmp(argv[i], "--harness") == 0 && i + 1 < argc) {
             quickHarness = QString::fromLocal8Bit(argv[++i]);
         } else if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
-            std::printf("usage: lapis_studio [--harness claude|codex] [--test | --smoke-offscreen [DIR] | --probe-live | --probe-chat MODEL [EFFORT] | --bench-fps [--metal [DIR]] | --record-demo OUT.mp4 | --snap-omnibar OUT.png | --snap-review OUT.png]\n");
+            std::printf("usage: lapis_studio [--harness claude|codex] [--test | --smoke-offscreen [DIR] | --probe-live | --probe-chat MODEL [EFFORT] | --bench-fps [--metal [DIR]] | --record-demo OUT.mp4 | --snap-omnibar OUT.png | --snap-review OUT.png | --snap-slowmix OUT.png]\n");
             return 0;
         }
     }
     const bool offscreen = test || smoke || probe || bench || !demoOut.isEmpty() || !chatModel.isEmpty()
-                           || !snapOut.isEmpty() || !reviewOut.isEmpty();
+                           || !snapOut.isEmpty() || !reviewOut.isEmpty() || !slowmixOut.isEmpty();
     const bool metalBench = bench && metal;
     if (offscreen) {
         // Never open a visible window while building or testing on the host Mac.
@@ -148,6 +156,8 @@ int main(int argc, char **argv)
         return studio::snapOmnibar(snapOut);
     if (!reviewOut.isEmpty())
         return studio::snapReview(reviewOut);
+    if (!slowmixOut.isEmpty())
+        return studio::snapSlowmix(slowmixOut);
 
     studio::Backend backend(studio::Backend::Mode::Live);
     backend.setQuickHarness(quickHarness);  // before the helpers warm up 0.4 s from now
@@ -156,6 +166,8 @@ int main(int argc, char **argv)
     backend.setReviewsPath(studio::Backend::defaultReviewsPath());  // saved taste rules feed the filter
     // The only place GameController.framework is ever touched: offscreen modes return above.
     backend.gamepad()->setEnabled(true);
+    // Likewise the only place `slowmix --stdio` may ever be spawned (lazily, on first play).
+    backend.slowmixController()->setSpawnAllowed(true);
     QQmlApplicationEngine engine;
     QQuickWindow *win = studio::createStudioWindow(engine, &backend, false, QSize(1680, 1050));
     if (!win)

@@ -1085,6 +1085,8 @@ Backend::Backend(Mode mode, QObject *parent, bool warmHelpers)
     connect(&m_prefsSave, &QTimer::timeout, this, [this] { savePrefs(); });
     if (m_mode == Mode::Mock) {
         ensureFixtureFiles();
+        const QString clips = ensureSlowmixFixture();
+        m_slowmix.setLibrary(clips, clips + QStringLiteral("/.plays.tsv"));
         loadFixtures();
         m_folders = fixtureFolders();
         m_defaultFolder = m_folders.value(0);
@@ -1096,6 +1098,9 @@ Backend::Backend(Mode mode, QObject *parent, bool warmHelpers)
         return;
     }
     loadFolders();
+    // Read-only until the overlay asks (refresh); spawning stays off unless main() allows it.
+    m_slowmix.setLibrary(SlowmixController::defaultClipsDir(),
+                         SlowmixController::defaultClipsDir() + QStringLiteral("/.plays.tsv"));
     // The quick answer line shows live seconds while a model thinks, so a heavy model never
     // looks hung. Its own signal: a tick re-runs only the bindings that show the clock.
     m_quickTicker.setInterval(100);

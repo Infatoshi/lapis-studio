@@ -31,6 +31,7 @@ lapis_warnings(lapis_core)
 # Transcript parsing and Phonon live-transcript ingest.
 add_library(lapis_ingest STATIC
   src/ingest/phonon.hpp src/ingest/phonon.cpp
+  src/ingest/slowmix.hpp src/ingest/slowmix.cpp
   src/transcript.hpp src/transcript.cpp
 )
 target_link_libraries(lapis_ingest PUBLIC lapis_core Qt6::Core)
@@ -107,6 +108,7 @@ qt_add_qml_module(lapis_studio
     qml/OnboardingModal.qml
     qml/MorningBriefingOverlay.qml
     qml/SessionReviewOverlay.qml
+    qml/SlowmixOverlay.qml
     qml/FloatingOmnibar.qml
 )
 

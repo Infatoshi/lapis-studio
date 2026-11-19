@@ -5,6 +5,7 @@
 #include "transcript.hpp"
 #include "core/types.hpp"
 #include "ingest/phonon.hpp"
+#include "ingest/slowmix.hpp"
 #include "llm/prefix.hpp"
 #include "llm/router.hpp"
 #include "llm/sse.hpp"
@@ -239,6 +240,9 @@ class Backend : public QObject {
     Q_PROPERTY(QString openaiCompatModel READ openaiCompatModel WRITE setOpenaiCompatModel NOTIFY prefsChanged)
     // PS4 DualShock 4 / extended gamepad. Always present; only main()'s live window enables it.
     Q_PROPERTY(QObject *gamepad READ gamepadObject CONSTANT)
+    // slowmix music player (SlowmixController). Spawns `slowmix --stdio` only after main()'s live
+    // window calls setSpawnAllowed(true); Mock and every offscreen mode are dry runs.
+    Q_PROPERTY(QObject *slowmix READ slowmix CONSTANT)
     // Hovered / pinned semantic targets (TargetRegistry); viewers push, FloatingOmnibar reads.
     Q_PROPERTY(QObject *targets READ targets CONSTANT)
     // Morning Briefing: changed / active projects in two lines each (see localBriefing()).
@@ -398,6 +402,8 @@ public:
     Q_INVOKABLE void clearStreamHistory(const QString &streamId);
     // Hover history, pins and the active semantic target (created on first use).
     TargetRegistry *targets();
+    QObject *slowmix() { return &m_slowmix; }
+    SlowmixController *slowmixController() { return &m_slowmix; }
     QVector<ChatTurn> streamHistory(const QString &streamId) const { return m_streamHistory.value(streamId); }
     // Live mode owns a router (created lazily); tests may inject one (not owned) in any mode.
     LlmRouter *llmRouter();
@@ -670,6 +676,7 @@ private:
     QStringList m_projectOrder;  // locks card slots so background updates never shuffle muscle memory
     Gamepad m_gamepad;
     std::unique_ptr<TargetRegistry> m_targets;  // lazy: targets()
+    SlowmixController m_slowmix;  // its destructor sends `quit`, so no audio outlives the app
     void startConversation(const QString &streamId, const QString &projectKey, const QString &slice,
                            const QString &question);
 

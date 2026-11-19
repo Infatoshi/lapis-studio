@@ -39,6 +39,17 @@ FocusScope {
         }
     }
 
+    // Music (slowmix): "♪ night drive" while a track plays, a bare "♪" otherwise.
+    readonly property QtObject player: backend ? backend.slowmix : null
+    readonly property bool musicPlaying: player ? player.playing : false
+    readonly property string musicLabel: musicPlaying && player.currentTrack.length > 0 ? "♪ " + player.currentTrack : "♪"
+    function toggleMusic() {
+        if (music.open)
+            music.hide();
+        else if (!settings.open && !briefing.open && !review.open && !controllerMap.open && !dialog.open && !onboarding.open)
+            music.show();
+    }
+
     // UI zoom (0.75..1.60) and input mode ("vim" | "wasd" | "mouse"), persisted by the backend.
     // There is no arrows mode; arrow keys are a silent fallback in every mode.
     readonly property real uiScale: backend ? backend.uiScale : 1.0
@@ -99,7 +110,7 @@ FocusScope {
 
     // The view in charge supplies the prediction: the composer while it has focus, else the lens.
     readonly property var predictedAction: {
-        if (settings.open || onboarding.open || dialog.open || briefing.open || omnibar.open || review.open)
+        if (settings.open || onboarding.open || dialog.open || briefing.open || omnibar.open || review.open || music.open)
             return null;
         if (answers.inputFocused)
             return answers.predictedAction;
@@ -388,8 +399,18 @@ FocusScope {
             e.accepted = true;
             return;
         }
-        if (settings.open || briefing.open || review.open)
+        // Cmd+M: the music card (slowmix). Esc closes it; the music keeps playing.
+        if (ctrl && e.key === Qt.Key_M && (e.modifiers & Qt.ShiftModifier) === 0) {
+            if (music.open)
+                music.hide();
+            else if (!settings.open && !briefing.open && !review.open && !controllerMap.open)
+                music.show();
+            e.accepted = true;
             return;
+        }
+        if (settings.open || briefing.open || review.open || music.open)
+            return;
+        // Cmd+Shift+M: model & effort.
         if (ctrl && e.key === Qt.Key_M) {
             if (lens > 0) {
                 answers.openPicker();
@@ -612,6 +633,8 @@ FocusScope {
             briefing.move(dy !== 0 ? dy : dx);
         } else if (review.open) {
             review.move(dy !== 0 ? dy : dx);
+        } else if (music.open) {
+            if (dy !== 0) music.move(dy); else music.stepSpeed(dx);
         } else if (onboarding.open) {
             onboarding.choice = Math.max(0, Math.min(onboarding.cards.length - 1, onboarding.choice + dx + dy));
         } else if (dialog.open) {
@@ -655,6 +678,7 @@ FocusScope {
         else if (onboarding.open) onboarding.confirm();
         else if (briefing.open) briefing.confirm();
         else if (review.open) review.confirm();
+        else if (music.open) music.playRow(music.row);
         else if (dialog.open) dialog.start();
         else if (settings.open) settings.hide();
         else if (answers.pickerOpen) answers.pickerOpen = false;  // the composer keeps focus
@@ -670,6 +694,7 @@ FocusScope {
         if (controllerMap.open) controllerMap.hide();
         else if (briefing.open) briefing.hide();
         else if (review.open) review.hide();
+        else if (music.open) music.hide();
         else if (dialog.open) dialog.hide();
         else if (settings.open) settings.hide();
         else if (answers.pickerOpen) answers.pickerOpen = false;
@@ -713,6 +738,8 @@ FocusScope {
             backend.cycleModel(d);
         } else if (review.open) {
             review.move(d);
+        } else if (music.open) {
+            music.move(d);
         } else if (lens === 0) {
             if (constellation.count > 0) selectedIsland = constellation.stepSelection(selectedIsland, d, true);
         } else if (lens === 1) {
@@ -823,6 +850,9 @@ FocusScope {
         onFilterPicked: (f) => app.setIslandFilter(f)
         onResetLayout: if (app.backend) app.backend.resetCardPositions()
         onReviewRequested: review.show()
+        musicLabel: app.musicLabel
+        musicPlaying: app.musicPlaying
+        onMusicRequested: app.toggleMusic()
     }
 
     // The shared element: a card that starts as the island and becomes the whole window.
@@ -895,7 +925,7 @@ FocusScope {
                     objectName: "headerJob"
                     anchors.left: headerName.right
                     anchors.leftMargin: 14
-                    anchors.right: codePill.visible ? codePill.left : lensDots.left
+                    anchors.right: codePill.visible ? codePill.left : headerMusic.left
                     anchors.rightMargin: 24
                     anchors.verticalCenter: parent.verticalCenter
                     visible: text.length > 0
@@ -912,8 +942,8 @@ FocusScope {
                     objectName: "codePill"
                     readonly property bool on: app.backend ? app.backend.showCodeDiffs : false
                     visible: app.lens === 2 && app.project !== null && (app.project.diffCount || 0) > 0
-                    anchors.right: lensDots.left
-                    anchors.rightMargin: 22
+                    anchors.right: headerMusic.left
+                    anchors.rightMargin: 12
                     anchors.verticalCenter: parent.verticalCenter
                     width: codeText.implicitWidth + 26
                     height: 28
@@ -931,6 +961,32 @@ FocusScope {
                     }
                     HoverHandler { id: codeHover; cursorShape: Qt.PointingHandCursor }
                     TapHandler { onTapped: app.toggleCodeDiffs() }
+                }
+                // Music: the same quiet ♪ pill as the Constellation's top bar.
+                Rectangle {
+                    id: headerMusic
+                    objectName: "headerMusicPill"
+                    anchors.right: lensDots.left
+                    anchors.rightMargin: 22
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: Math.min(headerMusicText.implicitWidth, 260) + 26
+                    height: 28
+                    radius: 14
+                    color: headerMusicHover.hovered ? Theme.card : "transparent"
+                    border.width: 1
+                    border.color: app.musicPlaying ? Theme.goldA(0.55) : Theme.line
+                    Text {
+                        id: headerMusicText
+                        anchors.centerIn: parent
+                        width: Math.min(implicitWidth, 260)
+                        elide: Text.ElideRight
+                        text: app.musicLabel
+                        color: app.musicPlaying ? Theme.gold : Theme.dim
+                        font.family: Theme.mono
+                        font.pixelSize: 14
+                    }
+                    HoverHandler { id: headerMusicHover; cursorShape: Qt.PointingHandCursor }
+                    TapHandler { onTapped: app.toggleMusic() }
                 }
                 Row {
                     id: lensDots
@@ -1131,7 +1187,7 @@ FocusScope {
                       stage.terms.active, stage.terms.selected, stage.terms.count, stage.terms.expanded];
         if (deps.length === 0 || (navMode === "mouse" && !padConnected))
             return null;
-        if (settings.open || onboarding.open || dialog.open || controllerMap.open || briefing.open || review.open)
+        if (settings.open || onboarding.open || dialog.open || controllerMap.open || briefing.open || review.open || music.open)
             return null;
         if (lens === 0 && constellation.dragging)
             return null;  // the card under the pointer is the focus while it moves
@@ -1311,7 +1367,7 @@ FocusScope {
                                  : (app.projects.length > 0 ? app.projects[Math.min(app.selectedIsland, app.projects.length - 1)].key : "")
         artifactIndex: app.lens === 2 ? app.artifactIndex : -1
         mouseMode: app.navMode === "mouse"
-        suppressed: settings.open || dialog.open || onboarding.open || briefing.open || controllerMap.open || review.open
+        suppressed: settings.open || dialog.open || onboarding.open || briefing.open || controllerMap.open || review.open || music.open
         onClosed: app.takeFocus()
     }
 
@@ -1387,6 +1443,14 @@ FocusScope {
         backend: app.backend
         padHints: app.padHints
         padGlyphs: app.padGlyphs
+        onClosed: app.takeFocus()
+    }
+    // --- Music -----------------------------------------------------------------------------------
+    // Cmd+M or the ♪ pill: the curated slowmix rotation and its five controls.
+    SlowmixOverlay {
+        id: music
+        anchors.fill: parent
+        backend: app.backend
         onClosed: app.takeFocus()
     }
     // Quiet hint, Constellation only: where the briefing lives.

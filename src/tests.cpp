@@ -2188,9 +2188,9 @@ void uiTests()
         check(firstItem(win, "modelChipLabel") && firstItem(win, "modelChipLabel")->property("text").toString() == "Sonnet 5.5 · low",
               "picker: composer chip shows the model + effort",
               firstItem(win, "modelChipLabel") ? firstItem(win, "modelChipLabel")->property("text").toString() : "none");
-        sendKey(win, Qt::Key_M, Qt::ControlModifier);
+        sendKey(win, Qt::Key_M, Qt::ControlModifier | Qt::ShiftModifier);
         settle(60);
-        check(strip && strip->isVisible() && in && in->hasActiveFocus(), "picker: Cmd+M opens the strip and focuses the composer");
+        check(strip && strip->isVisible() && in && in->hasActiveFocus(), "picker: Cmd+Shift+M opens the strip and focuses the composer");
         QStringList pairs;
         check(textOverlaps(win, &pairs) == 0, "picker: no overlapping text", pairs.join("; "));
         letter(Qt::Key_S, "s");
@@ -2227,7 +2227,7 @@ void uiTests()
         letter(Qt::Key_A, "a");
         sendKey(win, Qt::Key_Escape);
         typeText(win, "which arm?");
-        sendKey(win, Qt::Key_M, Qt::ControlModifier);
+        sendKey(win, Qt::Key_M, Qt::ControlModifier | Qt::ShiftModifier);
         letter(Qt::Key_D, "d");
         sendKey(win, Qt::Key_Return);
         check(backend.lastAskModel() == "gpt-6-sol" && backend.lastAskEffort() == "high" && backend.lastAskChannel() == "openai"
@@ -4341,6 +4341,182 @@ int snapOmnibar(const QString &outPath)
     return saved ? 0 : 1;
 }
 
+// Music overlay (slowmix) on the mock backend: a dry run, never an external process.
+void slowmixUiTests()
+{
+    Backend backend(Backend::Mode::Mock);
+    QTemporaryDir tmp;
+    backend.setPrefsPath(tmp.path() + "/studio_prefs.json");
+    backend.completeOnboarding("controller");
+    QQmlApplicationEngine engine;
+    QQuickWindow *win = createStudioWindow(engine, &backend, false, QSize(1920, 1080));
+    check(win != nullptr, "music ui: QML loads");
+    if (!win)
+        return;
+    QObject *app = win->findChild<QObject *>("studioApp");
+    QQuickItem *overlay = firstItem(win, "slowmixOverlay");
+    SlowmixController *player = backend.slowmixController();
+    if (!app || !overlay)
+        return;
+    settle(450);
+    auto visibleItems = [&](const char *name) {
+        QList<QQuickItem *> out;
+        for (QQuickItem *it : findItems(overlay, name))
+            if (it->isVisible())
+                out << it;
+        return out;
+    };
+    auto pillText = [&] {
+        QQuickItem *p = firstItem(win, "musicPill");
+        const auto t = p ? findItems(p, "barPillText") : QList<QQuickItem *>();
+        return t.isEmpty() ? QString() : t.first()->property("text").toString();
+    };
+    auto chip = [&](const char *name, const QString &label) -> QQuickItem * {
+        for (QQuickItem *it : visibleItems(name))
+            if (it->property("label").toString() == label)
+                return it;
+        return nullptr;
+    };
+    auto click = [&](QQuickItem *it) {
+        if (it)
+            mouseClick(win, it->mapToScene(QPointF(it->width() / 2, it->height() / 2)), Qt::LeftButton);
+        settle(60);
+    };
+
+    check(pillText() == QStringLiteral("♪") && !overlay->property("open").toBool(),
+          "music ui: idle top-bar pill is a bare ♪, overlay closed", pillText());
+    sendKey(win, Qt::Key_M, Qt::ControlModifier);
+    settle(300);
+    check(overlay->property("open").toBool() && overlay->isVisible() && overlay->hasActiveFocus(),
+          "music ui: Cmd+M opens the music overlay");
+
+    QStringList names;
+    for (QQuickItem *t : visibleItems("slowmixTrackName"))
+        names << t->property("text").toString();
+    check(names == QStringList({"night drive", "afterglow extended", "tidal lock", "glass harbor", "low orbit"}),
+          "music ui: curated rotation by 30-day minutes (no takes, runner-ups, baked exports, stale or unplayed)",
+          names.join(", "));
+    QStringList pairs;
+    check(textOverlaps(win, &pairs) == 0, "music ui: no overlapping text", pairs.join("; "));
+    const QList<QQuickItem *> speeds = visibleItems("slowmixSpeed");
+    const QList<QQuickItem *> reverbs = visibleItems("slowmixReverb");
+    const QList<QQuickItem *> basses = visibleItems("slowmixBass");
+    check(speeds.size() == 6 && reverbs.size() == 3 && basses.size() == 3 && visibleItems("slowmixPlay").size() == 1
+              && visibleItems("slowmixLoop").size() == 1,
+          "music ui: only Play, Loop, 6 speeds, 3 reverbs, 3 bass presets",
+          QStringLiteral("%1 %2 %3").arg(speeds.size()).arg(reverbs.size()).arg(basses.size()));
+
+    // Enter plays the selected (top) track at its learned favorite preset.
+    sendKey(win, Qt::Key_Return);
+    settle(100);
+    check(player->playing() && player->currentTrack() == "night drive" && player->speed() == 0.85 && player->reverb() == "hall",
+          "music ui: Enter plays the top track with its favorite 0.85x hall",
+          player->currentTrack() + " " + QString::number(player->speed()) + " " + player->reverb());
+    check(chip("slowmixSpeed", "0.85x") && chip("slowmixSpeed", "0.85x")->property("on").toBool()
+              && chip("slowmixReverb", "Hall") && chip("slowmixReverb", "Hall")->property("on").toBool(),
+          "music ui: the active speed / reverb chips light up");
+    sendKey(win, Qt::Key_Down);
+    sendKey(win, Qt::Key_Return);
+    settle(60);
+    check(player->currentTrack() == "afterglow extended" && player->speed() == 1.25 && player->reverb() == "hall",
+          "music ui: Down + Enter switches track and applies its favorite 1.25x",
+          player->currentTrack() + " " + QString::number(player->speed()));
+    sendKey(win, Qt::Key_Right);
+    check(player->speed() == 1.6, "music ui: Right steps speed to the next chip", QString::number(player->speed()));
+    click(chip("slowmixSpeed", "0.90x"));
+    click(chip("slowmixReverb", "Heavy"));
+    click(chip("slowmixBass", "Warm"));
+    check(qFuzzyCompare(player->speed(), 0.90) && player->reverb() == "heavy" && player->bass() == 2.0,
+          "music ui: chip clicks set speed / reverb / bass",
+          QString::number(player->speed()) + " " + player->reverb() + " " + QString::number(player->bass()));
+    click(firstItem(win, "slowmixLoop"));
+    check(!player->looping(), "music ui: Loop chip toggles looping");
+    sendKey(win, Qt::Key_Space);
+    check(!player->playing(), "music ui: Space pauses");
+    sendKey(win, Qt::Key_Space);
+    check(player->playing(), "music ui: Space resumes");
+
+    click(firstItem(win, "slowmixAll"));
+    settle(100);
+    check(visibleItems("slowmixTrack").size() == 7 && player->showArchive(),
+          "music ui: All adds stale and never-played songs",
+          QString::number(visibleItems("slowmixTrack").size()));
+    click(firstItem(win, "slowmixAll"));
+    settle(100);
+
+    sendKey(win, Qt::Key_Escape);
+    settle(300);
+    check(!overlay->property("open").toBool() && player->playing() && player->currentTrack() == "afterglow extended",
+          "music ui: Esc closes the overlay without stopping playback");
+    check(pillText() == QStringLiteral("♪ afterglow extended"), "music ui: top-bar pill names the playing track", pillText());
+    sendKey(win, Qt::Key_M, Qt::ControlModifier);
+    settle(200);
+    const bool reopened = overlay->property("open").toBool();
+    sendKey(win, Qt::Key_M, Qt::ControlModifier);
+    settle(200);
+    check(reopened && !overlay->property("open").toBool(), "music ui: Cmd+M toggles the overlay");
+    // From a focused composer too: Cmd+M is music there, Cmd+Shift+M stays the model strip.
+    QMetaObject::invokeMethod(app, "enterProject", Q_ARG(QVariant, QVariant(0)));
+    settle(400);
+    if (QQuickItem *in = firstItem(win, "composerInput")) {
+        in->forceActiveFocus();
+        settle(60);
+        const bool composerFocused = in->hasActiveFocus();
+        sendKey(win, Qt::Key_M, Qt::ControlModifier);
+        settle(250);
+        QQuickItem *strip = firstItem(win, "modelStrip");
+        check(composerFocused && overlay->property("open").toBool() && !(strip && strip->isVisible()),
+              "music ui: Cmd+M from the composer opens music, not the model strip");
+        QQuickItem *hdr = firstItem(win, "headerMusicPill");
+        check(hdr && hdr->isVisible(), "music ui: zoomed lenses show the ♪ pill in the header");
+        sendKey(win, Qt::Key_Escape);
+        settle(250);
+    } else {
+        check(false, "music ui: composer input found");
+    }
+    check(player->spawnCount() == 0 && !player->running() && !player->spawnAllowed(),
+          "music ui: mock mode never spawns slowmix");
+}
+
+int snapSlowmix(const QString &outPath)
+{
+    Backend backend(Backend::Mode::Mock);
+    QQmlApplicationEngine engine;
+    QQuickWindow *win = createStudioWindow(engine, &backend, false, QSize(1920, 1080));
+    if (!win) {
+        std::fprintf(stderr, "snap-slowmix: QML failed to load\n");
+        return 2;
+    }
+    QQuickItem *overlay = firstItem(win, "slowmixOverlay");
+    if (!overlay)
+        return 3;
+    QDir().mkpath(QFileInfo(outPath).absolutePath());
+    QString barPath = outPath;
+    barPath.insert(outPath.endsWith(QLatin1String(".png"), Qt::CaseInsensitive) ? outPath.size() - 4 : outPath.size(),
+                   QLatin1String("-bar"));
+    settle(450);
+    // Playing the top of the rotation (a dry run: no audio, no process).
+    SlowmixController *player = backend.slowmixController();
+    player->refresh();
+    if (!player->tracks().isEmpty())
+        player->selectTrack(player->tracks().first().toMap().value("path").toString());
+    mouseMove(win, QPointF(4, 1076));
+    settle(500);
+    const QImage bar = win->grabWindow();
+    const bool barSaved = bar.save(barPath);
+    sendKey(win, Qt::Key_M, Qt::ControlModifier);
+    settle(500);
+    const QImage img = win->grabWindow();
+    const bool saved = img.save(outPath);
+    std::printf("snap-slowmix: %s %s (%d blue/green px), %lld tracks, playing \"%s\" %.2fx %s\n",
+                saved ? "saved" : "FAILED", qPrintable(outPath), forbiddenPixels(img),
+                static_cast<long long>(player->tracks().size()), qPrintable(player->currentTrack()), player->speed(),
+                qPrintable(player->reverb()));
+    std::printf("snap-slowmix: %s %s (%d blue/green px), spawned %d\n", barSaved ? "saved" : "FAILED",
+                qPrintable(barPath), forbiddenPixels(bar), player->spawnCount());
+    return saved && barSaved ? 0 : 1;
+}
+
 int runTests()
 {
     unitTests();
@@ -4350,6 +4526,7 @@ int runTests()
     formFactorTests();
     phase3UnitTests();
     phase3UiTests();
+    slowmixUiTests();
     omnibarUiTests();
     uiTests();
     gamepadUiTests();
