@@ -2925,6 +2925,24 @@ void openAiCompatUnitTests()
               && b.recentActions().last() == "act 14",
           "openai-compat: recordAction keeps last 12 actions for intent inference");
 
+    // Phonon live transcript tail: missing returns empty; fresh symlink returns last N non-empty lines.
+    {
+        QTemporaryDir td;
+        check(readPhononTail(td.path() + "/missing.txt").isEmpty(),
+              "phonon tail: missing file returns empty");
+        const QString realPath = td.path() + "/transcript.txt";
+        QFile f(realPath);
+        if (f.open(QIODevice::WriteOnly)) {
+            f.write("line 1\n\nline 2\nline 3\nline 4\nline 5\nline 6\n  \nline 7\n");
+            f.close();
+        }
+        const QString linkPath = td.path() + "/latest.txt";
+        QFile::link(realPath, linkPath);
+        const QString tail = readPhononTail(linkPath, 5, 60000);
+        check(tail == QStringLiteral("line 3\nline 4\nline 5\nline 6\nline 7"),
+              "phonon tail: fresh symlink returns last 5 non-empty lines");
+    }
+
     // KV pre-warm: one token, not streamed, and the same system + pinned-context prefix as an ask.
     {
         const QString model = QStringLiteral("qwen3.8-flash-next");

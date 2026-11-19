@@ -35,6 +35,10 @@ QString lapisPeers() { return home() + QStringLiteral("/.local/bin/lapis-peers")
 QString claudeBin() { return home() + QStringLiteral("/.local/bin/claude"); }
 QString agyBin() { return home() + QStringLiteral("/.local/bin/agy"); }
 QString workspacePath() { return home() + QStringLiteral("/.lapis/runtime/workspace.json"); }
+QString phononLatestPath()
+{
+    return home() + QStringLiteral("/Library/Application Support/Phonon/Meetings/latest.txt");
+}
 
 QString expandHome(const QString &p)
 {
@@ -1061,9 +1065,11 @@ Backend::Backend(Mode mode, QObject *parent, bool warmHelpers)
         m_watcher.addPath(workspacePath());
     m_boardTimer.setInterval(5000);
     connect(&m_boardTimer, &QTimer::timeout, this, &Backend::pollBoard);
+    connect(&m_boardTimer, &QTimer::timeout, this, &Backend::pollPhonon);
     m_boardTimer.start();
     refresh();
     pollBoard();
+    pollPhonon();
     m_ageTimer.setInterval(30000);
     connect(&m_ageTimer, &QTimer::timeout, this, &Backend::publish);
     m_ageTimer.start();
@@ -1412,6 +1418,56 @@ void Backend::recordAction(const QString &action)
     m_recentActions << a;
     while (m_recentActions.size() > 12)
         m_recentActions.removeFirst();
+}
+
+QString readPhononTail(const QString &path, int maxLines, qint64 maxAgeMs)
+{
+    const QFileInfo fi(path);
+    const QString target = fi.canonicalFilePath();
+    if (target.isEmpty())
+        return {};
+    const QFileInfo tf(target);
+    if (!tf.exists() || !tf.isReadable())
+        return {};
+    const qint64 ageMs = QDateTime::currentMSecsSinceEpoch() - tf.lastModified().toMSecsSinceEpoch();
+    if (maxAgeMs > 0 && ageMs > maxAgeMs)
+        return {};
+    QFile f(target);
+    if (!f.open(QIODevice::ReadOnly))
+        return {};
+    if (f.size() > 16384)
+        f.seek(f.size() - 16384);
+    const QString text = QString::fromUtf8(f.readAll());
+    QStringList lines;
+    for (const QString &raw : text.split(QLatin1Char('\n'))) {
+        const QString s = raw.trimmed();
+        if (!s.isEmpty())
+            lines << s;
+    }
+    if (lines.size() > maxLines)
+        lines = lines.mid(lines.size() - maxLines);
+    return lines.join(QLatin1Char('\n'));
+}
+
+void Backend::pollPhonon()
+{
+    if (m_mode != Mode::Live)
+        return;
+    const QString path = phononLatestPath();
+    const QFileInfo fi(path);
+    const QString target = fi.canonicalFilePath();
+    const qint64 mtime = target.isEmpty() ? 0 : QFileInfo(target).lastModified().toMSecsSinceEpoch();
+    if (mtime == m_phononMtime && mtime != 0) {
+        const qint64 ageMs = QDateTime::currentMSecsSinceEpoch() - mtime;
+        if (ageMs <= 10 * 60 * 1000)
+            return;  // unchanged and still fresh
+    }
+    m_phononMtime = mtime;
+    const QString tail = readPhononTail(path);
+    if (tail != m_phononTail) {
+        m_phononTail = tail;
+        emit phononTailChanged();
+    }
 }
 
 void Backend::setOpenaiCompatUrl(const QString &url)
@@ -2229,6 +2285,8 @@ void Backend::askOpenAiCompat(const QString &projectKey, int artifactIndex, cons
     QString q = question;
     if (!m_recentActions.isEmpty())
         q += QStringLiteral("\n\nRecent user actions:\n- ") + m_recentActions.join(QStringLiteral("\n- "));
+    if (!m_phononTail.isEmpty())
+        q += QStringLiteral("\n\nLive Phonon audio transcript:\n") + m_phononTail;
     const QByteArray payload = buildOpenAiCompatRequest(model, kCompatSystemPrompt, ctx, q, m_chatEffort);
 
     QNetworkRequest req{QUrl(endpoint)};

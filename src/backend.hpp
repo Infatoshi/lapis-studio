@@ -142,6 +142,9 @@ QByteArray buildOpenAiWarmRequest(const QString &model, const QString &systemPro
 // The quick-ask system prompt shared by asks and warms (byte-identical prefix).
 extern const QString kCompatSystemPrompt;
 OpenAiSseEvent parseOpenAiSseLine(const QByteArray &line);
+// Read the last `maxLines` non-empty lines from Phonon's live meeting/audio transcript
+// if modified within `maxAgeMs` (returns empty if missing or stale).
+QString readPhononTail(const QString &path, int maxLines = 15, qint64 maxAgeMs = 10 * 60 * 1000);
 
 // Human-interest filter: the request asking the fast model to keep only what matches the human's
 // direction (goal), pinned params / terms and what they are inspecting right now (recent actions),
@@ -215,6 +218,8 @@ class Backend : public QObject {
     Q_PROPERTY(int quickThinkingTokens READ quickThinkingTokens NOTIFY quickChanged)
     Q_PROPERTY(QString focusedProject READ focusedProject WRITE setFocusedProject NOTIFY projectsChanged)
     Q_PROPERTY(QString activeCategory READ activeCategory NOTIFY projectsChanged)
+    Q_PROPERTY(QString phononTail READ phononTail NOTIFY phononTailChanged)
+    Q_PROPERTY(bool phononLive READ phononLive NOTIFY phononTailChanged)
     Q_PROPERTY(QString openaiCompatUrl READ openaiCompatUrl WRITE setOpenaiCompatUrl NOTIFY prefsChanged)
     Q_PROPERTY(QString openaiCompatModel READ openaiCompatModel WRITE setOpenaiCompatModel NOTIFY prefsChanged)
     // PS4 DualShock 4 / extended gamepad. Always present; only main()'s live window enables it.
@@ -352,6 +357,8 @@ public:
     Q_INVOKABLE void recordAction(const QString &action);
     QStringList recentActions() const { return m_recentActions; }
     QString activeCategory() const { return m_activeCategory; }
+    QString phononTail() const { return m_phononTail; }
+    bool phononLive() const { return !m_phononTail.isEmpty(); }
 
     // The prompt preamble for quick asks and traces: on-screen artifact, last turns, files, tools, write-up.
     QString contextFor(const QString &projectKey, int artifactIndex) const;
@@ -418,6 +425,7 @@ signals:
     void prefsChanged();
     void suggestionChanged();
     void briefingChanged();
+    void phononTailChanged();
     void sessionStarted(const QString &projectKey);
     void quickTick();
 
@@ -472,6 +480,7 @@ private:
     void noteAnswer(const QString &answer);   // the whole answer so far (clamped)
     void appendAnswer(const QString &delta);  // one raw text delta
     void pollBoard();
+    void pollPhonon();
     // Persistent provider channels (live only).
     struct Channel {
         QString key, provider, model, effort;
@@ -559,6 +568,8 @@ private:
     QSet<QString> m_pinnedMetrics;
     QByteArray m_compatBuf;
     QString m_activeCategory;
+    QString m_phononTail;
+    qint64 m_phononMtime = 0;
     QStringList m_selectedAgentIds;
     QStringList m_recentActions;
     QStringList m_projectOrder;  // locks card slots so background updates never shuffle muscle memory
