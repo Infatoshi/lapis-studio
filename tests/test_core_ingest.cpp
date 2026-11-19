@@ -12,10 +12,15 @@
 #include <QDir>
 #include <QElapsedTimer>
 #include <QFile>
+#include <QFileInfo>
 #include <QJsonDocument>
+#include <QJsonObject>
+#include <QLocalServer>
+#include <QLocalSocket>
 #include <QTemporaryDir>
 
 #include <algorithm>
+#include <chrono>
 
 #include <cstdio>
 #include <thread>
@@ -324,8 +329,153 @@ void slowmixTests()
     check(c.spawnCount() == 0 && !c.running(), "slowmix: dry run never spawns a process");
     SlowmixController live;
     live.setBinary(td.path() + "/no-such-slowmix");
+    live.setSocketPath(td.path() + "/none.sock");  // never probe the real ~/.lapis-next daemon
     live.setSpawnAllowed(true);
-    check(!live.available(), "slowmix: spawn allowed but binary missing -> unavailable");
+    check(!live.available(), "slowmix: spawn allowed, no daemon, binary missing -> unavailable");
+    check(SlowmixController::defaultSocketPath().endsWith("/slowmix.sock"), "slowmix: default socket path",
+          SlowmixController::defaultSocketPath());
+}
+
+// A stand-in for `slowmix --socket`: answers `status` with its state, applies play / pause /
+// load, and records every line it is sent.
+struct MockSlowmixDaemon {
+    QLocalServer server;
+    QList<QLocalSocket *> clients;
+    QStringList lines;
+    int connections = 0;
+    int hangups = 0;
+    bool playing = true;
+    QString path;
+
+    bool listen(const QString &sockPath)
+    {
+        QLocalServer::removeServer(sockPath);
+        QObject::connect(&server, &QLocalServer::newConnection, [this] {
+            while (QLocalSocket *c = server.nextPendingConnection()) {
+                ++connections;
+                clients << c;
+                QObject::connect(c, &QLocalSocket::disconnected, [this, c] {
+                    ++hangups;
+                    clients.removeAll(c);
+                    c->deleteLater();
+                });
+                QObject::connect(c, &QLocalSocket::readyRead, [this, c] {
+                    while (c->canReadLine()) {
+                        const QString l = QString::fromUtf8(c->readLine()).trimmed();
+                        lines << l;
+                        if (l == "play")
+                            playing = true;
+                        else if (l == "pause")
+                            playing = false;
+                        else if (l.startsWith("load "))
+                            path = l.mid(5), playing = true;
+                        else if (l == "status")
+                            c->write(QJsonDocument(QJsonObject{{"playing", playing},
+                                                               {"track", QFileInfo(path).fileName()},
+                                                               {"path", path},
+                                                               {"speed", 0.85},
+                                                               {"reverb", "heavy"},
+                                                               {"bass", 3.0},
+                                                               {"loop", false},
+                                                               {"pos", 12.0},
+                                                               {"dur", 200.0}})
+                                         .toJson(QJsonDocument::Compact)
+                                     + '\n');
+                    }
+                });
+            }
+        });
+        return server.listen(sockPath);
+    }
+};
+
+template <typename F>
+bool pumpUntil(F done, int timeoutMs = 3000)
+{
+    QElapsedTimer t;
+    t.start();
+    while (!done() && t.elapsed() < timeoutMs) {
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 10);
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    return done();
+}
+
+void slowmixDaemonTests()
+{
+    QTemporaryDir td;
+    const QString clips = td.path() + "/clips";
+    QDir().mkpath(clips);
+    writeFile(clips + "/night_drive.wav", "");
+    const QString sock = td.path() + "/s.sock";
+    MockSlowmixDaemon d;
+    d.path = clips + "/night_drive.wav";
+    check(d.listen(sock), "slowmix daemon: mock server listens", d.server.errorString());
+
+    // Attach to a daemon that is already playing: the UI syncs to it, nothing is spawned.
+    auto *c = new SlowmixController;
+    c->setLibrary(clips, td.path() + "/plays.tsv");
+    c->setBinary(td.path() + "/no-such-slowmix");
+    c->setSocketPath(sock);
+    c->setSpawnAllowed(true);
+    check(pumpUntil([&] { return c->playing(); }), "slowmix daemon: attach syncs playing on connect");
+    check(c->running() && c->available() && c->spawnCount() == 0 && d.connections == 1,
+          "slowmix daemon: attached over the socket without spawning, binary missing is fine",
+          QString("conns=%1 spawns=%2").arg(d.connections).arg(c->spawnCount()));
+    check(c->currentPath() == d.path && c->currentTrack() == "night drive" && c->speed() == 0.85
+              && c->reverb() == "heavy" && c->bass() == 3.0 && !c->looping() && c->position() == 12.0
+              && c->duration() == 200.0,
+          "slowmix daemon: sync fills track, path, speed, reverb, bass, loop, position",
+          c->currentPath() + " | " + c->currentTrack() + " | " + QString::number(c->speed()) + " " + c->reverb());
+
+    // Commands reach the daemon over the same connection.
+    c->togglePlay();
+    check(pumpUntil([&] { return d.lines.contains("pause"); }) && !c->playing() && !d.playing,
+          "slowmix daemon: togglePlay sends pause", d.lines.join(", "));
+
+    // The daemon drops us (e.g. it restarted its listener): reconnect and resync.
+    QLocalSocket *first = d.clients.value(0);
+    if (first)
+        first->disconnectFromServer();
+    check(pumpUntil([&] { return d.connections == 2 && c->running(); }),
+          "slowmix daemon: reconnects after the connection drops", QString::number(d.connections));
+    d.playing = true;  // someone pressed play elsewhere while we were away
+    check(pumpUntil([&] { return c->playing(); }), "slowmix daemon: polling picks up remote state after reconnect");
+
+    // Destruction hangs up but never stops the music.
+    const int hangupsBefore = d.hangups;
+    delete c;
+    check(pumpUntil([&] { return d.hangups == hangupsBefore + 1; }), "slowmix daemon: destructor closes the socket");
+    check(!d.lines.contains("quit") && d.server.isListening() && d.playing,
+          "slowmix daemon: destructor never sends quit; server untouched and still playing", d.lines.join(", "));
+
+    // A new app instance attaches to the same daemon and shows the same song.
+    SlowmixController again;
+    again.setSocketPath(sock);
+    again.setBinary(td.path() + "/no-such-slowmix");
+    again.setSpawnAllowed(true);
+    check(pumpUntil([&] { return again.playing() && again.currentPath() == d.path; }) && d.connections == 3
+              && again.spawnCount() == 0,
+          "slowmix daemon: a restarted app reattaches and resyncs");
+
+    // No daemon: the first play spawns `slowmix --socket <path>` detached.
+    const QString fake = td.path() + "/fake-slowmix";
+    const QString argsOut = td.path() + "/args.txt";
+    writeFile(fake, QString("#!/bin/sh\necho \"$@\" > '%1'\n").arg(argsOut).toUtf8());
+    QFile::setPermissions(fake, QFile::permissions(fake) | QFileDevice::ExeOwner);
+    const QString deadSock = td.path() + "/dead/s.sock";
+    SlowmixController fresh;
+    fresh.setBinary(fake);
+    fresh.setSocketPath(deadSock);
+    fresh.setSpawnAllowed(true);
+    check(fresh.spawnCount() == 0 && !fresh.running(), "slowmix daemon: probing an absent daemon spawns nothing");
+    fresh.selectTrack(d.path);
+    check(fresh.spawnCount() == 1 && !fresh.running(), "slowmix daemon: first play spawns once (fake never listens)",
+          QString::number(fresh.spawnCount()));
+    pumpUntil([&] { return QFileInfo(argsOut).size() > 0; });
+    QFile af(argsOut);
+    const QString args = af.open(QIODevice::ReadOnly) ? QString::fromUtf8(af.readAll()).trimmed() : QString();
+    check(args == "--socket " + deadSock, "slowmix daemon: spawned with --socket <path>", args);
 }
 
 // --- Cross-session memory ---------------------------------------------------------------------
@@ -561,6 +711,7 @@ int main(int argc, char **argv)
     coreTests();
     phononTests();
     slowmixTests();
+    slowmixDaemonTests();
     memoryTests();
     windowStateTests();
     std::printf("test_core_ingest: %d passed, %d failed\n", g_pass, g_fail);

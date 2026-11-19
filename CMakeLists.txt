@@ -36,7 +36,7 @@ add_library(lapis_ingest STATIC
   src/ingest/memory.hpp src/ingest/memory.cpp
   src/transcript.hpp src/transcript.cpp
 )
-target_link_libraries(lapis_ingest PUBLIC lapis_core Qt6::Core Qt6::Concurrent)
+target_link_libraries(lapis_ingest PUBLIC lapis_core Qt6::Core Qt6::Concurrent Qt6::Network)
 lapis_warnings(lapis_ingest)
 
 # APC-aligned prompt builder, SSE parser and the libcurl-multi LlmRouter.
