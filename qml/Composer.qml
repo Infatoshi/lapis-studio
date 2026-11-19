@@ -72,7 +72,8 @@ Item {
         return "…";
     }
     function providerLabel(p) {
-        return p === "anthropic" ? "Anthropic" : p === "openai" ? "OpenAI" : p === "google" ? "Google" : "";
+        return p === "anthropic" ? "Anthropic" : p === "openai" ? "OpenAI" : p === "google" ? "Google"
+             : p === "openrouter" ? "OpenRouter" : p === "openai-compat" ? "Local vLLM" : "";
     }
     function focusInput(t) {
         input.forceActiveFocus();

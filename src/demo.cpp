@@ -317,15 +317,15 @@ QList<DemoEvent> demoScript(Backend *backend)
     letter(26.1 + s, Qt::Key_J, "j");
     key(27.3 + s, Qt::Key_Escape);
     // 32.3-36.4 s: type a question, Cmd+Shift+M opens the inline Model & Effort strip with speed tags:
-    // s s (Sonnet · Fast -> Opus · Frontier -> Fable · Frontier), d d (low -> medium -> high),
-    // w (back to Opus); Enter sends with Opus · high.
+    // w w (Sonnet · Fast -> Opus · Frontier -> Fable · Frontier), d d (low -> medium -> high),
+    // s (back to Opus); Enter sends with Opus · high.
     type(27.8 + s, QStringLiteral("best arm?"), 0.04);
     key(28.5 + s, Qt::Key_M, Qt::ControlModifier | Qt::ShiftModifier);
-    letter(29.1 + s, Qt::Key_S, "s");
-    letter(29.6 + s, Qt::Key_S, "s");
+    letter(29.1 + s, Qt::Key_W, "w");
+    letter(29.6 + s, Qt::Key_W, "w");
     letter(30.1 + s, Qt::Key_D, "d");
     letter(30.6 + s, Qt::Key_D, "d");
-    letter(31.2 + s, Qt::Key_W, "w");
+    letter(31.2 + s, Qt::Key_S, "s");
     key(31.9 + s, Qt::Key_Return);
     // 36.4-44 s: thinking streams dim, the answer replaces it; the composer's ghost follow-up
     // gets the ring; Tab accepts it; Opt+Enter streams the trace, which collapses; Esc zooms out.

@@ -568,29 +568,29 @@ int mergeBriefingReply(QVariantList &rows, const QString &reply)
 
 const QList<ModelSpec> &modelCatalog()
 {
-    // Efforts per model: agy's own `agy models` list for Gemini (hydrogen is the only one with
-    // xhigh); Claude Code's --effort levels for Claude, minus xhigh on Haiku; codex reasoning
-    // efforts for GPT-6, minus xhigh on the small Luna.
+    // The curated lineup, in picker order. Efforts per model: agy's own `agy models` list for
+    // Gemini (hydrogen and neon have xhigh, carbon stops at high); Claude Code's --effort levels
+    // for Claude; codex reasoning efforts for GPT-6.
     static const QStringList lmh = {QStringLiteral("low"), QStringLiteral("medium"), QStringLiteral("high")};
     static const QStringList all = lmh + QStringList{QStringLiteral("xhigh")};
     // Speed classes are what a quick ask feels like: Fast = first token in ~1-3 s; Deep Think =
     // a heavy thinking model (gemini-4-hydrogen: 31.8 s median at high, 4.3 s cold at low), whose
     // agy stream sends no thinking text, only step events, so the UI shows a live phase instead.
     static const QList<ModelSpec> c = {
-        {QStringLiteral("claude-sonnet-5-5"), QStringLiteral("anthropic"), QStringLiteral("Sonnet 5.5"), all, QStringLiteral("Fast")},
-        {QStringLiteral("claude-opus-5-5"), QStringLiteral("anthropic"), QStringLiteral("Opus 5.5"), all, QStringLiteral("Frontier")},
-        {QStringLiteral("claude-fable-5-2"), QStringLiteral("anthropic"), QStringLiteral("Fable 5.2"), all, QStringLiteral("Frontier")},
-        {QStringLiteral("claude-haiku-5-5"), QStringLiteral("anthropic"), QStringLiteral("Haiku 5.5"), lmh, QStringLiteral("Fast")},
-        {QStringLiteral("gpt-6-astra"), QStringLiteral("openai"), QStringLiteral("GPT-6 Astra"), all, QStringLiteral("Frontier")},
-        {QStringLiteral("gpt-6-sol"), QStringLiteral("openai"), QStringLiteral("GPT-6 Sol"), all, QStringLiteral("Balanced")},
-        {QStringLiteral("gpt-6-luna"), QStringLiteral("openai"), QStringLiteral("GPT-6 Luna"), lmh, QStringLiteral("Fast")},
-        {QStringLiteral("gemini-3.8-flash"), QStringLiteral("google"), QStringLiteral("Gemini 3.8 Flash"), lmh, QStringLiteral("Fast")},
-        {QStringLiteral("gemini-4-carbon"), QStringLiteral("google"), QStringLiteral("Gemini 4 Carbon"), lmh, QStringLiteral("Teach")},
-        {QStringLiteral("gemini-4-hydrogen"), QStringLiteral("google"), QStringLiteral("Gemini 4 Hydrogen"), all, QStringLiteral("Deep Think")},
-        {QStringLiteral("gemini-4-argon"), QStringLiteral("google"), QStringLiteral("Gemini 4 Argon"), lmh, QStringLiteral("Balanced")},
+        // "fast" = reasoning effort "none" on OpenRouter, the default; low..high opt into thinking.
+        {QStringLiteral("deepseek/deepseek-v4.1-flash-1017"), QStringLiteral("openrouter"), QStringLiteral("DeepSeek V4.1 Flash"),
+         QStringList{QStringLiteral("fast")} + lmh, QStringLiteral("Fast")},
         // "fast" = no thinking (enable_thinking false), the default; low / medium opt into it.
-        {QStringLiteral("qwen3.8-flash-next"), QStringLiteral("openai-compat"), QStringLiteral("Qwen3.8 Flash"),
+        {QStringLiteral("qwen3.8-flash-next"), QStringLiteral("openai-compat"), QStringLiteral("Qwen3.8 Flash Next"),
          QStringList{QStringLiteral("fast"), QStringLiteral("low"), QStringLiteral("medium")}, QStringLiteral("Fast")},
+        {QStringLiteral("claude-fable-5-2"), QStringLiteral("anthropic"), QStringLiteral("Fable 5.2"), all, QStringLiteral("Frontier")},
+        {QStringLiteral("claude-opus-5-5"), QStringLiteral("anthropic"), QStringLiteral("Opus 5.5"), all, QStringLiteral("Frontier")},
+        {QStringLiteral("claude-sonnet-5-5"), QStringLiteral("anthropic"), QStringLiteral("Sonnet 5.5"), all, QStringLiteral("Fast")},
+        {QStringLiteral("gpt-6-astra"), QStringLiteral("openai"), QStringLiteral("GPT 6.2 Astra"), all, QStringLiteral("Frontier")},
+        {QStringLiteral("gpt-6-sol"), QStringLiteral("openai"), QStringLiteral("GPT 6.2 Sol"), all, QStringLiteral("Balanced")},
+        {QStringLiteral("gemini-4-carbon"), QStringLiteral("google"), QStringLiteral("Gemini 4 Carbon"), lmh, QStringLiteral("Teach")},
+        {QStringLiteral("gemini-4-neon"), QStringLiteral("google"), QStringLiteral("Gemini 4 Neon"), all, QStringLiteral("Balanced")},
+        {QStringLiteral("gemini-4-hydrogen"), QStringLiteral("google"), QStringLiteral("Gemini 4 Hydrogen"), all, QStringLiteral("Deep Think")},
     };
     return c;
 }
@@ -728,8 +728,8 @@ QString channelKeyFor(const QString &model, const QString &effort)
         return QStringLiteral("google:") + agyModelId(model, effort);
     if (p == QLatin1String("anthropic"))
         return QStringLiteral("anthropic:%1:%2").arg(model, clampEffort(model, effort));
-    if (p == QLatin1String("openai-compat"))
-        return QStringLiteral("openai-compat:") + model;
+    if (p == QLatin1String("openai-compat") || p == QLatin1String("openrouter"))
+        return p + QLatin1Char(':') + model;
     return {};
 }
 
@@ -1561,6 +1561,21 @@ void Backend::setPrefsPath(const QString &path)
     emit prefsChanged();
 }
 
+namespace {
+// Only known lenses, a non-negative artifact index and a real bool survive into prefs.
+QVariantMap normalizedViewState(const QVariantMap &in)
+{
+    static const QStringList lenses = {QStringLiteral("constellation"), QStringLiteral("ladder"), QStringLiteral("stage")};
+    const QString lens = in.value(QStringLiteral("lens")).toString();
+    if (!lenses.contains(lens))
+        return {};
+    return {{QStringLiteral("lens"), lens},
+            {QStringLiteral("focusedProject"), in.value(QStringLiteral("focusedProject")).toString()},
+            {QStringLiteral("artifactIndex"), std::max(0, in.value(QStringLiteral("artifactIndex")).toInt())},
+            {QStringLiteral("needsMeOnly"), in.value(QStringLiteral("needsMeOnly")).toBool()}};
+}
+}  // namespace
+
 void Backend::loadPrefs()
 {
     if (m_prefsPath.isEmpty())
@@ -1591,6 +1606,9 @@ void Backend::loadPrefs()
     if (!compatModel.isEmpty())
         m_openaiCompatModel = compatModel;
     m_openaiCompatKey = o.value(QLatin1String("openaiCompatKey")).toString().trimmed();
+    m_openrouterKey = o.value(QLatin1String("openrouterApiKey")).toString().trimmed();
+    m_viewState = normalizedViewState(o.value(QLatin1String("viewState")).toObject().toVariantMap());
+    emit viewStateChanged();
     m_showCodeDiffs = o.value(QLatin1String("showCodeDiffs")).toBool(false);
     m_windowState = WindowState::fromJson(o.value(QLatin1String("windowState")).toObject());
     m_cardPositions.clear();
@@ -1789,6 +1807,17 @@ void Backend::setOpenaiCompatModel(const QString &model)
     m_prefsSave.start();
 }
 
+void Backend::setViewState(const QVariantMap &state)
+{
+    const QVariantMap v = normalizedViewState(state);
+    if (v.isEmpty() || v == m_viewState)
+        return;
+    m_viewState = v;
+    emit viewStateChanged();
+    if (!m_prefsPath.isEmpty())
+        m_prefsSave.start();  // debounced 400 ms; savePrefs never lets a mock write the real file
+}
+
 bool Backend::savePrefs()
 {
     m_prefsSave.stop();
@@ -1815,7 +1844,7 @@ bool Backend::savePrefs()
             o = QJsonDocument::fromJson(old.read(256 * 1024)).object();
     }
     static const char *const kOwnedOptional[] = {"windowState", "cardPositions", "gamepadBindings", "openaiCompatModel",
-                                                 "mapSort", "clusterOrder"};
+                                                 "mapSort", "clusterOrder", "viewState"};
     for (const char *k : kOwnedOptional)
         o.remove(QLatin1String(k));
     if (m_compatUrlCleared)
@@ -1849,6 +1878,8 @@ bool Backend::savePrefs()
         o.insert(QStringLiteral("mapSort"), m_mapSort);
     if (m_clusterOrder != defaultClusterOrder())
         o.insert(QStringLiteral("clusterOrder"), QJsonArray::fromStringList(m_clusterOrder));
+    if (!m_viewState.isEmpty())
+        o.insert(QStringLiteral("viewState"), QJsonObject::fromVariantMap(m_viewState));
     {
         const QHash<QString, QString> padMap = m_gamepad.bindingsMap();
         const QHash<QString, QString> defMap = GamepadState::defaultBindings();
@@ -2497,11 +2528,16 @@ void Backend::ask(const QString &projectKey, int artifactIndex, const QString &q
     const QString recent = recentConversationBlock();
     if (!recent.isEmpty())
         prompt += QStringLiteral("\n\n") + recent;
+    prompt += QStringLiteral("\n\n") + currentTimeLine(QDateTime::currentDateTime());
     prompt += QStringLiteral("\n\nQuestion: ") + q;
     m_quickClock.start();
     m_quickTicker.start();
     if (providerFor(m_chatModel) == QLatin1String("openai-compat")) {
         askOpenAiCompat(projectKey, artifactIndex, q);
+        return;
+    }
+    if (providerFor(m_chatModel) == QLatin1String("openrouter")) {
+        askOpenRouter(projectKey, artifactIndex, q);
         return;
     }
     Channel *c = ensureChannel(m_chatModel, m_chatEffort);
@@ -2536,7 +2572,8 @@ void Backend::warmChannel()
 
 Backend::Channel *Backend::ensureChannel(const QString &model, const QString &effort)
 {
-    if (m_mode != Mode::Live || providerFor(model) == QLatin1String("openai-compat"))
+    const QString prov = providerFor(model);
+    if (m_mode != Mode::Live || prov == QLatin1String("openai-compat") || prov == QLatin1String("openrouter"))
         return nullptr;
     const QString key = channelKeyFor(model, effort);
     if (key.isEmpty())
@@ -2733,6 +2770,48 @@ void Backend::askOpenAiCompat(const QString &projectKey, int artifactIndex, cons
     req.apiKey = key;
     req.payload = buildTieredChatRequest(p);
     router->startStream(req);  // replaces any quick ask still streaming
+}
+
+QString Backend::openrouterKey() const
+{
+    QString key = m_openrouterKey;
+    if (key.isEmpty())
+        key = qEnvironmentVariable("OPENROUTER_API_KEY").trimmed();
+    return key;
+}
+
+void Backend::askOpenRouter(const QString &projectKey, int artifactIndex, const QString &question)
+{
+    const QString key = openrouterKey();
+    if (key.isEmpty()) {
+        m_quickAnswer = QStringLiteral("Set OPENROUTER_API_KEY (env) or openrouterApiKey in studio_prefs.json");
+        finishQuick(false);
+        return;
+    }
+    if (m_suggestReply) {
+        m_suggestReply->disconnect(this);
+        m_suggestReply->abort();
+        m_suggestReply->deleteLater();
+        m_suggestReply.clear();
+    }
+    m_quickChannel = channelKeyFor(m_chatModel, m_chatEffort);
+    LlmRouter *router = llmRouter();
+    if (!router) {
+        m_quickAnswer = QStringLiteral("openrouter: no router");
+        finishQuick(false);
+        return;
+    }
+    // Same tiers as the compat ask (the shared ring rides in Tier 2), but the picked model and
+    // effort, and OpenRouter's reasoning / provider routing instead of chat_template_kwargs.
+    TieredPrompt p = tieredPrompt(projectKey, contextSlice(projectKey, artifactIndex), question, m_sharedHistory);
+    p.model = m_chatModel;
+    p.effort = m_chatEffort;
+    LlmStreamRequest req;
+    req.streamId = QString::fromLatin1(kQuickStreamId);
+    req.endpoint = QStringLiteral("https://openrouter.ai/api/v1/chat/completions");
+    req.apiKey = key;
+    req.payload = buildOpenRouterChatRequest(p);
+    router->startStream(req);
 }
 
 // --- LlmRouter streams ----------------------------------------------------------------------
@@ -2958,6 +3037,7 @@ TieredPrompt Backend::tieredPrompt(const QString &projectKey, const QString &sli
     p.recentActions = m_recentActions;
     p.phononTail = m_phononTail;
     p.memory = memoryContext(projectKey, question);  // recall rides in Tier 3 only: the prefix stays hot
+    p.currentTime = currentTimeLine(QDateTime::currentDateTime());  // Tier 3 only: Tiers 0/1 stay APC-hot
     p.question = question;
     return p;
 }
@@ -3222,7 +3302,8 @@ void Backend::requestSuggestion(const QString &projectKey, int artifactIndex)
         return;
     }
     // A second thread on the warm codex app-server, so a suggestion never interleaves with an answer.
-    Channel *c = ensureChannel(QStringLiteral("gpt-6-luna"), QStringLiteral("low"));
+    // gpt-6-sol at low: the lightest GPT-6 left in the lineup (Luna is retired).
+    Channel *c = ensureChannel(QStringLiteral("gpt-6-sol"), QStringLiteral("low"));
     if (!c || !c->proc)
         return;
     if (c->suggestReq < 0) {
@@ -3232,7 +3313,7 @@ void Backend::requestSuggestion(const QString &projectKey, int artifactIndex)
                                     "Suggest the single most useful next question the user could ask about what is on "
                                     "screen. Reply with only the question, under 9 words."))));
     }
-    c->suggestQueue = {codexTurnParams(QString(), contextFor(projectKey, artifactIndex), QStringLiteral("gpt-6-luna"),
+    c->suggestQueue = {codexTurnParams(QString(), contextFor(projectKey, artifactIndex), QStringLiteral("gpt-6-sol"),
                                        QStringLiteral("low"))};
     flushCodex(c);
 }
@@ -4913,8 +4994,13 @@ QString Backend::spawnAgent(const QString &projectKey, const QString &task, bool
         emit uiActionRequested(QStringLiteral("spawn_agent"), t);
         return QStringLiteral("Sent to the %1 agent: %2").arg(p->name, clampWords(t, 14));
     }
-    const QString dir = QDir::cleanPath(expandHome(p->dir));
-    if (p->dir.trimmed().isEmpty() || isScratchDir(dir))
+    // A $HOME scratch tab ("~tab:*", or any session living in $HOME) spawns in $HOME; only an
+    // empty or temp folder (/tmp, the system temp dir, /) is refused.
+    const QString homeDir = QDir::cleanPath(home());
+    QString dir = QDir::cleanPath(expandHome(p->dir));
+    if (p->dir.trimmed().isEmpty() && p->key.startsWith(QLatin1String("~tab:")))
+        dir = homeDir;
+    if (dir != homeDir && (p->dir.trimmed().isEmpty() || isScratchDir(dir)))
         return QStringLiteral("%1 has no project folder (scratch or /tmp); open a real project to spawn an agent.").arg(p->name);
     emit uiActionRequested(QStringLiteral("spawn_agent"), t);
     startSession(dir, QStringLiteral("claude"), QStringLiteral("claude-opus-5-5"), t);

@@ -14,6 +14,7 @@
 #include "core/types.hpp"
 
 #include <QByteArray>
+#include <QDateTime>
 #include <QJsonArray>
 #include <QString>
 #include <QStringList>
@@ -38,7 +39,18 @@ struct TieredPrompt {
     QString phononTail;
     QString memory;               // cross-session recall ("Relevant past conversations:")
     QString question;
+    // Wall-clock line ("Current time: 6:16 pm"), Tier 3 only so Tiers 0/1 stay byte-stable and
+    // APC-hot. Empty = omitted (deterministic tests); Backend::tieredPrompt fills it.
+    QString currentTime;
 };
+
+// "Current time: 6:16 pm" from the local clock (12-hour, lowercase am/pm).
+QString currentTimeLine(const QDateTime &now);
+
+// OpenRouter: the same tiered messages, no chat_template_kwargs / reasoning_effort; instead
+// reasoning.effort ("none" for fast / none) and provider routing (Wafer, InferenceNet, Nebius
+// by latency, fallbacks allowed).
+QByteArray buildOpenRouterChatRequest(const TieredPrompt &p);
 
 // "fast" and "none": the request sends chat_template_kwargs.enable_thinking = false and no
 // reasoning_effort (Qwen3.8 no_think). Any other non-empty effort rides as reasoning_effort.

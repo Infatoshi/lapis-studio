@@ -1,7 +1,8 @@
 import QtQuick
 
-// Cmd+, : a centred OLED card. Mode (Neovim / Gaming / Mouse), UI scale, default model and
-// effort, model suggestions, and the active keybinds. j/k (w/s, Up/Down) pick a row, h/l (a/d,
+// Cmd+, : a centred OLED card. Rows run most-used first: Model (every model visible at once),
+// Default Effort, Controller Mapping, Ambient Voice, Navigation Mode, Theme, UI Scale, Code Diffs,
+// Model Suggestions; then the active keybinds. j/k (w/s, Up/Down) pick a row, h/l (a/d,
 // Left/Right) change it, Esc or Cmd+, closes. Everything is clickable too.
 FocusScope {
     id: root
@@ -12,6 +13,18 @@ FocusScope {
     signal closed()
     signal openControllerMap()
 
+    // Row indices, most frequently used first. StudioApp opens on modelRow for "model settings".
+    readonly property int modelRow: 0
+    readonly property int effortRow: 1
+    readonly property int controllerRow: 2
+    readonly property int ambientRow: 3
+    readonly property int navRow: 4
+    readonly property int themeRow: 5
+    readonly property int scaleRow: 6
+    readonly property int diffsRow: 7
+    readonly property int suggestRow: 8
+    readonly property int rowCount: 9
+
     readonly property string mode: backend ? backend.navMode : "controller"
     readonly property var modes: [
         { id: "controller", name: "Controller", tag: "Recommended" },
@@ -19,11 +32,15 @@ FocusScope {
         { id: "wasd", name: "Gaming", tag: "" },
         { id: "mouse", name: "Mouse", tag: "" }
     ]
-    readonly property int rowCount: 8
     readonly property var themes: [
         { id: "gold", name: "Gold" },
         { id: "lapis", name: "Lapis Blue" }
     ]
+    readonly property var models: backend ? backend.models : []
+    function providerName(p) {
+        return p === "anthropic" ? "Anthropic" : p === "openai" ? "OpenAI" : p === "google" ? "Google"
+             : p === "openrouter" ? "OpenRouter" : p === "openai-compat" ? "Local vLLM" : p;
+    }
     readonly property var keybinds: mode === "controller" ? [
             ["✕", "confirm"], ["○", "back"], ["△", "tab"], ["□", "prose"],
             ["L1 R1", "slide"], ["L2 R2", "zoom"], ["☰", "settings"], ["pad", "new session"]]
@@ -76,19 +93,20 @@ FocusScope {
         if (!backend)
             return;
         switch (row) {
-        case 0: {
+        case modelRow: backend.cycleModel(d); break;
+        case effortRow: backend.cycleEffort(d); break;
+        case controllerRow: openControllerMap(); break;
+        case ambientRow: backend.ambientVoiceEnabled = d > 0; break;
+        case navRow: {
             const ids = modes.map(m => m.id);
             const i = Math.max(0, ids.indexOf(mode));
             backend.navMode = ids[Math.max(0, Math.min(ids.length - 1, i + d))];
             break;
         }
-        case 1: backend.zoomBy(d > 0 ? 1.1 : 1 / 1.1); break;
-        case 2: backend.cycleModel(d); break;
-        case 3: backend.cycleEffort(d); break;
-        case 4: backend.modelSuggestions = d > 0; break;
-        case 5: backend.theme = d > 0 ? "lapis" : "gold"; break;
-        case 6: openControllerMap(); break;
-        case 7: backend.showCodeDiffs = d > 0; break;
+        case themeRow: backend.theme = d > 0 ? "lapis" : "gold"; break;
+        case scaleRow: backend.zoomBy(d > 0 ? 1.1 : 1 / 1.1); break;
+        case diffsRow: backend.showCodeDiffs = d > 0; break;
+        case suggestRow: backend.modelSuggestions = d > 0; break;
         }
     }
 
@@ -113,7 +131,7 @@ FocusScope {
         } else if (k === Qt.Key_Left || k === Qt.Key_H || k === Qt.Key_A) {
             change(-1);
         } else if (k === Qt.Key_Return || k === Qt.Key_Enter) {
-            if (row === 6)
+            if (row === controllerRow)
                 openControllerMap();
             else
                 hide();
@@ -135,8 +153,8 @@ FocusScope {
         id: card
         objectName: "settingsCard"
         anchors.centerIn: parent
-        width: 900
-        height: content.height + 76
+        width: 1000
+        height: content.height + 68
         radius: 28
         color: "#000000"
         border.width: 1.5
@@ -146,13 +164,13 @@ FocusScope {
         Column {
             id: content
             x: 44
-            y: 38
+            y: 32
             width: parent.width - 88
-            spacing: 6
+            spacing: 4
 
             Item {
                 width: parent.width
-                height: 54
+                height: 48
                 Text {
                     text: "Settings"
                     color: Theme.ink
@@ -171,10 +189,145 @@ FocusScope {
                 }
             }
 
-            // 0. Mode
+            // 0. Model: every model in the lineup, visible and clickable at once.
             SettingRow {
-                index: 0
-                caption: "Mode"
+                index: root.modelRow
+                caption: "Model"
+                stacked: true
+                height: 30 + modelGrid.height + 14
+                Grid {
+                    id: modelGrid
+                    objectName: "settingsModelGrid"
+                    columns: 5
+                    columnSpacing: 10
+                    rowSpacing: 10
+                    readonly property real chipW: (width - columnSpacing * (columns - 1)) / columns
+                    width: parent.width
+                    Repeater {
+                        model: root.models
+                        Rectangle {
+                            required property var modelData
+                            objectName: "settingsModelChip"
+                            readonly property bool current: root.backend && root.backend.chatModel === modelData.id
+                            width: modelGrid.chipW
+                            height: 54
+                            radius: 14
+                            color: current ? Theme.goldA(0.14) : "transparent"
+                            border.width: 1.5
+                            border.color: current ? Theme.gold : Theme.line
+                            Column {
+                                anchors.centerIn: parent
+                                spacing: 3
+                                Text {
+                                    anchors.horizontalCenter: parent.horizontalCenter
+                                    text: modelData.label
+                                    color: parent.parent.current ? Theme.gold : Theme.ink
+                                    font.family: Theme.sans
+                                    font.pixelSize: 15
+                                    font.weight: Font.DemiBold
+                                }
+                                Text {
+                                    anchors.horizontalCenter: parent.horizontalCenter
+                                    text: modelData.speed + " · " + root.providerName(modelData.provider)
+                                    color: Theme.dim
+                                    font.family: Theme.mono
+                                    font.pixelSize: 11
+                                }
+                            }
+                            TapHandler {
+                                onTapped: { root.row = root.modelRow; if (root.backend) root.backend.chatModel = modelData.id; }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 1. Default effort (the chips the selected model accepts)
+            SettingRow {
+                index: root.effortRow
+                caption: "Default Effort"
+                Row {
+                    spacing: 8
+                    anchors.verticalCenter: parent.verticalCenter
+                    Repeater {
+                        model: root.backend ? root.backend.chatEfforts : []
+                        Rectangle {
+                            required property string modelData
+                            objectName: "settingsEffort"
+                            readonly property bool current: root.backend && root.backend.chatEffort === modelData
+                            width: effText.implicitWidth + 24
+                            height: 32
+                            radius: 16
+                            color: current ? Theme.gold : "transparent"
+                            border.width: current ? 0 : 1
+                            border.color: Theme.faint
+                            Text {
+                                id: effText
+                                anchors.centerIn: parent
+                                text: parent.modelData
+                                color: parent.current ? "#000000" : Theme.dim
+                                font.family: Theme.mono
+                                font.pixelSize: 15
+                            }
+                            TapHandler { onTapped: { root.row = root.effortRow; if (root.backend) root.backend.chatEffort = parent.modelData; } }
+                        }
+                    }
+                }
+            }
+
+            // 2. Controller mapping
+            SettingRow {
+                index: root.controllerRow
+                caption: "Controller"
+                Row {
+                    spacing: 14
+                    anchors.verticalCenter: parent.verticalCenter
+                    Rectangle {
+                        width: ctrlMapLbl.implicitWidth + 28
+                        height: 36
+                        radius: 18
+                        color: root.row === root.controllerRow ? "#1b1408" : "#11100e"
+                        border.width: 1
+                        border.color: root.row === root.controllerRow ? Theme.gold : Theme.line
+                        Text {
+                            id: ctrlMapLbl
+                            anchors.centerIn: parent
+                            text: "Controller Mapping  →"
+                            color: root.row === root.controllerRow ? Theme.gold : Theme.ink
+                            font.family: Theme.sans
+                            font.pixelSize: 15
+                            font.weight: Font.Medium
+                        }
+                        TapHandler { onTapped: { root.row = root.controllerRow; root.openControllerMap(); } }
+                    }
+                    Text {
+                        text: "Remap DualShock 4 buttons, triggers, and sticks (C)"
+                        color: Theme.dim
+                        font.family: Theme.sans
+                        font.pixelSize: 14
+                        anchors.verticalCenter: parent.verticalCenter
+                    }
+                }
+            }
+
+            // 3. Ambient voice
+            SettingRow {
+                index: root.ambientRow
+                caption: "Ambient Voice"
+                OnOffPills {
+                    objectName: "settingsAmbient"
+                    rowIndex: root.ambientRow
+                    on: root.backend ? root.backend.ambientVoiceEnabled : false
+                    firstOn: true
+                    note: on ? "Spoken lines become Studio actions" : "Voice only when held"
+                    onPicked: (v) => { if (root.backend) root.backend.ambientVoiceEnabled = v; }
+                }
+            }
+
+            // 4. Navigation mode
+            SettingRow {
+                index: root.navRow
+                caption: "Navigation Mode"
                 Row {
                     spacing: 12
                     anchors.verticalCenter: parent.verticalCenter
@@ -212,15 +365,51 @@ FocusScope {
                                     anchors.verticalCenter: parent.verticalCenter
                                 }
                             }
-                            TapHandler { onTapped: { root.row = 0; if (root.backend) root.backend.navMode = modelData.id; } }
+                            TapHandler { onTapped: { root.row = root.navRow; if (root.backend) root.backend.navMode = modelData.id; } }
                         }
                     }
                 }
             }
 
-            // 1. UI scale
+            // 5. Accent theme
             SettingRow {
-                index: 1
+                index: root.themeRow
+                caption: "Theme"
+                Row {
+                    spacing: 12
+                    anchors.verticalCenter: parent.verticalCenter
+                    Repeater {
+                        model: root.themes
+                        Rectangle {
+                            required property var modelData
+                            objectName: "settingsTheme"
+                            readonly property bool current: (root.backend ? root.backend.theme : "gold") === modelData.id
+                            // No colour swatch: gold mode must stay free of blue pixels, and the
+                            // selected pill already shows its accent.
+                            width: themeName.implicitWidth + 36
+                            height: 40
+                            radius: 20
+                            color: current ? Theme.goldA(0.14) : "transparent"
+                            border.width: 1.5
+                            border.color: current ? Theme.gold : Theme.line
+                            Text {
+                                id: themeName
+                                anchors.centerIn: parent
+                                text: parent.modelData.name
+                                color: parent.current ? Theme.gold : Theme.dim
+                                font.family: Theme.sans
+                                font.pixelSize: 18
+                                font.weight: Font.DemiBold
+                            }
+                            TapHandler { onTapped: { root.row = root.themeRow; if (root.backend) root.backend.theme = modelData.id; } }
+                        }
+                    }
+                }
+            }
+
+            // 6. UI scale
+            SettingRow {
+                index: root.scaleRow
                 caption: "UI Scale"
                 Row {
                     spacing: 18
@@ -257,205 +446,43 @@ FocusScope {
                 }
             }
 
-            // 2. Default model
-            SettingRow {
-                index: 2
-                caption: "Default Model"
-                Row {
-                    spacing: 16
-                    anchors.verticalCenter: parent.verticalCenter
-                    Text {
-                        objectName: "settingsModel"
-                        text: root.backend ? root.backend.shortModelLabel(root.backend.chatModel) + "  ·  "
-                                             + root.backend.modelSpeed(root.backend.chatModel) : ""
-                        color: Theme.ink
-                        font.family: Theme.sans
-                        font.pixelSize: 19
-                        font.weight: Font.DemiBold
-                        anchors.verticalCenter: parent.verticalCenter
-                        TapHandler { onTapped: { root.row = 2; if (root.backend) root.backend.cycleModel(1); } }
-                    }
-                    Text {
-                        text: root.backend ? (root.backend.chatProvider === "anthropic" ? "Anthropic · claude stream-json"
-                              : root.backend.chatProvider === "openai" ? "OpenAI · codex app-server"
-                              : "Google · agy stream-json") : ""
-                        color: Theme.dim
-                        font.family: Theme.mono
-                        font.pixelSize: 14
-                        anchors.verticalCenter: parent.verticalCenter
-                    }
-                }
-            }
-
-            // 3. Default effort
-            SettingRow {
-                index: 3
-                caption: "Default Effort"
-                Row {
-                    spacing: 8
-                    anchors.verticalCenter: parent.verticalCenter
-                    Repeater {
-                        model: root.backend ? root.backend.chatEfforts : []
-                        Rectangle {
-                            required property string modelData
-                            readonly property bool current: root.backend && root.backend.chatEffort === modelData
-                            width: effText.implicitWidth + 24
-                            height: 32
-                            radius: 16
-                            color: current ? Theme.gold : "transparent"
-                            border.width: current ? 0 : 1
-                            border.color: Theme.faint
-                            Text {
-                                id: effText
-                                anchors.centerIn: parent
-                                text: parent.modelData
-                                color: parent.current ? "#000000" : Theme.dim
-                                font.family: Theme.mono
-                                font.pixelSize: 15
-                            }
-                            TapHandler { onTapped: { root.row = 3; if (root.backend) root.backend.chatEffort = parent.modelData; } }
-                        }
-                    }
-                }
-            }
-
-            // 4. Model suggestions for the Tab predictor
-            SettingRow {
-                index: 4
-                caption: "Model Hints"
-                Row {
-                    spacing: 16
-                    anchors.verticalCenter: parent.verticalCenter
-                    Rectangle {
-                        width: 52
-                        height: 28
-                        radius: 14
-                        color: root.backend && root.backend.modelSuggestions ? Theme.gold : Theme.track
-                        anchors.verticalCenter: parent.verticalCenter
-                        Rectangle {
-                            width: 22; height: 22; radius: 11
-                            y: 3
-                            x: root.backend && root.backend.modelSuggestions ? 27 : 3
-                            color: "#000000"
-                        }
-                        TapHandler { onTapped: { root.row = 4; if (root.backend) root.backend.modelSuggestions = !root.backend.modelSuggestions; } }
-                    }
-                    Text {
-                        text: root.backend && root.backend.modelSuggestions ? "Tab prompts come from fast model, warm" : "Tab prompts from local heuristics only"
-                        color: Theme.dim
-                        font.family: Theme.sans
-                        font.pixelSize: 15
-                        anchors.verticalCenter: parent.verticalCenter
-                    }
-                }
-            }
-
-            // 5. Accent theme
-            SettingRow {
-                index: 5
-                caption: "Theme"
-                Row {
-                    spacing: 12
-                    anchors.verticalCenter: parent.verticalCenter
-                    Repeater {
-                        model: root.themes
-                        Rectangle {
-                            required property var modelData
-                            objectName: "settingsTheme"
-                            readonly property bool current: (root.backend ? root.backend.theme : "gold") === modelData.id
-                            // No colour swatch: gold mode must stay free of blue pixels, and the
-                            // selected pill already shows its accent.
-                            width: themeName.implicitWidth + 36
-                            height: 40
-                            radius: 20
-                            color: current ? Theme.goldA(0.14) : "transparent"
-                            border.width: 1.5
-                            border.color: current ? Theme.gold : Theme.line
-                            Text {
-                                id: themeName
-                                anchors.centerIn: parent
-                                text: parent.modelData.name
-                                color: parent.current ? Theme.gold : Theme.dim
-                                font.family: Theme.sans
-                                font.pixelSize: 18
-                                font.weight: Font.DemiBold
-                            }
-                            TapHandler { onTapped: { root.row = 5; if (root.backend) root.backend.theme = modelData.id; } }
-                        }
-                    }
-                }
-            }
-
-            SettingRow {
-                index: 6
-                caption: "Controller"
-                Row {
-                    spacing: 14
-                    Rectangle {
-                        width: ctrlMapLbl.implicitWidth + 28
-                        height: 36
-                        radius: 18
-                        color: root.row === 6 ? "#1b1408" : "#11100e"
-                        border.width: 1
-                        border.color: root.row === 6 ? Theme.gold : Theme.line
-                        Text {
-                            id: ctrlMapLbl
-                            anchors.centerIn: parent
-                            text: "Controller Mapping  →"
-                            color: root.row === 6 ? Theme.gold : Theme.ink
-                            font.family: Theme.sans
-                            font.pixelSize: 15
-                            font.weight: Font.Medium
-                        }
-                        TapHandler { onTapped: { root.row = 6; root.openControllerMap(); } }
-                    }
-                    Text {
-                        text: "Remap DualShock 4 buttons, triggers, and sticks (C)"
-                        color: Theme.dim
-                        font.family: Theme.sans
-                        font.pixelSize: 14
-                        anchors.verticalCenter: parent.verticalCenter
-                    }
-                }
-            }
-
             // 7. Code diffs on the Stage (visual-first: off by default; the Stage's Code pill too)
             SettingRow {
-                index: 7
+                index: root.diffsRow
                 caption: "Code Diffs"
-                Row {
-                    spacing: 16
-                    anchors.verticalCenter: parent.verticalCenter
-                    Rectangle {
-                        objectName: "settingsCodeDiffs"
-                        width: 52
-                        height: 28
-                        radius: 14
-                        color: root.backend && root.backend.showCodeDiffs ? Theme.gold : Theme.track
-                        anchors.verticalCenter: parent.verticalCenter
-                        Rectangle {
-                            width: 22; height: 22; radius: 11
-                            y: 3
-                            x: root.backend && root.backend.showCodeDiffs ? 27 : 3
-                            color: "#000000"
-                        }
-                        TapHandler { onTapped: { root.row = 7; if (root.backend) root.backend.showCodeDiffs = !root.backend.showCodeDiffs; } }
-                    }
-                    Text {
-                        text: root.backend && root.backend.showCodeDiffs ? "Diffs follow the visuals on the Stage" : "Stage shows results only; diffs on request"
-                        color: Theme.dim
-                        font.family: Theme.sans
-                        font.pixelSize: 15
-                        anchors.verticalCenter: parent.verticalCenter
-                    }
+                OnOffPills {
+                    objectName: "settingsCodeDiffs"
+                    rowIndex: root.diffsRow
+                    on: root.backend ? root.backend.showCodeDiffs : false
+                    firstOn: false
+                    note: on ? "Diffs follow the visuals on the Stage" : "Stage shows results only; diffs on request"
+                    onPicked: (v) => { if (root.backend) root.backend.showCodeDiffs = v; }
                 }
             }
 
-            Item { width: 1; height: 14 }
-            Rectangle { width: parent.width; height: 1; color: Theme.line }
-            Item { width: 1; height: 10 }
+            // 8. Model suggestions for the Tab predictor
+            SettingRow {
+                index: root.suggestRow
+                caption: "Model Suggestions"
+                OnOffPills {
+                    objectName: "settingsSuggestions"
+                    rowIndex: root.suggestRow
+                    on: root.backend ? root.backend.modelSuggestions : false
+                    firstOn: true
+                    note: on ? "Tab prompts come from fast model, warm" : "Tab prompts from local heuristics only"
+                    onPicked: (v) => { if (root.backend) root.backend.modelSuggestions = v; }
+                }
+            }
 
+            Item { width: 1; height: 12 }
+            Rectangle { width: parent.width; height: 1; color: Theme.line }
+            Item { width: 1; height: 8 }
+
+            // With a pad connected in Controller mode, the live PS4 section below replaces the
+            // generic glyph list (same buttons), so the card still fits a 1080 p window.
+            readonly property bool showKeybinds: !(root.padConnected && root.mode === "controller")
             Text {
+                visible: content.showKeybinds
                 text: "Keybinds"
                 color: Theme.dim
                 font.family: Theme.sans
@@ -466,6 +493,7 @@ FocusScope {
             }
             Grid {
                 objectName: "settingsKeybinds"
+                visible: content.showKeybinds
                 columns: 2
                 columnSpacing: 40
                 rowSpacing: 10
@@ -494,7 +522,7 @@ FocusScope {
             }
 
             // PS4 Controller: only while a pad is connected (the window enables it; offscreen never).
-            Item { width: 1; height: 14; visible: root.padConnected }
+            Item { width: 1; height: 14; visible: root.padConnected && content.showKeybinds }
             Item {
                 width: parent.width
                 height: 24
@@ -563,13 +591,55 @@ FocusScope {
         }
     }
 
+    // Two pills (On / Off, in the order the row reads best) and a one-line note.
+    component OnOffPills: Row {
+        id: oo
+        property int rowIndex: 0
+        property bool on: false
+        property bool firstOn: true
+        property string note: ""
+        signal picked(bool value)
+        spacing: 12
+        anchors.verticalCenter: parent ? parent.verticalCenter : undefined
+        Repeater {
+            model: oo.firstOn ? [true, false] : [false, true]
+            Rectangle {
+                required property bool modelData
+                readonly property bool current: oo.on === modelData
+                width: 72
+                height: 34
+                radius: 17
+                color: current ? Theme.goldA(0.14) : "transparent"
+                border.width: 1.5
+                border.color: current ? Theme.gold : Theme.line
+                Text {
+                    anchors.centerIn: parent
+                    text: parent.modelData ? "On" : "Off"
+                    color: parent.current ? Theme.gold : Theme.dim
+                    font.family: Theme.sans
+                    font.pixelSize: 16
+                    font.weight: Font.DemiBold
+                }
+                TapHandler { onTapped: { root.row = oo.rowIndex; oo.picked(parent.modelData); } }
+            }
+        }
+        Text {
+            text: oo.note
+            color: Theme.dim
+            font.family: Theme.sans
+            font.pixelSize: 15
+            anchors.verticalCenter: parent.verticalCenter
+        }
+    }
+
     component SettingRow: Item {
         id: sr
         property int index: 0
         property string caption: ""
+        property bool stacked: false  // caption above a full-width body (the Model grid)
         default property alias content: body.data
         width: parent ? parent.width : 0
-        height: 62
+        height: 56
         Rectangle {
             anchors.fill: parent
             anchors.leftMargin: -18
@@ -579,16 +649,16 @@ FocusScope {
         }
         Rectangle {
             x: -18
+            y: sr.stacked ? 8 : (sr.height - height) / 2
             width: 3
             height: 26
             radius: 1.5
-            anchors.verticalCenter: parent.verticalCenter
             color: Theme.gold
             visible: root.row === sr.index
         }
         Text {
             width: 170
-            anchors.verticalCenter: parent.verticalCenter
+            y: sr.stacked ? 10 : (sr.height - height) / 2
             text: sr.caption
             color: root.row === sr.index ? Theme.ink : Theme.dim
             font.family: Theme.sans
@@ -597,9 +667,10 @@ FocusScope {
         }
         Item {
             id: body
-            x: 180
-            width: parent.width - 180
-            height: parent.height
+            x: sr.stacked ? 0 : 180
+            y: sr.stacked ? 36 : 0
+            width: parent.width - x
+            height: sr.stacked ? parent.height - y : parent.height
         }
     }
 }

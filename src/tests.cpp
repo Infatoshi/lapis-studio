@@ -557,43 +557,51 @@ void unitTests()
         check(b.chatEffort() == "xhigh", "picker: D/l x3 -> xhigh", b.chatEffort());
         b.cycleEffort(1);
         check(b.chatEffort() == "xhigh", "picker: effort stops at the model's top (no wrap)", b.chatEffort());
-        b.cycleModel(-1);  // W / k / Up from the first model wraps to the last (qwen3.8-flash-next)
+        // Catalog order: DeepSeek, Qwen, Fable, Opus, Sonnet, Astra, Sol, Carbon, Neon, Hydrogen.
+        b.cycleModel(-1);
+        check(b.chatModel() == "claude-opus-5-5" && b.chatEffort() == "xhigh" && b.chatProvider() == "anthropic",
+              "picker: W from Sonnet steps to Opus 5.5, xhigh kept", b.chatModel() + " " + b.chatEffort());
+        b.cycleModel(-1);
+        b.cycleModel(-1);
         check(b.chatModel() == "qwen3.8-flash-next" && b.chatEffort() == "fast" && b.chatProvider() == "openai-compat",
-              "picker: W wraps to Qwen3.8 Flash and lands on no-think fast", b.chatModel() + " " + b.chatEffort());
+              "picker: W x2 -> Qwen3.8 Flash Next on no-think fast", b.chatModel() + " " + b.chatEffort());
         b.cycleModel(-1);
-        check(b.chatModel() == "gemini-4-argon" && b.chatEffort() == "high" && b.chatProvider() == "google",
-              "picker: W steps to Gemini 4 Argon", b.chatModel() + " " + b.chatEffort());
+        check(b.chatModel() == "deepseek/deepseek-v4.1-flash-1017" && b.chatEffort() == "fast"
+                  && b.chatProvider() == "openrouter" && b.chatEfforts() == QStringList({"fast", "low", "medium", "high"}),
+              "picker: W -> DeepSeek V4.1 Flash (OpenRouter), fast default",
+              b.chatModel() + " " + b.chatEffort() + " " + b.chatEfforts().join(','));
+        b.cycleModel(-1);  // wraps from the first model to the last
+        check(b.chatModel() == "gemini-4-hydrogen" && b.chatEffort() == "xhigh" && b.chatProvider() == "google",
+              "picker: W wraps to Gemini 4 Hydrogen; leaving fast restores xhigh", b.chatModel() + " " + b.chatEffort());
         b.cycleModel(-1);
-        check(b.chatModel() == "gemini-4-hydrogen" && b.chatEfforts().contains("xhigh"), "picker: hydrogen offers xhigh",
+        check(b.chatModel() == "gemini-4-neon" && b.chatEfforts().contains("xhigh"), "picker: Neon offers xhigh",
               b.chatEfforts().join(','));
-        b.cycleEffort(1);
-        check(b.chatEffort() == "xhigh", "picker: D on hydrogen -> xhigh", b.chatEffort());
-        for (int i = 0; i < 3; ++i)
-            b.cycleModel(-1);
-        check(b.chatModel() == "gpt-6-luna" && b.chatEffort() == "high" && b.chatProvider() == "openai",
-              "picker: W x3 -> GPT-6 Luna, xhigh clamps to high", b.chatModel() + " " + b.chatEffort());
+        b.cycleModel(-1);
+        check(b.chatModel() == "gemini-4-carbon" && b.chatEffort() == "high",
+              "picker: W -> Gemini 4 Carbon, xhigh clamps to high", b.chatModel() + " " + b.chatEffort());
         b.cycleEffort(-1);
         b.cycleEffort(-1);
         b.cycleEffort(-1);
         check(b.chatEffort() == "low", "picker: A x3 -> low (stops at low)", b.chatEffort());
+        b.cycleModel(-1);
+        check(b.chatModel() == "gpt-6-sol" && b.chatProvider() == "openai", "picker: W crosses Google -> OpenAI", b.chatModel());
         b.cycleModel(1);
         b.cycleModel(1);
-        check(b.chatModel() == "gemini-4-carbon", "picker: S x2 crosses OpenAI -> Google", b.chatModel());
-        int perProvider[4] = {0, 0, 0, 0};
-        for (const ModelSpec &m : modelCatalog()) {
-            const int idx = m.provider == "anthropic" ? 0
-                          : m.provider == "openai"    ? 1
-                          : m.provider == "google"    ? 2 : 3;
-            perProvider[idx] += 1;
+        check(b.chatModel() == "gemini-4-neon", "picker: S x2 back across to Neon", b.chatModel());
+        QStringList ids;
+        for (const ModelSpec &m : modelCatalog())
+            ids << m.id;
+        check(ids == QStringList({"deepseek/deepseek-v4.1-flash-1017", "qwen3.8-flash-next", "claude-fable-5-2",
+                                  "claude-opus-5-5", "claude-sonnet-5-5", "gpt-6-astra", "gpt-6-sol", "gemini-4-carbon",
+                                  "gemini-4-neon", "gemini-4-hydrogen"}),
+              "picker: exactly the curated 10-model lineup, in order", ids.join(','));
+        for (const char *gone : {"gpt-6-luna", "gemini-3.8-flash", "gemini-4-argon", "claude-haiku-5-5"}) {
+            b.setChatModel(gone);
+            check(b.chatModel() == "gemini-4-neon" && providerFor(gone).isEmpty(), "picker: retired model is not selectable", gone);
         }
-        check(modelCatalog().size() == 12 && perProvider[0] == 4 && perProvider[1] == 3 && perProvider[2] == 4
-                  && perProvider[3] == 1,
-              "picker: 4 Claude + 3 GPT-6 + 4 Gemini + 1 OpenAI-compat models");
-        b.setChatModel("gpt-5");
-        check(b.chatModel() == "gemini-4-carbon", "picker: unknown model ignored");
-        b.setChatEffort("xhigh");
+        b.setChatEffort("fast");
         check(b.chatEffort() == "low", "picker: an effort the model lacks is ignored", b.chatEffort());
-        check(clampEffort("claude-haiku-5-5", "xhigh") == "high" && clampEffort("gpt-6-astra", "xhigh") == "xhigh",
+        check(clampEffort("gemini-4-carbon", "xhigh") == "high" && clampEffort("gpt-6-astra", "xhigh") == "xhigh",
               "picker: clampEffort per model");
 
         // Channel routing: one daemon per provider channel, reused across turns.
@@ -640,15 +648,15 @@ void unitTests()
     // codex app-server JSON-RPC framing: one compact object per line, requests carry ids,
     // notifications do not, turn/start carries model + effort + summary.
     {
-        const QByteArray line = codexRpc(7, "turn/start", codexTurnParams("th1", "hi", "gpt-6-luna", "xhigh"));
+        const QByteArray line = codexRpc(7, "turn/start", codexTurnParams("th1", "hi", "gpt-6-sol", "high"));
         check(line.endsWith('\n') && line.count('\n') == 1, "codex: one JSON object per line");
         const QJsonObject o = QJsonDocument::fromJson(line).object();
         const QJsonObject p = o.value("params").toObject();
         check(o.value("id").toInt() == 7 && o.value("method").toString() == "turn/start" && p.value("threadId").toString() == "th1"
-                  && p.value("model").toString() == "gpt-6-luna" && p.value("effort").toString() == "high"
+                  && p.value("model").toString() == "gpt-6-sol" && p.value("effort").toString() == "high"
                   && p.value("summary").toString() == "concise"
                   && p.value("input").toArray().at(0).toObject().value("text").toString() == "hi",
-              "codex: turn/start params (model, clamped effort, summary)", QString::fromUtf8(line));
+              "codex: turn/start params (model, effort, summary)", QString::fromUtf8(line));
         const QJsonObject ts = codexThreadStartParams("be brief");
         check(ts.value("approvalPolicy").toString() == "never" && ts.value("sandbox").toString() == "read-only"
                   && ts.value("ephemeral").toBool() && ts.value("developerInstructions").toString() == "be brief",
@@ -702,9 +710,12 @@ void unitTests()
                   && t1.value("id").toInt() != t2.value("id").toInt()
                   && t2.value("params").toObject().value("model").toString() == "gpt-6-sol",
               "codex: turn 2 reuses the thread, switches model per turn, new request id");
-        for (const char *m : {"gpt-6-astra", "gpt-6-sol", "gpt-6-luna"})
+        for (const char *m : {"gpt-6-astra", "gpt-6-sol"})
             check(channelKeyFor(m, "low") == "openai" && providerFor(m) == "openai",
-                  "codex: astra / sol / luna all ride the one app-server", m);
+                  "codex: astra / sol both ride the one app-server", m);
+        check(channelKeyFor("deepseek/deepseek-v4.1-flash-1017", "fast") == "openrouter:deepseek/deepseek-v4.1-flash-1017",
+              "openrouter: DeepSeek gets its own HTTP channel key, no daemon",
+              channelKeyFor("deepseek/deepseek-v4.1-flash-1017", "fast"));
         check(codexAppServerArgs().value(0) == "app-server" && codexAppServerArgs().contains("mcp_servers={}"),
               "codex: app-server args (no MCP servers)", codexAppServerArgs().join(' '));
     }
@@ -758,9 +769,10 @@ void unitTests()
     // Honest speed classes in the catalog and picker.
     {
         const QHash<QString, QString> want = {
-            {"claude-sonnet-5-5", "Sonnet 5.5 · Fast"}, {"gemini-3.8-flash", "Gemini 3.8 Flash · Fast"},
+            {"claude-sonnet-5-5", "Sonnet 5.5 · Fast"}, {"deepseek/deepseek-v4.1-flash-1017", "DeepSeek V4.1 Flash · Fast"},
             {"gemini-4-hydrogen", "Gemini 4 Hydrogen · Deep Think"}, {"gemini-4-carbon", "Gemini 4 Carbon · Teach"},
-            {"gpt-6-astra", "GPT-6 Astra · Frontier"}, {"gpt-6-luna", "GPT-6 Luna · Fast"}};
+            {"gpt-6-astra", "GPT 6.2 Astra · Frontier"}, {"gpt-6-sol", "GPT 6.2 Sol · Balanced"},
+            {"qwen3.8-flash-next", "Qwen3.8 Flash Next · Fast"}, {"gemini-4-neon", "Gemini 4 Neon · Balanced"}};
         for (auto it = want.cbegin(); it != want.cend(); ++it)
             check(modelDisplayLabel(it.key()) == it.value(), "catalog: model speed class label", modelDisplayLabel(it.key()));
         bool allTagged = true;
@@ -1004,14 +1016,14 @@ void unitTests()
             check(r.navMode() == "wasd" && r.chatModel() == "gemini-4-hydrogen" && r.chatEffort() == "xhigh",
                   "prefs: old 'arrows' file -> wasd; default model + effort load",
                   r.navMode() + " " + r.chatModel() + " " + r.chatEffort());
-            r.setChatModel("claude-haiku-5-5");
-            check(r.chatEffort() == "high", "prefs: switching to Haiku clamps xhigh -> high", r.chatEffort());
+            r.setChatModel("gemini-4-carbon");
+            check(r.chatEffort() == "high", "prefs: switching to Carbon clamps xhigh -> high", r.chatEffort());
             check(r.savePrefs(), "prefs: save model + effort");
         }
         {
             Backend r(Backend::Mode::Mock);
             r.setPrefsPath(path);
-            check(r.chatModel() == "claude-haiku-5-5" && r.chatEffort() == "high", "prefs: default model + effort round trip",
+            check(r.chatModel() == "gemini-4-carbon" && r.chatEffort() == "high", "prefs: default model + effort round trip",
                   r.chatModel() + " " + r.chatEffort());
         }
     }
@@ -1439,32 +1451,61 @@ void uiTests()
         QStringList texts;
         visibleWords(win, &texts);
         const QString all = texts.join('\n');
-        check(all.contains("Controller") && all.contains("Neovim") && all.contains("Gaming") && all.contains("Mouse")
+        // Rows run most-used first; the Model row shows every model in the lineup at once.
+        const QStringList captions = {"Model", "Default Effort", "Controller", "Ambient Voice", "Navigation Mode",
+                                      "Theme", "UI Scale", "Code Diffs", "Model Suggestions"};
+        int lastAt = -1;
+        bool ordered = true;
+        for (const QString &c : captions) {
+            const int at = int(texts.indexOf(c));
+            ordered = ordered && at > lastAt;
+            lastAt = at;
+        }
+        check(ordered, "settings: rows ranked Model, Effort, Controller, Ambient, Nav, Theme, Scale, Diffs, Suggestions",
+              texts.mid(0, 40).join(" | "));
+        QStringList missing;
+        for (const char *m : {"DeepSeek V4.1 Flash", "Qwen3.8 Flash Next", "Fable 5.2", "Opus 5.5", "Sonnet 5.5",
+                              "GPT 6.2 Astra", "GPT 6.2 Sol", "Gemini 4 Carbon", "Gemini 4 Neon", "Gemini 4 Hydrogen"})
+            if (!texts.contains(QString::fromUtf8(m)))
+                missing << m;
+        check(missing.isEmpty() && findItems(win->contentItem(), "settingsModelChip").size() == 10
+                  && !all.contains("Luna") && !all.contains("Gemini 3"),
+              "settings: Model grid shows all 10 models at once, no retired ones", missing.join(","));
+        check(all.contains("Neovim") && all.contains("Gaming") && all.contains("Mouse")
                   && !all.contains("arrows", Qt::CaseInsensitive),
-              "settings: Mode shows Controller / Neovim / Gaming / Mouse only");
-        check(all.contains("UI Scale") && all.contains("1.00x") && all.contains("0.75x – 1.60x") && all.contains("wheel"),
+              "settings: Navigation Mode shows Controller / Neovim / Gaming / Mouse only");
+        check(all.contains("1.00x") && all.contains("0.75x – 1.60x") && all.contains("wheel"),
               "settings: UI scale with range and wheel hint");
-        check(all.contains("Default Model") && all.contains("Sonnet 5.5") && all.contains("Default Effort"),
-              "settings: default model & effort");
         check(all.contains("confirm") && all.contains("settings"),
               "settings: Controller keybind cheat-sheet");
         QStringList pairs;
         check(textOverlaps(win, &pairs) == 0, "settings: no overlapping text", pairs.join("; "));
         check(forbiddenPixels(win->grabWindow()) == 0, "settings: no blue/green pixels");
-        sendKey(win, Qt::Key_L, Qt::NoModifier, "l");  // row 0: Mode -> Neovim
+        if (QQuickItem *card = firstItem(win, "settingsCard")) {
+            const QRectF r = card->mapRectToScene(QRectF(0, 0, card->width(), card->height()));
+            check(r.top() >= 0 && r.bottom() <= win->height(), "settings: the card fits the window",
+                  QStringLiteral("%1..%2 of %3").arg(r.top()).arg(r.bottom()).arg(win->height()));
+        }
+        sendKey(win, Qt::Key_L, Qt::NoModifier, "l");  // row 0: Model -> next in the lineup
+        check(backend.chatModel() == "gpt-6-astra", "settings: l on Model -> GPT 6.2 Astra", backend.chatModel());
+        sendKey(win, Qt::Key_H, Qt::NoModifier, "h");
+        sendKey(win, Qt::Key_J, Qt::NoModifier, "j");  // row 1: effort
+        sendKey(win, Qt::Key_L, Qt::NoModifier, "l");
+        check(backend.chatEffort() == "medium", "settings: l on Default Effort -> medium", backend.chatEffort());
+        sendKey(win, Qt::Key_H, Qt::NoModifier, "h");
+        for (int i = 0; i < 3; ++i)
+            sendKey(win, Qt::Key_J, Qt::NoModifier, "j");  // row 4: navigation mode
+        sendKey(win, Qt::Key_L, Qt::NoModifier, "l");
         settle(50);
-        check(backend.navMode() == "vim", "settings: l on Mode switches to Neovim", backend.navMode());
+        check(backend.navMode() == "vim", "settings: l on Navigation Mode switches to Neovim", backend.navMode());
         texts.clear();
         visibleWords(win, &texts);
         check(texts.join('\n').contains("h j k l"), "settings: cheat-sheet follows the mode");
         sendKey(win, Qt::Key_H, Qt::NoModifier, "h");
-        sendKey(win, Qt::Key_J, Qt::NoModifier, "j");  // row 1: UI scale
+        sendKey(win, Qt::Key_J, Qt::NoModifier, "j");
+        sendKey(win, Qt::Key_J, Qt::NoModifier, "j");  // row 6: UI scale
         sendKey(win, Qt::Key_L, Qt::NoModifier, "l");
         check(qFuzzyCompare(backend.uiScale(), 1.1), "settings: l on UI Scale zooms 10%", QString::number(backend.uiScale()));
-        sendKey(win, Qt::Key_H, Qt::NoModifier, "h");
-        sendKey(win, Qt::Key_J, Qt::NoModifier, "j");  // row 2: model
-        sendKey(win, Qt::Key_L, Qt::NoModifier, "l");
-        check(backend.chatModel() == "claude-opus-5-5", "settings: l on Default Model -> Opus 5.5", backend.chatModel());
         sendKey(win, Qt::Key_H, Qt::NoModifier, "h");
         check(app->property("selectedIsland").toInt() == 0 && app->property("lens").toInt() == 0,
               "settings: keys stay in the overlay");
@@ -2204,15 +2245,13 @@ void uiTests()
         letter(Qt::Key_W, "w");
         const QString afterW = backend.chatModel();
         letter(Qt::Key_J, "j");
-        letter(Qt::Key_J, "j");
-        letter(Qt::Key_J, "j");
-        letter(Qt::Key_J, "j");
         const QString afterJ = backend.chatModel();
         letter(Qt::Key_H, "h");
         const QString afterH = backend.chatEffort();
         sendKey(win, Qt::Key_Down);
         sendKey(win, Qt::Key_Right);
-        check(afterS == "claude-opus-5-5" && afterDD == "high" && afterW == "claude-sonnet-5-5" && afterJ == "gpt-6-astra"
+        // Lineup order: ... Fable, Opus, Sonnet, Astra, Sol, ...
+        check(afterS == "gpt-6-astra" && afterDD == "high" && afterW == "claude-sonnet-5-5" && afterJ == "gpt-6-astra"
                   && afterH == "medium" && backend.chatModel() == "gpt-6-sol" && backend.chatEffort() == "high",
               "picker: S/W/j/Down cycle models, D/h/Right cycle efforts",
               QStringList({afterS, afterDD, afterW, afterJ, afterH, backend.chatModel(), backend.chatEffort()}).join(' '));
@@ -2765,7 +2804,9 @@ void gamepadUiTests()
     }
     // □ on the constellation opens Settings on the Default Model row; ☰ toggles Settings.
     tap([](S &s) { s.x = true; });
-    check(prop(settings, "open").toBool() && prop(settings, "row").toInt() == 2, "pad ui: □ on constellation opens model settings");
+    check(prop(settings, "open").toBool() && prop(settings, "row").toInt() == prop(settings, "modelRow").toInt()
+              && prop(settings, "modelRow").toInt() == 0,
+          "pad ui: □ on constellation opens settings on the Model row (top)");
     tap([](S &s) { s.menu = true; });
     check(!prop(settings, "open").toBool(), "pad ui: ☰ closes settings");
     tap([](S &s) { s.menu = true; });
@@ -2777,15 +2818,21 @@ void gamepadUiTests()
         check(hdr && hdr->isVisible() && hdr->property("text").toString().contains("DualShock 4") && binds && binds->isVisible(),
               "pad ui: settings shows the PS4 Controller keybinds");
         scanBanned(win, "settings with pad");
+        if (QQuickItem *card = firstItem(win, "settingsCard")) {
+            const QRectF r = card->mapRectToScene(QRectF(0, 0, card->width(), card->height()));
+            check(r.top() >= 0 && r.bottom() <= win->height(), "pad ui: settings card with the PS4 section fits the window",
+                  QStringLiteral("%1..%2 of %3").arg(r.top()).arg(r.bottom()).arg(win->height()));
+        }
         check(forbiddenPixels(win->grabWindow()) == 0, "pad ui: settings pad section has zero blue/green pixels");
     }
     tap([](S &s) { s.dpadY = -1; });
     check(prop(settings, "row").toInt() == 1, "pad ui: d-pad down moves the settings row");
     {
-        const double before = backend.uiScale();
+        const QString before = backend.chatEffort();
         tap([](S &s) { s.dpadX = 1; });
-        check(backend.uiScale() > before, "pad ui: d-pad right changes the UI scale row");
-        backend.setUiScale(1.0);
+        check(backend.chatEffort() != before, "pad ui: d-pad right changes the Default Effort row",
+              before + " -> " + backend.chatEffort());
+        backend.setChatEffort(before);
     }
     tap([](S &s) { s.b = true; });
     check(!prop(settings, "open").toBool(), "pad ui: ○ closes settings");
@@ -5407,9 +5454,9 @@ void finalWiringTests()
 
     // Tier 0 local studio context rides in every compat request, byte-identical to the warm.
     {
-        b.setStudioContext("CTX-MARKER tetra 4x RTX PRO 6000");
+        b.setStudioContext("CTX-MARKER gpu-host 4x RTX PRO 6000");
         const QString key = b.projects().value(0).toMap().value("key").toString();
-        const TieredPrompt p = b.tieredPrompt(key, QString(), "what is tetra?");
+        const TieredPrompt p = b.tieredPrompt(key, QString(), "what is gpu-host?");
         const QJsonObject body = QJsonDocument::fromJson(buildTieredChatRequest(p)).object();
         const QString sys = body.value("messages").toArray().first().toObject().value("content").toString();
         const QJsonObject warm = QJsonDocument::fromJson(buildTieredWarmRequest(p)).object();
@@ -6054,9 +6101,150 @@ int snapMap(const QString &outPath)
     return saved ? 0 : 1;
 }
 
+// Quick polish: view-state persistence, $HOME spawn, Tier 3 clock, OpenRouter request.
+void polishTests()
+{
+    // viewState: normalized, persisted, reloaded; junk never lands.
+    QTemporaryDir tmp;
+    const QString path = tmp.path() + "/studio_prefs.json";
+    QString stageKey;
+    int stageArts = 0;
+    {
+        Backend b(Backend::Mode::Mock);
+        b.setPrefsPath(path);
+        for (const QVariant &v : b.projects()) {
+            const QVariantMap m = v.toMap();
+            if (m.value("artifacts").toList().size() > stageArts) {
+                stageArts = int(m.value("artifacts").toList().size());
+                stageKey = m.value("key").toString();
+            }
+        }
+        b.setViewState({{"lens", "nonsense"}, {"focusedProject", stageKey}});
+        check(b.viewState().isEmpty(), "viewState: an unknown lens is dropped");
+        b.setViewState({{"lens", "stage"}, {"focusedProject", stageKey}, {"artifactIndex", 99}, {"needsMeOnly", true}});
+        check(b.savePrefs(), "viewState: prefs flush");
+        QFile f(path);
+        f.open(QIODevice::ReadOnly);
+        const QJsonObject vs = QJsonDocument::fromJson(f.readAll()).object().value("viewState").toObject();
+        check(vs.value("lens").toString() == "stage" && vs.value("focusedProject").toString() == stageKey
+                  && vs.value("artifactIndex").toInt() == 99 && vs.value("needsMeOnly").toBool(),
+              "viewState: written to studio_prefs.json", QString::fromUtf8(QJsonDocument(vs).toJson(QJsonDocument::Compact)));
+    }
+    check(stageArts > 1, "viewState: a fixture with several artifacts exists", stageKey);
+    {
+        // Restore on startup: Stage, the saved project, artifact clamped, Needs Me filter back on.
+        Backend b(Backend::Mode::Mock);
+        b.setPrefsPath(path);
+        check(b.viewState().value("lens").toString() == "stage", "viewState: reloads from prefs");
+        QQmlApplicationEngine engine;
+        QQuickWindow *win = createStudioWindow(engine, &b, false, QSize(1920, 1080));
+        QObject *app = win ? win->findChild<QObject *>("studioApp") : nullptr;
+        check(app && app->property("lens").toInt() == 2 && app->property("projectKey").toString() == stageKey
+                  && app->property("artifactIndex").toInt() == stageArts - 1
+                  && app->property("islandFilter").toString() == "needs",
+              "viewState: restart lands on the saved Stage, project, artifact and filter",
+              app ? QStringLiteral("lens %1 key %2 art %3 filter %4")
+                        .arg(app->property("lens").toInt())
+                        .arg(app->property("projectKey").toString())
+                        .arg(app->property("artifactIndex").toInt())
+                        .arg(app->property("islandFilter").toString())
+                  : QStringLiteral("no app"));
+        if (app) {
+            QMetaObject::invokeMethod(app, "goLens", Q_ARG(QVariant, QVariant(1)));
+            QCoreApplication::processEvents();
+            check(b.viewState().value("lens").toString() == "ladder" && b.viewState().value("focusedProject") == stageKey,
+                  "viewState: a lens change goes back to the backend", b.viewState().value("lens").toString());
+        }
+    }
+    {
+        // A saved project that no longer exists falls back to the Constellation.
+        QFile f(path);
+        f.open(QIODevice::WriteOnly | QIODevice::Truncate);
+        f.write(R"({"viewState":{"lens":"ladder","focusedProject":"gone-project","artifactIndex":0,"needsMeOnly":false}})");
+        f.close();
+        Backend b(Backend::Mode::Mock);
+        b.setPrefsPath(path);
+        QQmlApplicationEngine engine;
+        QQuickWindow *win = createStudioWindow(engine, &b, false, QSize(1920, 1080));
+        QObject *app = win ? win->findChild<QObject *>("studioApp") : nullptr;
+        check(app && app->property("lens").toInt() == 0 && app->property("islandFilter").toString() == "all",
+              "viewState: a missing project falls back to the Constellation");
+    }
+
+    // spawn_agent from a $HOME scratch tab runs in $HOME; a /tmp session is still refused.
+    {
+        Backend b(Backend::Mode::Mock);
+        b.mockAddProject("~tab:aa11bb22", "Why is the fn key slow", "~", "quick Qs", "idle");
+        b.mockAddProject("~tab:ee55ff66", "Untitled scratch", "", "quick Qs", "idle");
+        b.mockAddProject("tmp-scratch", "Scratch in tmp", "/tmp", "quick Qs", "idle");
+        b.setFocusedProject("~tab:aa11bb22");
+        const QString r1 = b.dispatchStudioAction("spawn_agent", "write a disk usage script");
+        check(r1.startsWith("Spawning an Opus 5.5 agent in ~:"), "spawn: a $HOME tab spawns in $HOME", r1);
+        b.setFocusedProject("~tab:ee55ff66");
+        const QString r2 = b.dispatchStudioAction("spawn_agent", "tidy my downloads");
+        check(r2.startsWith("Spawning an Opus 5.5 agent in ~:"), "spawn: a tab with no folder defaults to $HOME", r2);
+        b.setFocusedProject("tmp-scratch");
+        const QString r3 = b.dispatchStudioAction("spawn_agent", "do work");
+        check(r3.contains("no project folder"), "spawn: /tmp is still refused", r3);
+    }
+    check(kCompatSystemPrompt.contains("Never say you are spawning or starting an agent unless the same answer emits "
+                                       "[[ACTION:spawn_agent:<task>]]"),
+          "spawn: Tier 0 forbids prose-only 'Spawning an agent'");
+
+    // Wall clock rides in Tier 3 only: the system prompt and the trunk never carry it.
+    {
+        const QString line = currentTimeLine(QDateTime(QDate(2026, 11, 19), QTime(18, 16)));
+        const QString midnight = currentTimeLine(QDateTime(QDate(2026, 11, 20), QTime(0, 5)));
+        check(line == "Current time: 6:16 pm" && midnight == "Current time: 12:05 am", "clock: 12-hour local time line",
+              line + " | " + midnight);
+        TieredPrompt p;
+        p.model = "qwen3.8-flash-next";
+        p.systemPrompt = kCompatSystemPrompt;
+        p.trunk = "TRUNK";
+        p.currentTime = line;
+        p.question = "is the run still going?";
+        const QString leaf = tieredLeafText(p);
+        check(leaf.endsWith("Current time: 6:16 pm\n\nQuestion: is the run still going?"), "clock: Tier 3 leaf carries the time",
+              leaf);
+        const QJsonArray msgs = QJsonDocument::fromJson(buildTieredChatRequest(p)).object().value("messages").toArray();
+        const QJsonArray warm = QJsonDocument::fromJson(buildTieredWarmRequest(p)).object().value("messages").toArray();
+        bool prefixClean = true;
+        for (int i = 0; i + 1 < msgs.size(); ++i)
+            prefixClean = prefixClean && !msgs[i].toObject().value("content").toString().contains("Current time");
+        check(prefixClean && !QJsonDocument(warm).toJson().contains("Current time")
+                  && msgs.last().toObject().value("content").toString().contains("Current time: 6:16 pm"),
+              "clock: Tiers 0/1 and the warm prefix never carry the time (APC stays hot)");
+    }
+
+    // OpenRouter body: DeepSeek, reasoning none on fast, provider routing, no Qwen-only kwargs.
+    {
+        TieredPrompt p;
+        p.model = "deepseek/deepseek-v4.1-flash-1017";
+        p.effort = "fast";
+        p.systemPrompt = kCompatSystemPrompt;
+        p.question = "hi";
+        const QJsonObject o = QJsonDocument::fromJson(buildOpenRouterChatRequest(p)).object();
+        const QJsonObject prov = o.value("provider").toObject();
+        check(o.value("model").toString() == "deepseek/deepseek-v4.1-flash-1017" && o.value("stream").toBool()
+                  && o.value("reasoning").toObject().value("effort").toString() == "none"
+                  && prov.value("order").toArray() == QJsonArray({"Wafer", "InferenceNet", "Nebius"})
+                  && prov.value("sort").toString() == "latency" && prov.value("allow_fallbacks").toBool()
+                  && !o.contains("chat_template_kwargs") && !o.contains("reasoning_effort"),
+              "openrouter: fast -> reasoning none, Wafer/InferenceNet/Nebius by latency",
+              QString::fromUtf8(QJsonDocument(o).toJson(QJsonDocument::Compact)).left(400));
+        const QString sys = o.value("messages").toArray().first().toObject().value("content").toString();
+        check(sys.contains("served via OpenRouter") && !sys.contains("vLLM"), "openrouter: identity line names OpenRouter");
+        p.effort = "medium";
+        check(QJsonDocument::fromJson(buildOpenRouterChatRequest(p)).object().value("reasoning").toObject().value("effort")
+                  == "medium",
+              "openrouter: a thinking effort rides as reasoning.effort");
+    }
+}
+
 int runTests()
 {
     unitTests();
+    polishTests();
     mapUnitTests();
     studioControlTests();
     gamepadUnitTests();

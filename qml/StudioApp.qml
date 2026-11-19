@@ -473,7 +473,11 @@ FocusScope {
         };
     }
     onUiStateMapChanged: if (backend) backend.setUiState(uiStateMap)
-    Component.onCompleted: if (backend) backend.setUiState(uiStateMap)
+    Component.onCompleted: {
+        if (backend)
+            backend.setUiState(uiStateMap);
+        restoreViewState();  // projects may already be published (no projectsChanged will follow)
+    }
 
     Connections {
         target: app.backend
@@ -487,6 +491,46 @@ FocusScope {
             app.lens = 1;
         }
     }
+
+    // --- Persisted view state (prefs "viewState") ----------------------------------------------
+    // Restored once, on the first projects publish, so a restart lands where you were; a saved
+    // project that no longer exists falls back cleanly to the Constellation. Every later change
+    // goes to the backend, which debounces the prefs write (and only the live window has a file).
+    property bool viewRestored: false
+    readonly property var viewStateMap: ({
+        lens: lens === 0 ? "constellation" : (lens === 1 ? "ladder" : "stage"),
+        focusedProject: projectKey,
+        artifactIndex: artifactIndex,
+        needsMeOnly: islandFilter === "needs"
+    })
+    onViewStateMapChanged: if (viewRestored && backend) backend.setViewState(viewStateMap)
+    function restoreViewState() {
+        if (viewRestored || !backend || projects.length === 0)
+            return;
+        viewRestored = true;
+        const v = backend.viewState;
+        if (!v || !v.lens)
+            return;
+        setIslandFilter(v.needsMeOnly ? "needs" : "all");
+        const i = backend.projectIndex(v.focusedProject || "");
+        if (i < 0) {
+            lens = 0;
+            return;
+        }
+        selectedIsland = i;
+        projectKey = projects[i].key;
+        if (v.lens === "constellation")
+            return;
+        const arts = projects[i].artifacts || [];
+        if (v.lens === "stage" && arts.length > 0) {
+            artifactIndex = Math.max(0, Math.min(v.artifactIndex || 0, arts.length - 1));
+            lens = 2;
+        } else {
+            artifactIndex = 0;
+            lens = 1;
+        }
+    }
+    onProjectsChanged: restoreViewState()
 
     Keys.onPressed: (e) => {
         const ctrl = (e.modifiers & Qt.ControlModifier) !== 0;
@@ -562,7 +606,7 @@ FocusScope {
                 answers.openPicker();
             } else {
                 settings.show();
-                settings.row = 2;  // Default Model
+                settings.row = settings.modelRow;
             }
             e.accepted = true;
             return;
@@ -874,12 +918,12 @@ FocusScope {
         if (onboarding.open || dialog.open || briefing.open || omnibar.open)
             return;
         if (settings.open) {
-            settings.row = 2;  // Default Model
+            settings.row = settings.modelRow;
         } else if (answers.inputFocused) {
             answers.pickerOpen ? (answers.pickerOpen = false) : answers.openPicker();
         } else if (lens === 0) {
             settings.show();
-            settings.row = 2;
+            settings.row = settings.modelRow;
         } else {
             proseOpen = !proseOpen;
         }

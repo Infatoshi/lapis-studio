@@ -4,6 +4,7 @@
 #include <QFile>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QLocale>
 #include <QRegularExpression>
 
 namespace studio {
@@ -17,7 +18,9 @@ const QString kCompatSystemPrompt = QStringLiteral(
     "set_volume:<pct>, open_spotify, spotify_play, spotify_play:<song>, spotify_pause, spotify_next, spotify_prev, "
     "spotify_volume:<pct>, focus_project:<name>, open_stage:<name>, open_ladder:<name>, go_home, "
     "sort_map:category|recent|activity, move_cluster:<Work|Projects|Apps|Quick Qs>:<left|right|top|bottom>, "
-    "spawn_agent:<task> to start a coding agent on real work). Several tags may go in one answer.");
+    "spawn_agent:<task> to start a coding agent on real work). Several tags may go in one answer. "
+    "Never say you are spawning or starting an agent unless the same answer emits [[ACTION:spawn_agent:<task>]]; "
+    "the tag is what starts it, the words alone do nothing.");
 
 namespace {
 
@@ -62,7 +65,9 @@ QString tier0SystemText(const QString &systemPrompt, const QString &model, const
         parts << systemPrompt;
     if (!model.isEmpty())
         parts << QStringLiteral("Your model ID is ") + model
-                     + QStringLiteral(" (running locally via OpenAI-compatible vLLM). Transcripts in context come from "
+                     + (model.contains(QLatin1Char('/')) ? QStringLiteral(" (served via OpenRouter)")
+                                                         : QStringLiteral(" (running locally via OpenAI-compatible vLLM)"))
+                     + QStringLiteral(". Transcripts in context come from "
                                       "other agent sessions (Claude, Codex, Antigravity); never claim to be Claude or "
                                       "any other model. Answer directly from context whenever sufficient to minimize "
                                       "latency; emit compound [[ACTION:...]] tags together in one turn when multiple "
@@ -105,8 +110,35 @@ QString tieredLeafText(const TieredPrompt &p)
         section(QStringLiteral("Live Phonon audio transcript:\n") + p.phononTail);
     if (!p.memory.isEmpty())
         section(QStringLiteral("Relevant past conversations:\n") + p.memory);
+    if (!p.currentTime.isEmpty())
+        section(p.currentTime);
     section(QStringLiteral("Question: ") + p.question);
     return leaf;
+}
+
+QString currentTimeLine(const QDateTime &now)
+{
+    // QLocale::c() so "AP" is always "AM"/"PM" regardless of the user's locale, then lowercase.
+    return QStringLiteral("Current time: ") + QLocale::c().toString(now.time(), QStringLiteral("h:mm AP")).toLower();
+}
+
+QByteArray buildOpenRouterChatRequest(const TieredPrompt &p)
+{
+    QJsonArray msgs = tieredPrefixMessages(tier0SystemText(p.systemPrompt, p.model, p.extraSystemContext), p.trunk,
+                                           p.history);
+    msgs << message(QStringLiteral("user"), tieredLeafText(p));
+    QJsonObject body;
+    body.insert(QStringLiteral("model"), p.model);
+    body.insert(QStringLiteral("stream"), true);
+    body.insert(QStringLiteral("messages"), msgs);
+    const QString effort = p.effort.isEmpty() || isNoThinkEffort(p.effort) ? QStringLiteral("none") : p.effort;
+    body.insert(QStringLiteral("reasoning"), QJsonObject{{QStringLiteral("effort"), effort}});
+    body.insert(QStringLiteral("provider"),
+                QJsonObject{{QStringLiteral("order"), QJsonArray{QStringLiteral("Wafer"), QStringLiteral("InferenceNet"),
+                                                                 QStringLiteral("Nebius")}},
+                            {QStringLiteral("sort"), QStringLiteral("latency")},
+                            {QStringLiteral("allow_fallbacks"), true}});
+    return QJsonDocument(body).toJson(QJsonDocument::Compact);
 }
 
 QByteArray buildTieredChatRequest(const TieredPrompt &p)

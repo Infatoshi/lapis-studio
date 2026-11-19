@@ -278,6 +278,9 @@ class Backend : public QObject {
     Q_PROPERTY(bool phononLive READ phononLive NOTIFY phononTailChanged)
     Q_PROPERTY(QString openaiCompatUrl READ openaiCompatUrl WRITE setOpenaiCompatUrl NOTIFY prefsChanged)
     Q_PROPERTY(QString openaiCompatModel READ openaiCompatModel WRITE setOpenaiCompatModel NOTIFY prefsChanged)
+    // Last IDE view, restored on the first projects publish: {lens: "constellation"|"stage"|"ladder",
+    // focusedProject, artifactIndex, needsMeOnly}. Persisted in studio_prefs.json (live window only).
+    Q_PROPERTY(QVariantMap viewState READ viewState NOTIFY viewStateChanged)
     // PS4 DualShock 4 / extended gamepad. Always present; only main()'s live window enables it.
     Q_PROPERTY(QObject *gamepad READ gamepadObject CONSTANT)
     // slowmix music player (SlowmixController). Spawns `slowmix --stdio` only after main()'s live
@@ -528,6 +531,9 @@ public:
     QString openaiCompatModel() const { return m_openaiCompatModel; }
     void setOpenaiCompatUrl(const QString &url);
     void setOpenaiCompatModel(const QString &model);
+    QVariantMap viewState() const { return m_viewState; }
+    // Normalizes and stores the view; the debounced prefs save writes it (no path = memory only).
+    Q_INVOKABLE void setViewState(const QVariantMap &state);
     Q_INVOKABLE void setGamepadBinding(const QString &inputId, const QString &actionId);
     Q_INVOKABLE void resetGamepadBindings();
     Q_INVOKABLE void recordAction(const QString &action);
@@ -612,6 +618,7 @@ public:
 
 signals:
     void projectsChanged();
+    void viewStateChanged();
     void foldersChanged();
     void quickChanged();
     void traceChanged();
@@ -724,6 +731,9 @@ private:
     void onTraceOutput();
     void finishTrace();
     void askOpenAiCompat(const QString &projectKey, int artifactIndex, const QString &question);
+    // DeepSeek V4.1 Flash via OpenRouter: same tiers, reasoning effort "none" on fast.
+    void askOpenRouter(const QString &projectKey, int artifactIndex, const QString &question);
+    QString openrouterKey() const;  // m_openrouterKey (prefs openrouterApiKey), then env OPENROUTER_API_KEY
     void onRouterDelta(const QString &streamId, const QString &text, const QString &thinking);
     void onRouterFinished(const QString &streamId, const QString &error);
     // contextFor() = head + slice + rest; contextTrunk() = head + rest. False if no such project.
@@ -768,6 +778,8 @@ private:
     QString m_openaiCompatUrl;
     QString m_openaiCompatModel = QStringLiteral("qwen3.8-flash-next");
     QString m_openaiCompatKey;
+    QString m_openrouterKey;  // prefs openrouterApiKey (read only; never written back)
+    QVariantMap m_viewState;  // prefs viewState: {lens, focusedProject, artifactIndex, needsMeOnly}
     bool m_compatUrlCleared = false;  // setOpenaiCompatUrl("") ran: savePrefs drops the file's URL
     QNetworkAccessManager m_nam;  // suggestion, filter and briefing (one request each at most)
     std::unique_ptr<LlmRouter> m_ownedRouter;
