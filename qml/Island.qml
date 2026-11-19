@@ -12,6 +12,14 @@ Item {
     property bool morphing: false  // this island is the shared element: the zoom layer stands in for it
     property real pulse: -1        // the Constellation's shared wave clock (0..1, linear); -1 = off
     property bool draggable: false // the Constellation is settled: press-and-move drags the card
+    property bool showNumber: true // keyboard / mouse: number keys jump to cards; the pad has no number keys
+    property bool cursorOver: false    // the free pad cursor is on this card (soft highlight + hover target)
+    property bool grabbed: false       // held by the pad cursor (or riding a group drag): lifted, accent edge
+    property bool multiSelected: false // inside the rubber-band selection: a crisp ring, pinned as a target
+    property bool marqueeHit: false    // the marquee being drawn covers it (preview of the selection)
+    property real groupDx: 0           // a sibling in the selection is being mouse-dragged: ride along
+    property real groupDy: 0
+    property bool glide: false         // a cluster re-sort: x / y travel on a spring instead of jumping
     signal clicked()
     // Pointer travel since the press, in the parent's coordinates. dragMoved fires per move
     // while the card rides a Translate (no relayout); dragEnded fires once, on release.
@@ -21,8 +29,11 @@ Item {
     property real dragDx: 0
     property real dragDy: 0
     readonly property bool dragging: mouse.moved
-    transform: Translate { x: root.dragDx; y: root.dragDy }
-    z: dragging ? 10 : 0
+    transform: Translate { x: root.dragDx + root.groupDx; y: root.dragDy + root.groupDy }
+    z: dragging || grabbed ? 10 : 0
+    Behavior on x { enabled: root.glide; SpringAnimation { spring: 3.2; damping: 0.28; epsilon: 0.25 } }
+    Behavior on y { enabled: root.glide; SpringAnimation { spring: 3.2; damping: 0.28; epsilon: 0.25 } }
+    readonly property bool hovered: mouse.containsMouse || cursorOver
 
     readonly property int fresh: proj && proj.fresh ? proj.fresh : 0
     readonly property bool active: proj ? proj.active === true : false
@@ -42,7 +53,7 @@ Item {
     opacity: morphing ? 0 : born * (1 - recede)
 
     // Focus and hover lift on a spring, so arrow-key travel across islands feels physical.
-    readonly property real lift: dragging ? 1.04 : (mouse.pressed ? 0.97 : (selected ? 1.03 : (mouse.containsMouse ? 1.015 : 1)))
+    readonly property real lift: grabbed ? 1.03 : (dragging ? 1.04 : (mouse.pressed ? 0.97 : (selected ? 1.03 : (hovered ? 1.015 : 1))))
 
     Item {
         id: body
@@ -54,12 +65,29 @@ Item {
         Rectangle {
             anchors.fill: parent
             radius: 26
-            color: mouse.containsMouse || root.selected ? Theme.cardHi : Theme.card
+            color: root.hovered || root.selected || root.grabbed ? Theme.cardHi : Theme.card
+            border.width: root.grabbed ? 1.5 : 0
+            border.color: Theme.goldA(0.6)
+            antialiasing: true
+        }
+        // Multi-select ring (and the live marquee preview, fainter): crisp, outside the card.
+        Rectangle {
+            objectName: "islandSelectRing"
+            anchors.fill: parent
+            anchors.margins: -7
+            radius: 32
+            visible: root.multiSelected || root.marqueeHit
+            color: "transparent"
+            border.width: 1.5
+            border.color: Theme.goldA(root.multiSelected ? 0.85 : 0.4)
+            antialiasing: true
         }
 
         Text {
+            objectName: "islandNumber"
             x: 28
             y: 24
+            visible: root.showNumber
             text: root.number <= 9 ? String(root.number) : ""
             color: Theme.faint
             font.family: Theme.mono
@@ -213,11 +241,12 @@ Item {
         // Hover-to-ask: the island reports itself as a session target (window coordinates).
         onContainsMouseChanged: root.reportHover()
     }
+    onCursorOverChanged: reportHover()
     property QtObject targets: null
     function reportHover() {
         if (!targets || !proj)
             return;
-        if (mouse.containsMouse) {
+        if (mouse.containsMouse || cursorOver) {  // not `hovered`: its binding may not have caught up yet
             const r = root.mapToItem(null, 0, 0, root.width, root.height);
             const job = proj.jobName ? proj.jobName : "";
             const state = proj.stateLine ? proj.stateLine : "";

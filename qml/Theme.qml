@@ -16,6 +16,7 @@ QtObject {
     readonly property color ink: "#e8d5b5"
     readonly property color text: "#d9cfc3"
     readonly property color dim: "#6e665e"
+    readonly property color muted: "#4c453d"  // low-contrast micro-labels (Constellation cluster names)
     readonly property color faint: "#3a332c"
     readonly property color addBg: "#1a1309"
     readonly property color delBg: "#170c07"

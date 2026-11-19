@@ -1480,6 +1480,75 @@ void Backend::resetCardPositions()
         m_prefsSave.start();
 }
 
+void Backend::setMapSort(const QString &sort)
+{
+    const QString s = sort == QLatin1String("recent") || sort == QLatin1String("activity") ? sort : QStringLiteral("category");
+    if (s == m_mapSort)
+        return;
+    m_mapSort = s;
+    emit mapLayoutChanged();
+    if (!m_prefsPath.isEmpty())
+        m_prefsSave.start();
+}
+
+QStringList Backend::presentClusters() const
+{
+    QSet<QString> have;
+    for (const QVariant &v : m_projectList)
+        have.insert(v.toMap().value(QStringLiteral("cluster")).toString());
+    QStringList out;
+    for (const QString &c : m_clusterOrder)
+        if (have.contains(c))
+            out << c;
+    return out;
+}
+
+bool Backend::moveCluster(const QString &cluster, const QString &dir)
+{
+    const QStringList next = moveClusterInOrder(m_clusterOrder, presentClusters(), cluster, dir);
+    if (next == m_clusterOrder)
+        return false;
+    m_clusterOrder = next;
+    emit mapLayoutChanged();
+    resetCardPositions();  // after the order: the map has its glide on by now, dragged cards spring too
+    if (!m_prefsPath.isEmpty())
+        m_prefsSave.start();
+    return true;
+}
+
+void Backend::mockSetCategory(const QString &key, const QString &category)
+{
+    if (m_mode != Mode::Mock)
+        return;
+    Project *p = find(key);
+    if (!p)
+        return;
+    for (SessionInfo &s : p->sessions)
+        s.category = category;
+    publish();
+}
+
+void Backend::mockAddProject(const QString &key, const QString &name, const QString &dir, const QString &category,
+                             const QString &status)
+{
+    if (m_mode != Mode::Mock || find(key))
+        return;
+    Project p;
+    p.key = key;
+    p.name = name;
+    p.dir = dir;
+    p.mtime = 500 - m_projects.size();
+    SessionInfo s;
+    s.id = QStringLiteral("f1x7%1-0000-0000-0000-000000000000").arg(qHash(key) % 10000, 4, 10, QLatin1Char('0'));
+    s.title = name;
+    s.harness = QStringLiteral("claude");
+    s.status = status;
+    s.category = category;
+    p.sessions << s;
+    m_projects << p;
+    publish();
+}
+
 void Backend::setPrefsPath(const QString &path)
 {
     if (m_prefsSave.isActive()) {
@@ -1534,6 +1603,19 @@ void Backend::loadPrefs()
                                                      {QStringLiteral("y"), std::clamp(c.value(QLatin1String("y")).toDouble(), 0.0, 1.0)}});
     }
     emit cardPositionsChanged();
+    {
+        const QString sort = o.value(QLatin1String("mapSort")).toString();
+        m_mapSort = sort == QLatin1String("recent") || sort == QLatin1String("activity") ? sort : QStringLiteral("category");
+        // A saved order counts only as a full permutation of the four clusters.
+        QStringList order;
+        for (const QJsonValue &v : o.value(QLatin1String("clusterOrder")).toArray()) {
+            const QString c = normalizeClusterName(v.toString());
+            if (!c.isEmpty() && !order.contains(c))
+                order << c;
+        }
+        m_clusterOrder = order.size() == defaultClusterOrder().size() ? order : defaultClusterOrder();
+        emit mapLayoutChanged();
+    }
     QHash<QString, QString> padMap = GamepadState::defaultBindings();
     const QJsonObject padObj = o.value(QLatin1String("gamepadBindings")).toObject();
     for (auto it = padObj.begin(); it != padObj.end(); ++it)
@@ -1732,7 +1814,8 @@ bool Backend::savePrefs()
         if (old.open(QIODevice::ReadOnly))
             o = QJsonDocument::fromJson(old.read(256 * 1024)).object();
     }
-    static const char *const kOwnedOptional[] = {"windowState", "cardPositions", "gamepadBindings", "openaiCompatModel"};
+    static const char *const kOwnedOptional[] = {"windowState", "cardPositions", "gamepadBindings", "openaiCompatModel",
+                                                 "mapSort", "clusterOrder"};
     for (const char *k : kOwnedOptional)
         o.remove(QLatin1String(k));
     if (m_compatUrlCleared)
@@ -1762,6 +1845,10 @@ bool Backend::savePrefs()
         }
         o.insert(QStringLiteral("cardPositions"), cards);
     }
+    if (m_mapSort != QLatin1String("category"))
+        o.insert(QStringLiteral("mapSort"), m_mapSort);
+    if (m_clusterOrder != defaultClusterOrder())
+        o.insert(QStringLiteral("clusterOrder"), QJsonArray::fromStringList(m_clusterOrder));
     {
         const QHash<QString, QString> padMap = m_gamepad.bindingsMap();
         const QHash<QString, QString> defMap = GamepadState::defaultBindings();
@@ -1910,6 +1997,8 @@ QVariantMap Backend::projectMap(const Project &p) const
             activeInLapis = true;
     }
     m[QStringLiteral("category")] = primaryCat;
+    m[QStringLiteral("cluster")] = mapClusterFor(p.key, primaryCat, p.dir);
+    m[QStringLiteral("mtime")] = p.mtime;
     m[QStringLiteral("isActiveInLapis")] = activeInLapis;
     // The metric stays in the map (Stage, briefing proof) but the island shows it only when pinned;
     // the island itself speaks plain English: what the agent is on, and its latest step or blocker.
@@ -4226,7 +4315,79 @@ QStringList studioActionNames()
             QStringLiteral("set_volume"),     QStringLiteral("open_spotify"),  QStringLiteral("spotify_play"),
             QStringLiteral("spotify_pause"),  QStringLiteral("spotify_next"),  QStringLiteral("spotify_prev"),
             QStringLiteral("spotify_volume"), QStringLiteral("focus_project"), QStringLiteral("open_stage"),
-            QStringLiteral("open_ladder"),    QStringLiteral("go_home")};
+            QStringLiteral("open_ladder"),    QStringLiteral("go_home"),       QStringLiteral("sort_map"),
+            QStringLiteral("move_cluster")};
+}
+
+QStringList defaultClusterOrder()
+{
+    return {QStringLiteral("Work"), QStringLiteral("Projects"), QStringLiteral("Apps"), QStringLiteral("Quick Qs")};
+}
+
+QString normalizeClusterName(const QString &name)
+{
+    const QString n = name.toLower().remove(QRegularExpression(QStringLiteral("[^a-z]")));
+    if (n == QLatin1String("work") || n == QLatin1String("infinity"))
+        return QStringLiteral("Work");
+    if (n == QLatin1String("app") || n == QLatin1String("apps"))
+        return QStringLiteral("Apps");
+    if (n == QLatin1String("project") || n == QLatin1String("projects") || n == QLatin1String("repos"))
+        return QStringLiteral("Projects");
+    if (n == QLatin1String("quickqs") || n == QLatin1String("quickq") || n == QLatin1String("quickquestions")
+        || n == QLatin1String("quickquestion") || n == QLatin1String("questions") || n == QLatin1String("scratch")
+        || n == QLatin1String("tabs"))
+        return QStringLiteral("Quick Qs");
+    return {};
+}
+
+QString mapClusterFor(const QString &key, const QString &category, const QString &dir)
+{
+    const QString cat = category.trimmed().toLower();
+    if (cat == QLatin1String("infinity"))
+        return QStringLiteral("Work");
+    if (cat == QLatin1String("apps") || cat == QLatin1String("app"))
+        return QStringLiteral("Apps");
+    if (key.startsWith(QLatin1String("~tab:")) || normalizeClusterName(cat) == QLatin1String("Quick Qs"))
+        return QStringLiteral("Quick Qs");
+    const QString d = dir.trimmed();
+    if (!d.isEmpty() && isScratchDir(QDir::cleanPath(expandHome(d))))
+        return QStringLiteral("Quick Qs");
+    return QStringLiteral("Projects");
+}
+
+QStringList moveClusterInOrder(const QStringList &order, const QStringList &present, const QString &cluster,
+                               const QString &dir)
+{
+    const QString c = normalizeClusterName(cluster);
+    QStringList shown;
+    for (const QString &o : order)
+        if (present.contains(o))
+            shown << o;
+    const int i = int(shown.indexOf(c));
+    if (i < 0)
+        return order;
+    const int n = int(shown.size());
+    const int cols = n <= 1 ? 1 : 2;
+    const QString d = dir.trimmed().toLower();
+    int j = -1;
+    if (d == QLatin1String("left"))
+        j = (i % cols) > 0 ? i - 1 : -1;
+    else if (d == QLatin1String("right"))
+        j = (i % cols) < cols - 1 && i + 1 < n ? i + 1 : -1;
+    else if (d == QLatin1String("top") || d == QLatin1String("up"))
+        j = i - cols >= 0 ? i - cols : -1;
+    else if (d == QLatin1String("bottom") || d == QLatin1String("down"))
+        j = i + cols < n ? i + cols : -1;
+    if (j < 0)
+        return order;
+    std::swap(shown[i], shown[j]);
+    // The shown clusters take the cells they held, in their new order; empty ones keep their place.
+    QStringList out = order;
+    int k = 0;
+    for (QString &o : out)
+        if (present.contains(o))
+            o = shown[k++];
+    return out;
 }
 
 StudioCommand parseStudioCommand(const QString &text)
@@ -4427,6 +4588,37 @@ StudioCommand parseStudioCommand(const QString &text)
         const auto m = layoutRe.match(n);
         if (m.hasMatch() && onlyFiller(m.captured(1)))
             return cmd("reset_layout");
+    }
+    {
+        // "sort the map by recent", "group the cards by category", "order by activity".
+        static const QRegularExpression sortRe(QStringLiteral(
+            "^(?:sort|order|arrange|organi[sz]e|group|re ?sort|re ?order)\\s+(?:the\\s+|my\\s+)?"
+            "(?:(?:map|cards|constellation|islands|projects|sessions)\\s+)?by\\s+(?:the\\s+|most\\s+)?"
+            "(category|categories|type|recent|recency|recently used|latest|newest|activity|active|attention)(.*)$"));
+        const auto m = sortRe.match(n);
+        if (m.hasMatch() && onlyFiller(m.captured(2))) {
+            const QString w = m.captured(1);
+            const QString mode = w.startsWith(QLatin1String("categor")) || w == QLatin1String("type") ? QStringLiteral("category")
+                                 : (w.startsWith(QLatin1String("activ")) || w == QLatin1String("attention"))
+                                     ? QStringLiteral("activity")
+                                     : QStringLiteral("recent");
+            return cmd("sort_map", mode);
+        }
+        // "move the work cluster to the left", "put apps on top", "move quick qs down".
+        static const QRegularExpression moveRe(QStringLiteral(
+            "^(?:move|put|shift|place|slide|drag|push)\\s+(?:the\\s+|my\\s+)?"
+            "(work|apps?|projects?|repos|quick ?qs?|quick questions|scratch|tabs)\\s+"
+            "(?:(?:cluster|group|cards|section|zone|islands)\\s+)?(?:to\\s+|on\\s+|at\\s+|over\\s+to\\s+)?(?:the\\s+)?"
+            "(left|right|top|bottom|up|down)(.*)$"));
+        const auto mv = moveRe.match(n);
+        if (mv.hasMatch() && onlyFiller(mv.captured(3))) {
+            QString d = mv.captured(2);
+            if (d == QLatin1String("up"))
+                d = QStringLiteral("top");
+            else if (d == QLatin1String("down"))
+                d = QStringLiteral("bottom");
+            return cmd("move_cluster", normalizeClusterName(mv.captured(1)) + QLatin1Char(':') + d);
+        }
     }
     return {};
 }
@@ -4656,6 +4848,33 @@ QString Backend::dispatchStudioAction(const QString &action, const QString &arg)
     } else if (a == QLatin1String("reset_layout")) {
         resetCardPositions();
         reply = QStringLiteral("Reset the card layout.");
+    } else if (a == QLatin1String("sort_map")) {
+        const QString v = arg.trimmed().toLower();
+        const QString mode = v.startsWith(QLatin1String("rec")) ? QStringLiteral("recent")
+                             : v.startsWith(QLatin1String("act")) ? QStringLiteral("activity")
+                                                                  : QStringLiteral("category");
+        setMapSort(mode);
+        resetCardPositions();  // a re-sort re-flows every card, dragged ones included
+        emitArg = mode;
+        reply = mode == QLatin1String("recent")     ? QStringLiteral("Sorted the map by most recent.")
+                : mode == QLatin1String("activity") ? QStringLiteral("Sorted the map by activity.")
+                                                    : QStringLiteral("Sorted the map by category.");
+    } else if (a == QLatin1String("move_cluster")) {
+        const QString cluster = normalizeClusterName(arg.section(QLatin1Char(':'), 0, 0));
+        QString dir = arg.section(QLatin1Char(':'), 1, 1).trimmed().toLower();
+        if (dir == QLatin1String("up"))
+            dir = QStringLiteral("top");
+        else if (dir == QLatin1String("down"))
+            dir = QStringLiteral("bottom");
+        if (cluster.isEmpty() || !QStringList{QStringLiteral("left"), QStringLiteral("right"), QStringLiteral("top"),
+                                              QStringLiteral("bottom")}
+                                      .contains(dir))
+            return {};
+        if (!presentClusters().contains(cluster))
+            return QStringLiteral("There are no %1 cards on the map.").arg(cluster);
+        emitArg = cluster + QLatin1Char(':') + dir;
+        reply = moveCluster(cluster, dir) ? QStringLiteral("Moved %1 to the %2.").arg(cluster, dir)
+                                          : QStringLiteral("%1 is already at the %2.").arg(cluster, dir);
     } else if (a == QLatin1String("open_settings")) {
         reply = QStringLiteral("Opened Settings.");
     } else if (a == QLatin1String("open_briefing")) {

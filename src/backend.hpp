@@ -198,7 +198,8 @@ ProjectId sessionProjectId(const SessionInfo &s, const Extracted &ex, const QStr
 // filter_all, reset_layout, open_settings, open_briefing, set_theme:blue|gold, show_diffs:1|0,
 // spawn_agent:<task>, set_volume:<pct>, open_spotify, spotify_play[:<song>], spotify_pause,
 // spotify_next, spotify_prev, spotify_volume:<pct>, focus_project:<name>, open_stage:<name>,
-// open_ladder:<name>, go_home. A model reply may carry several; all run in one turn.
+// open_ladder:<name>, go_home, sort_map:category|recent|activity,
+// move_cluster:<cluster>:left|right|top|bottom. A model reply may carry several; all run in one turn.
 struct StudioCommand {
     QString action;
     QString arg;
@@ -213,6 +214,17 @@ StudioCommand parseStudioCommand(const QString &text);
 // Strips every leading [[ACTION:...]] tag from *answer (and the whitespace after it) and returns
 // the known actions in order. Unknown action names are dropped (still stripped).
 QList<StudioCommand> extractActionTags(QString *answer);
+// The Constellation cluster a project sits in: "Work" (the infinity category), "Apps" (apps),
+// "Quick Qs" (a ~tab: island, a scratch-dir session, or the quick Qs category), else "Projects".
+QString mapClusterFor(const QString &key, const QString &category, const QString &dir);
+// "work" / "quick qs" / "quick questions" / "app" -> the canonical cluster name; "" when unknown.
+QString normalizeClusterName(const QString &name);
+QStringList defaultClusterOrder();  // Work, Projects, Apps, Quick Qs
+// One step of `cluster` on the two-column cluster grid the map draws (only the clusters in
+// `present` take a cell, in `order`): left / right swap within a row, top / bottom within a
+// column. A blocked or unknown move returns `order` unchanged.
+QStringList moveClusterInOrder(const QStringList &order, const QStringList &present, const QString &cluster,
+                               const QString &dir);
 // The track (index into SlowmixController::tracks maps) a spoken query names best, -1 for none.
 // Matches on the name and file name with spaces, underscores and punctuation ignored.
 int matchSlowmixTrack(const QVariantList &tracks, const QString &query);
@@ -291,6 +303,11 @@ class Backend : public QObject {
     // Freeform Constellation: {projectKey: {x, y}}, the card centre as a fraction (0..1) of the
     // Constellation's width / height. Projects without an entry keep their auto-layout slot.
     Q_PROPERTY(QVariantMap cardPositions READ cardPositions NOTIFY cardPositionsChanged)
+    // Constellation clusters: card order inside each cluster ("category" keeps the project order,
+    // "recent" newest first, "activity" needs-me then live work first) and the cluster order on
+    // the two-column cluster grid. Both persist; sort_map / move_cluster voice actions set them.
+    Q_PROPERTY(QString mapSort READ mapSort WRITE setMapSort NOTIFY mapLayoutChanged)
+    Q_PROPERTY(QStringList clusterOrder READ clusterOrder NOTIFY mapLayoutChanged)
     // End-of-session reflection: {intent, corrections, rules: [..]} plus where it came from.
     Q_PROPERTY(QVariantMap reflection READ reflection NOTIFY reflectionChanged)
     Q_PROPERTY(bool reflectionBusy READ reflectionBusy NOTIFY reflectionChanged)
@@ -341,6 +358,11 @@ public:
     // Mock only: append one turn to a fixture project's transcript and re-extract it, as if the
     // agent had written while the user looked elsewhere (tests, demo).
     void mockAppendTurn(const QString &key, const Turn &t);
+    // Mock only: tag a fixture project's session with a Lapis category, or add a bare project
+    // (the cluster tests and the --snap-map frame).
+    void mockSetCategory(const QString &key, const QString &category);
+    void mockAddProject(const QString &key, const QString &name, const QString &dir, const QString &category,
+                        const QString &status);
     // Kill every daemon now, closing stdin first so it can exit on its own (the destructor runs
     // this). Returns the PIDs that were running.
     QList<qint64> shutdownChannels();
@@ -401,6 +423,13 @@ public:
     // x, y: the card centre as a fraction of the Constellation (clamped to 0..1). Persisted.
     Q_INVOKABLE void setCardPosition(const QString &projectKey, double x, double y);
     Q_INVOKABLE void resetCardPositions();
+    QString mapSort() const { return m_mapSort; }
+    void setMapSort(const QString &sort);
+    QStringList clusterOrder() const { return m_clusterOrder; }
+    // Moves one cluster a step (left|right|top|bottom) among the clusters on screen. Dragged card
+    // positions reset so the whole map re-flows. False when the move is blocked or unknown.
+    Q_INVOKABLE bool moveCluster(const QString &cluster, const QString &dir);
+    QStringList presentClusters() const;  // the clusters with at least one project, in clusterOrder
     // Session reflection: local lines land at once; with an OpenAI-compatible endpoint and a
     // router, one "reflection:1" stream to the fast model (qwen3.8-flash-next) rewrites them.
     QVariantMap reflection() const;
@@ -591,6 +620,7 @@ signals:
     void suggestionChanged();
     void briefingChanged();
     void cardPositionsChanged();
+    void mapLayoutChanged();
     void reflectionChanged();
     void tasteRulesChanged();
     void phononTailChanged();
@@ -767,6 +797,8 @@ private:
     QString m_briefingSource;
     bool m_showCodeDiffs = false;
     QVariantMap m_cardPositions;
+    QString m_mapSort = QStringLiteral("category");
+    QStringList m_clusterOrder = defaultClusterOrder();
     SessionReflection m_reflection;
     QString m_reflectionSource;
     QString m_reflectionRaw;  // the streamed model reply so far

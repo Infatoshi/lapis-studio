@@ -18,6 +18,8 @@ const QStringList kAmbientActionVocabulary = {
     QStringLiteral("reset_layout"),         QStringLiteral("spawn_agent:<task>"), QStringLiteral("set_volume:<pct>"),
     QStringLiteral("spotify_play"),         QStringLiteral("spotify_play:<song>"), QStringLiteral("spotify_pause"),
     QStringLiteral("spotify_next"),         QStringLiteral("spotify_prev"),      QStringLiteral("spotify_volume:<pct>"),
+    QStringLiteral("sort_map:<category|recent|activity>"),
+    QStringLiteral("move_cluster:<Work|Projects|Apps|Quick Qs>:<left|right|top|bottom>"),
 };
 
 namespace {

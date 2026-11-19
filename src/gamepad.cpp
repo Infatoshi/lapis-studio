@@ -111,12 +111,17 @@ void GamepadState::emitMappedAction(const QString &inputId, bool down, QList<Gam
             out.append(GamepadAction::make(GamepadAction::Back));
         return;
     }
+    if (act == QLatin1String("confirm")) {
+        // The hold edge first, so a grab starts before the press is read as a plain confirm.
+        out.append(GamepadAction::make(GamepadAction::ConfirmHeld, 0, 0, down ? 1.0 : 0.0));
+        if (down)
+            out.append(GamepadAction::make(GamepadAction::Confirm));
+        return;
+    }
     if (!down)
         return;
     if (act == QLatin1String("send"))
         out.append(GamepadAction::make(GamepadAction::Send));
-    else if (act == QLatin1String("confirm"))
-        out.append(GamepadAction::make(GamepadAction::Confirm));
     else if (act == QLatin1String("secondary"))
         out.append(GamepadAction::make(GamepadAction::Secondary));
     else if (act == QLatin1String("accept_prediction"))
@@ -144,8 +149,35 @@ void GamepadState::emitMappedAction(const QString &inputId, bool down, QList<Gam
 void GamepadState::reset()
 {
     const QHash<QString, QString> keepBindings = m_bindings;
+    const bool keepAnalog = m_analog;
     *this = GamepadState();
     m_bindings = keepBindings;
+    m_analog = keepAnalog;
+}
+
+void GamepadState::shapeStick(double lx, double ly, double *outX, double *outY)
+{
+    *outX = 0;
+    *outY = 0;
+    const double mag = std::hypot(lx, ly);
+    if (!(mag > kCursorDeadzone))
+        return;
+    const double t = std::min(1.0, (mag - kCursorDeadzone) / (1.0 - kCursorDeadzone));
+    const double k = t * t / mag;
+    *outX = lx * k;
+    *outY = -ly * k;  // stick up (+1) is screen up
+}
+
+void GamepadState::setAnalogCursor(bool on)
+{
+    if (m_analog == on)
+        return;
+    m_analog = on;
+    // Whatever the stick was doing ends here: no repeat carries across, no stale velocity.
+    if (m_navFromStick) {
+        m_navDx = m_navDy = 0;
+        m_navFromStick = false;
+    }
 }
 
 // The direction the user holds, as one discrete screen step. The d-pad wins over the stick;
@@ -161,6 +193,8 @@ void GamepadState::navDirection(const GamepadSnapshot &s, int *dx, int *dy) cons
             *dy = s.dpadY > 0 ? -1 : 1;  // pad up (+1) is screen up (-1)
         return;
     }
+    if (m_analog)
+        return;  // the free cursor owns the stick
     const double ax = std::abs(s.lx), ay = std::abs(s.ly);
     // Already holding a stick direction: keep it while that axis stays past the release line
     // and the other axis has not clearly taken over.
@@ -185,6 +219,22 @@ QList<GamepadAction> GamepadState::process(const GamepadSnapshot &s, qint64 nowM
 {
     QList<GamepadAction> out;
     const GamepadSnapshot &p = m_prev;
+
+    // Analog left stick: always tracked; in cursor mode one Cursor velocity per poll while
+    // deflected, plus a single 0, 0 when it returns to the deadzone.
+    {
+        double vx = 0, vy = 0;
+        shapeStick(s.lx, s.ly, &vx, &vy);
+        const bool wasMoving = m_leftX != 0 || m_leftY != 0;
+        m_leftX = vx;
+        m_leftY = vy;
+        if (m_analog && !m_capture && (vx != 0 || vy != 0 || wasMoving)) {
+            GamepadAction a = GamepadAction::make(GamepadAction::Cursor);
+            a.vx = vx;
+            a.vy = vy;
+            out.append(a);
+        }
+    }
 
     // Discrete navigation: fire on engage, then after 320 ms every 110 ms while held.
     int dx = 0, dy = 0;
@@ -359,6 +409,14 @@ void Gamepad::setMusicMode(bool on)
     emit musicModeChanged();
 }
 
+void Gamepad::setAnalogCursor(bool on)
+{
+    if (m_state.analogCursor() == on)
+        return;
+    m_state.setAnalogCursor(on);
+    emit analogCursorChanged();
+}
+
 void Gamepad::setBindingsMap(const QHash<QString, QString> &map)
 {
     m_state.setBindings(map);
@@ -433,10 +491,18 @@ void Gamepad::processSnapshot(const Snapshot &s, qint64 nowMs)
     m_prevR3 = s.r3;
     if (r3Edge)
         emit r3Pressed();
-    for (const GamepadAction &a : m_state.process(s, nowMs)) {
+    const QList<GamepadAction> actions = m_state.process(s, nowMs);
+    if (m_state.leftX() != m_leftX || m_state.leftY() != m_leftY) {
+        m_leftX = m_state.leftX();
+        m_leftY = m_state.leftY();
+        emit leftStickChanged();
+    }
+    for (const GamepadAction &a : actions) {
         switch (a.kind) {
         case GamepadAction::Nav: emit nav(a.dx, a.dy); break;
         case GamepadAction::Confirm: emit confirm(); break;
+        case GamepadAction::ConfirmHeld: emit confirmHeld(a.value > 0.5); break;
+        case GamepadAction::Cursor: emit cursorMove(a.vx, a.vy); break;
         case GamepadAction::Back: emit back(); break;
         case GamepadAction::BackHeld: emit backHeld(a.value > 0.5); break;
         case GamepadAction::AcceptPrediction: emit acceptPrediction(); break;
@@ -492,6 +558,11 @@ void Gamepad::setConnected(bool on, const QString &name)
     m_name = on ? name : QString();
     m_state.reset();
     m_prevR3 = false;
+    if (m_leftX != 0 || m_leftY != 0) {
+        m_leftX = m_leftY = 0;
+        emit leftStickChanged();
+        emit cursorMove(0, 0);
+    }
     emit connectedChanged();
 }
 

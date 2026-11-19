@@ -2719,10 +2719,30 @@ void gamepadUiTests()
     check(prop(app, "selectedIsland").toInt() == 1, "pad ui: △ selects the next island (Next View)");
     tap([](S &s) { s.l1 = true; });
     check(prop(app, "selectedIsland").toInt() == 0, "pad ui: L1 selects the previous island");
-    tap([](S &s) { s.lx = 1.0; });
-    check(prop(app, "selectedIsland").toInt() == 1, "pad ui: left stick right moves one island");
-    tap([](S &s) { s.dpadX = -1; });
-    check(prop(app, "selectedIsland").toInt() == 0, "pad ui: d-pad left moves back");
+    {
+        // The left stick drives the free map cursor (analog), not island hops: gliding it onto
+        // the next card selects that card. The d-pad still hops, and the cursor follows.
+        QObject *map = win->findChild<QObject *>("constellation");
+        check(pad->analogCursor(), "pad ui: on the Constellation the pad is in analog cursor mode");
+        settle(250);  // the cursor glides onto island 1's neighbour, the selection
+        S s;
+        s.lx = 1.0;
+        bool picked = false;
+        for (int k = 0; k < 250 && !picked; ++k) {
+            pad->processSnapshot(s, t);
+            t += 8;
+            settle(8);
+            picked = prop(app, "selectedIsland").toInt() == 1;
+        }
+        pad->processSnapshot(S(), t);
+        t += 40;
+        settle(30);
+        check(picked && map && map->property("stickX").toDouble() == 0,
+              "pad ui: left stick glides the free cursor onto the next island (and stops on release)");
+        tap([](S &s) { s.dpadX = -1; });
+        check(prop(app, "selectedIsland").toInt() == 0, "pad ui: d-pad left still hops back");
+        settle(300);  // the cursor follows the hop
+    }
     {
         const int before = prop(app, "predictorAccepts").toInt();
         const bool predicted = !prop(app, "predictedAction").isNull();
@@ -3243,6 +3263,8 @@ void mouseDrag(QQuickWindow *w, QPointF from, QPointF delta)
         mouseMove(w, from + delta * (qreal(i) / steps), Qt::LeftButton);
         QCoreApplication::processEvents();
     }
+    // Hold still before letting go: a drop, not a flick (Constellation cards fly on release speed).
+    waitUntil([] { return false; }, 90);
     mouseButton(w, QEvent::MouseButtonRelease, from + delta, Qt::LeftButton);
 }
 
@@ -4058,10 +4080,29 @@ void phase3UiTests()
         return t.isEmpty() ? QString() : t.first()->property("text").toString();
     };
 
-    // Needs Me: the pill counts, Cmd+2 filters to it, Cmd+1 brings every island back.
+    // Needs Me: one bell with a count badge (no All / Needs Me text pills), Cmd+2 filters to it,
+    // Cmd+1 brings every island back.
+    Q_UNUSED(pillText);
+    auto bellCount = [&] {
+        QQuickItem *t = firstItem(win, "needsBellCount");
+        QQuickItem *b = firstItem(win, "needsBellBadge");
+        return t && b && b->isVisible() ? t->property("text").toString() : QString();
+    };
     const int needs = needsMeCount(backend);
-    check(needs >= 1 && pillText("filterNeedsMe") == QStringLiteral("Needs Me (%1)").arg(needs) && pillText("filterAll") == "All",
-          "needs me: top bar shows All · Needs Me (N)", pillText("filterNeedsMe"));
+    check(needs >= 1 && firstItem(win, "needsBell") && firstItem(win, "needsBell")->isVisible()
+              && bellCount() == QString::number(needs) && !firstItem(win, "filterAll") && !firstItem(win, "filterNeedsMe"),
+          "needs me: the top bar is one bell with an N badge (no All / Needs Me pills)", bellCount());
+    {
+        // Addressing a card decrements the badge live; at zero it is a bare bell.
+        backend.applyBoard({BoardRow{firstSessionId(backend, "phonon"), QStringLiteral("idle"), QString()}});
+        settle(60);
+        const int after = needsMeCount(backend);
+        check(after == needs - 1 && (after > 0 ? bellCount() == QString::number(after) : bellCount().isEmpty()),
+              "needs me: the bell count drops live as a card is addressed", bellCount() + " vs " + QString::number(after));
+        backend.applyBoard({BoardRow{firstSessionId(backend, "phonon"), QStringLiteral("needs-ok"), QString()}});
+        settle(60);
+        check(bellCount() == QString::number(needs), "needs me: and climbs back when it waits again", bellCount());
+    }
     const int all = int(islands().size());
     sendKey(win, Qt::Key_2, Qt::ControlModifier);
     settle(300);
@@ -4084,24 +4125,33 @@ void phase3UiTests()
     settle(300);
     check(app->property("islandFilter").toString() == "all" && islands().size() == all, "needs me: Cmd+1 shows All again",
           QString::number(islands().size()));
-    if (QQuickItem *p = firstItem(win, "filterNeedsMe")) {
+    if (QQuickItem *p = firstItem(win, "needsBell")) {
         mouseClick(win, p->mapToScene(QPointF(p->width() / 2, p->height() / 2)), Qt::LeftButton, {});
         settle(200);
-        check(app->property("islandFilter").toString() == "needs", "needs me: clicking the pill filters too");
+        check(app->property("islandFilter").toString() == "needs", "needs me: clicking the bell filters too");
         sendKey(win, Qt::Key_1, Qt::ControlModifier);
         settle(250);
     }
 
-    // Freeform drag: transform-only while moving, committed once on release, persisted.
+    // Freeform drag: transform-only while moving, committed once on release, persisted. The last
+    // card (bottom row) moves down-right into open space, so it lands exactly as dropped (a drop
+    // onto another card would be nudged clear of it).
     QList<QQuickItem *> isl = islands();
-    QQuickItem *card = isl.value(0);
-    check(card != nullptr, "cards: an island to drag");
-    if (!card)
+    QQuickItem *card = nullptr;
+    QQuickItem *left = nullptr;
+    for (QQuickItem *it : isl) {
+        if (it->property("index").toInt() == 4)
+            card = it;
+        if (it->property("index").toInt() == 3)
+            left = it;
+    }
+    check(card != nullptr && left != nullptr, "cards: an island to drag");
+    if (!card || !left)
         return;
     const QString key = card->property("proj").toMap().value("key").toString();
     const QPointF xy0(card->x(), card->y());
     const QPointF from = card->mapToScene(QPointF(card->width() / 2, card->height() / 2));
-    const QPointF delta(260, 90);
+    const QPointF delta(60, 190);
     // Mid-drag: the card rides its Translate while x / y (the layout) stay put.
     mouseMove(win, from);
     mouseButton(win, QEvent::MouseButtonPress, from, Qt::LeftButton);
@@ -4117,6 +4167,7 @@ void phase3UiTests()
         mouseMove(win, from + delta * (i / 24.0), Qt::LeftButton);
         QCoreApplication::processEvents();
     }
+    settle(90);  // hold still, then let go: a drop, not a flick
     mouseButton(win, QEvent::MouseButtonRelease, from + delta, Qt::LeftButton);
     settle(120);
     check(app->property("lens").toInt() == 0, "cards: a drag never opens the island");
@@ -5446,9 +5497,567 @@ void finalWiringTests()
     }
 }
 
+namespace {
+
+// --- Constellation map: clusters, free cursor, flick physics, marquee ----------------------
+
+void mapUnitTests()
+{
+    // Cluster classifier: Lapis category first, then ~tab: / scratch, else a repo project.
+    check(mapClusterFor("cluster-serving", "infinity", "~/dev/cluster-serving") == "Work"
+              && mapClusterFor("lapis", "apps", "~/dev/lapis") == "Apps"
+              && mapClusterFor("~tab:14e5ecb8", "", "~") == "Quick Qs"
+              && mapClusterFor("notes", "quick Qs", "~/dev/notes") == "Quick Qs"
+              && mapClusterFor("scratch", "", "/tmp") == "Quick Qs"
+              && mapClusterFor("minecraft", "minecraft", "~/dev/minecraft") == "Projects"
+              && mapClusterFor("yoctogpt", "", "~/dev/yoctogpt") == "Projects",
+          "map: categories classify into Work / Apps / Quick Qs / Projects");
+    check(normalizeClusterName("quick qs") == "Quick Qs" && normalizeClusterName("app") == "Apps"
+              && normalizeClusterName("WORK") == "Work" && normalizeClusterName("banana").isEmpty(),
+          "map: cluster names normalize");
+
+    // move_cluster on the two-column cluster grid (Work Projects / Apps Quick Qs).
+    const QStringList d = defaultClusterOrder();
+    check(moveClusterInOrder(d, d, "Apps", "top") == QStringList{"Apps", "Projects", "Work", "Quick Qs"},
+          "map: Apps to the top swaps it with Work (same column)",
+          moveClusterInOrder(d, d, "Apps", "top").join(","));
+    check(moveClusterInOrder(d, d, "Work", "right") == QStringList{"Projects", "Work", "Apps", "Quick Qs"},
+          "map: Work to the right swaps within its row");
+    check(moveClusterInOrder(d, d, "Work", "left") == d && moveClusterInOrder(d, d, "Quick Qs", "bottom") == d
+              && moveClusterInOrder(d, d, "nope", "left") == d,
+          "map: a blocked or unknown move leaves the order");
+    check(moveClusterInOrder(d, {"Work", "Apps"}, "apps", "left") == QStringList{"Apps", "Projects", "Work", "Quick Qs"},
+          "map: moves count only the clusters on screen (empty ones keep their place)",
+          moveClusterInOrder(d, {"Work", "Apps"}, "apps", "left").join(","));
+
+    // Natural language / voice.
+    auto pc = [](const char *t) {
+        const StudioCommand c = parseStudioCommand(QString::fromUtf8(t));
+        return c.action + (c.arg.isEmpty() ? QString() : ":" + c.arg);
+    };
+    check(pc("sort the map by recent") == "sort_map:recent" && pc("can you sort the cards by activity please") == "sort_map:activity"
+              && pc("group the islands by category") == "sort_map:category",
+          "map: 'sort the map by ...' parses to sort_map",
+          pc("sort the map by recent") + " | " + pc("can you sort the cards by activity please"));
+    check(pc("move the work cluster to the left") == "move_cluster:Work:left" && pc("put apps on top") == "move_cluster:Apps:top"
+              && pc("move quick qs down") == "move_cluster:Quick Qs:bottom",
+          "map: 'move the work cluster to the left' parses to move_cluster",
+          pc("move the work cluster to the left") + " | " + pc("put apps on top") + " | " + pc("move quick qs down"));
+    {
+        QString answer = QStringLiteral("[[ACTION:move_cluster:Apps:top]] [[ACTION:sort_map:recent]] Done.");
+        const QList<StudioCommand> tags = extractActionTags(&answer);
+        check(tags.size() == 2 && tags[0].action == "move_cluster" && tags[0].arg == "Apps:top" && tags[1].arg == "recent"
+                  && answer == "Done.",
+              "map: model [[ACTION:move_cluster:Apps:top]] tags are known actions", answer);
+    }
+
+    // Backend: the actions re-sort, persist, and reset dragged cards.
+    {
+        QTemporaryDir tmp;
+        Backend b(Backend::Mode::Mock);
+        b.setPrefsPath(tmp.path() + "/studio_prefs.json");
+        b.mockSetCategory("cluster-serving", "infinity");
+        b.mockSetCategory("lapis", "apps");
+        b.mockAddProject("~tab:aa11bb22", "Why is the fn key slow", "~", "quick Qs", "idle");
+        QStringList clusters;
+        for (const QVariant &v : b.projects())
+            clusters << v.toMap().value("cluster").toString();
+        check(clusters.contains("Work") && clusters.contains("Apps") && clusters.contains("Quick Qs") && clusters.contains("Projects"),
+              "map: projectMap carries the cluster", clusters.join(","));
+        check(b.presentClusters() == defaultClusterOrder(), "map: all four clusters present", b.presentClusters().join(","));
+        b.setCardPosition("lapis", 0.5, 0.5);
+        const QString r1 = b.dispatchStudioAction("move_cluster", "Apps:top");
+        check(b.clusterOrder() == QStringList{"Apps", "Projects", "Work", "Quick Qs"} && b.cardPositions().isEmpty()
+                  && r1.contains("Moved Apps"),
+              "map: move_cluster reorders clusters and re-flows dragged cards", r1);
+        const QString r2 = b.dispatchStudioAction("sort_map", "recent");
+        check(b.mapSort() == "recent" && r2.contains("recent"), "map: sort_map:recent", r2);
+        check(b.dispatchStudioAction("move_cluster", "Apps:top").contains("already"), "map: a blocked move says so");
+        check(b.savePrefs(), "map: prefs flush");
+        Backend r(Backend::Mode::Mock);
+        r.setPrefsPath(b.prefsPath());
+        check(r.mapSort() == "recent" && r.clusterOrder() == b.clusterOrder(), "map: sort and cluster order reload from prefs",
+              r.mapSort() + " " + r.clusterOrder().join(","));
+    }
+
+    // Gamepad: analog left stick (0.14 radial deadzone, quadratic) and the ✕ hold edge.
+    {
+        double x = 9, y = 9;
+        GamepadState::shapeStick(0.13, 0.0, &x, &y);
+        const bool dead = x == 0 && y == 0;
+        GamepadState::shapeStick(1.0, 0.0, &x, &y);
+        const bool full = std::abs(x - 1.0) < 1e-9 && y == 0;
+        GamepadState::shapeStick(0.57, 0.0, &x, &y);
+        const bool quad = std::abs(x - 0.25) < 1e-9;
+        GamepadState::shapeStick(0.0, 1.0, &x, &y);
+        const bool up = std::abs(y + 1.0) < 1e-9;
+        check(dead && full && quad && up, "pad: analog stick deadzone 0.14, quadratic curve, stick up is screen up");
+
+        Gamepad g;
+        QList<QPair<double, double>> moves;
+        int navs = 0;
+        QList<bool> held;
+        QObject::connect(&g, &Gamepad::cursorMove, &g, [&](double vx, double vy) { moves.append({vx, vy}); });
+        QObject::connect(&g, &Gamepad::nav, &g, [&](int, int) { ++navs; });
+        QObject::connect(&g, &Gamepad::confirmHeld, &g, [&](bool down) { held.append(down); });
+        g.setAnalogCursor(true);
+        GamepadSnapshot s;
+        s.lx = 0.8;
+        s.ly = 0.3;
+        for (int t = 0; t <= 80; t += 8)
+            g.processSnapshot(s, t);
+        const bool streaming = moves.size() == 11 && moves.last().first > 0 && moves.last().second < 0 && navs == 0
+                               && g.leftX() > 0 && g.leftY() < 0;
+        g.processSnapshot(GamepadSnapshot(), 90);
+        g.processSnapshot(GamepadSnapshot(), 98);
+        check(streaming && moves.size() == 12 && moves.last().first == 0 && moves.last().second == 0 && g.leftX() == 0,
+              "pad: analog cursor mode streams stick velocity per poll (no nav steps), one 0,0 on release",
+              QStringLiteral("%1 moves, %2 navs").arg(moves.size()).arg(navs));
+        GamepadSnapshot dp;
+        dp.dpadX = 1;
+        g.processSnapshot(dp, 200);
+        g.processSnapshot(GamepadSnapshot(), 210);
+        check(navs == 1, "pad: the d-pad still hops in analog cursor mode", QString::number(navs));
+        GamepadSnapshot a;
+        a.a = true;
+        g.processSnapshot(a, 300);
+        g.processSnapshot(GamepadSnapshot(), 400);
+        check(held == QList<bool>{true, false}, "pad: ✕ reports its hold edges (down, up)");
+        g.setAnalogCursor(false);
+        s.ly = 0;
+        g.processSnapshot(s, 500);
+        check(navs == 2, "pad: out of cursor mode the stick steps again", QString::number(navs));
+    }
+}
+
+QList<QQuickItem *> mapIslands(QQuickWindow *win)
+{
+    QList<QQuickItem *> out;
+    for (QQuickItem *it : findItems(win->contentItem(), "island"))
+        if (it->isVisible() && it->property("draggable").toBool())
+            out << it;
+    return out;
+}
+QRectF itemRect(QQuickItem *it) { return QRectF(it->x(), it->y(), it->width(), it->height()); }
+int overlapPairs(const QList<QQuickItem *> &isl, QStringList *pairs = nullptr)
+{
+    int n = 0;
+    for (int i = 0; i < isl.size(); ++i)
+        for (int j = i + 1; j < isl.size(); ++j)
+            if (itemRect(isl[i]).intersects(itemRect(isl[j]))) {
+                ++n;
+                if (pairs)
+                    *pairs << isl[i]->property("key").toString() + " x " + isl[j]->property("key").toString();
+            }
+    return n;
+}
+QQuickItem *islandByKey(QQuickWindow *win, const QString &key)
+{
+    for (QQuickItem *it : mapIslands(win))
+        if (it->property("key").toString() == key)
+            return it;
+    return nullptr;
+}
+// The cluster scene: the five fixtures across Work / Projects / Apps plus two Quick Qs tabs.
+void seedClusterScene(Backend &b)
+{
+    b.mockSetCategory("cluster-serving", "infinity");
+    b.mockSetCategory("lapis", "apps");
+    b.mockSetCategory("phonon", "apps");
+    b.mockAddProject("~tab:aa11bb22", "Why is the fn key slow", "~", "quick Qs", "idle");
+    b.mockAddProject("~tab:cc33dd44", "Best eSIM for Japan", "~", "quick Qs", "finished");
+}
+
+void mapUiTests()
+{
+    Backend backend(Backend::Mode::Mock);
+    QTemporaryDir tmp;
+    backend.setPrefsPath(tmp.path() + "/studio_prefs.json");
+    backend.completeOnboarding("controller");
+    QQmlApplicationEngine engine;
+    QQuickWindow *win = createStudioWindow(engine, &backend, false, QSize(1920, 1080));
+    check(win != nullptr, "map ui: QML loads");
+    if (!win)
+        return;
+    QObject *app = win->findChild<QObject *>("studioApp");
+    QObject *map = win->findChild<QObject *>("constellation");
+    TargetRegistry *reg = backend.targets();
+    Gamepad *pad = backend.gamepad();
+    if (!app || !map || !pad) {
+        check(false, "map ui: app, constellation and pad present");
+        return;
+    }
+    settle(450);
+    seedClusterScene(backend);
+    settle(300);
+
+    // Clusters: tidy, labelled, zero overlap between cards and between clusters.
+    QList<QQuickItem *> isl = mapIslands(win);
+    {
+        QStringList pairs;
+        check(isl.size() == 7 && overlapPairs(isl, &pairs) == 0, "map ui: seven cards, zero overlapping pairs",
+              QString::number(isl.size()) + " " + pairs.join("; "));
+        QHash<QString, QRectF> box;
+        for (QQuickItem *it : isl) {
+            const QString c = it->property("proj").toMap().value("cluster").toString();
+            box[c] = box.contains(c) ? box[c].united(itemRect(it)) : itemRect(it);
+        }
+        bool apart = box.size() == 4;
+        for (auto a = box.cbegin(); a != box.cend(); ++a)
+            for (auto b = std::next(a); b != box.cend(); ++b)
+                apart = apart && !a.value().intersects(b.value());
+        check(apart, "map ui: four category clusters, their bounding boxes never overlap", QStringList(box.keys()).join(","));
+        QStringList labels;
+        for (QQuickItem *t : findItems(win->contentItem(), "clusterLabel"))
+            if (t->isVisible())
+                labels << t->property("text").toString();
+        check(labels == QStringList{"WORK", "PROJECTS", "APPS", "QUICK QS"}, "map ui: uppercase micro-labels, in cluster order",
+              labels.join(","));
+        // Lines join cards of one cluster only.
+        bool inside = true;
+        const QVariantList projects = backend.projects();
+        const QVariantList edges = map->property("edges").toList();
+        for (const QVariant &e : edges) {
+            const QVariantList ab = e.toList();
+            inside = inside && projects.value(ab.value(0).toInt()).toMap().value("cluster")
+                                   == projects.value(ab.value(1).toInt()).toMap().value("cluster");
+        }
+        check(!edges.isEmpty() && inside, "map ui: constellation lines stay inside each cluster", QString::number(edges.size()));
+        const QImage shot = win->grabWindow();
+        QStringList tp;
+        check(forbiddenPixels(shot) == 0 && textOverlaps(win, &tp) == 0, "map ui: clustered map clean (palette, text overlaps)",
+              tp.join("; "));
+    }
+
+    // Voice reorder: move Apps to the top, the cards spring there, still no overlaps.
+    {
+        QQuickItem *apps = islandByKey(win, "lapis");
+        const double y0 = apps ? apps->y() : 0;
+        backend.dispatchStudioAction("move_cluster", "Apps:top");
+        settle(120);
+        const double yMid = apps ? apps->y() : 0;
+        const bool gliding = map->property("gliding").toBool();
+        settle(1500);
+        const double y1 = apps ? apps->y() : 0;
+        QStringList pairs;
+        check(apps && gliding && y1 < y0 - 100 && yMid > y1 + 1 && overlapPairs(mapIslands(win), &pairs) == 0,
+              "map ui: move_cluster Apps:top glides the Apps cards up on a spring, no overlaps after",
+              QStringLiteral("y %1 -> mid %2 -> %3 %4").arg(y0).arg(yMid).arg(y1).arg(pairs.join(";")));
+        backend.dispatchStudioAction("move_cluster", "Apps:bottom");
+        settle(1500);
+    }
+
+    // Controller mode hides the corner numbers; keyboard / mouse shows them.
+    {
+        auto numbersShown = [&] {
+            int n = 0;
+            for (QQuickItem *t : findItems(win->contentItem(), "islandNumber"))
+                n += t->isVisible() && !t->property("text").toString().isEmpty();
+            return n;
+        };
+        const int inController = numbersShown();
+        backend.setNavMode("vim");
+        settle(60);
+        const int inVim = numbersShown();
+        backend.setNavMode("controller");
+        settle(60);
+        check(inController == 0 && inVim >= 7, "map ui: card numbers hide in controller mode, show for the keyboard",
+              QStringLiteral("%1 / %2").arg(inController).arg(inVim));
+    }
+
+    // Free cursor: a pad shows it; the stick glides it onto a card, which highlights, becomes
+    // the selection and the active session target.
+    pad->setConnected(true, QStringLiteral("DualShock 4"));
+    settle(300);
+    QQuickItem *cursor = firstItem(win, "mapCursor");
+    check(cursor && cursor->isVisible() && pad->analogCursor(), "map ui: a connected pad shows the free cursor (analog mode)");
+    {
+        QQuickItem *target = islandByKey(win, "yoctogpt");
+        const int ti = target ? target->property("projIndex").toInt() : -1;
+        qint64 t = 10000;
+        bool over = false;
+        for (int k = 0; k < 400 && target && !over; ++k) {
+            const QPointF c = itemRect(target).center();
+            const QPointF at(map->property("cursorX").toReal(), map->property("cursorY").toReal());
+            const QPointF d = c - at;
+            const double len = std::hypot(d.x(), d.y());
+            GamepadSnapshot s;
+            s.lx = len > 1 ? d.x() / len : 0;
+            s.ly = len > 1 ? -d.y() / len : 0;
+            pad->processSnapshot(s, t);
+            t += 8;
+            settle(8);
+            over = map->property("hoverIndex").toInt() == ti;
+        }
+        pad->processSnapshot(GamepadSnapshot(), t);
+        settle(60);
+        const QVariantMap at = reg->activeTarget();
+        // The card reports itself (kind session); the selection it becomes then re-reports it
+        // as the focus cursor's island target. Either way the active target is this project.
+        check(over && app->property("selectedIsland").toInt() == ti && target->property("cursorOver").toBool()
+                  && (at.value("kind") == "session" || at.value("kind") == "island") && at.value("sessionId") == "yoctogpt",
+              "map ui: the stick glides the cursor onto a card: it highlights, selects and becomes the session target",
+              at.value("kind").toString() + " " + at.value("sessionId").toString());
+    }
+    // Aim assist: the same stick moves the cursor 35% slower over a card.
+    {
+        QMetaObject::invokeMethod(map, "setStick", Q_ARG(QVariant, 1.0), Q_ARG(QVariant, 0.0));
+        map->setProperty("cursorX", 30.0);
+        map->setProperty("cursorY", 1050.0);
+        QMetaObject::invokeMethod(map, "advance", Q_ARG(QVariant, 0.05));
+        const double free = map->property("cursorX").toReal() - 30.0;
+        QQuickItem *card = islandByKey(win, "kernel-search");
+        const QPointF c = itemRect(card).center();
+        map->setProperty("cursorX", c.x() - 60);
+        map->setProperty("cursorY", c.y());
+        QMetaObject::invokeMethod(map, "advance", Q_ARG(QVariant, 0.05));
+        const double slow = map->property("cursorX").toReal() - (c.x() - 60);
+        QMetaObject::invokeMethod(map, "setStick", Q_ARG(QVariant, 0.0), Q_ARG(QVariant, 0.0));
+        check(free > 0 && std::abs(slow / free - 0.65) < 0.03, "map ui: aim assist slows the cursor ~35% over a card",
+              QStringLiteral("%1 px free, %2 px over a card").arg(free).arg(slow));
+    }
+
+    // Quick ✕ tap on a card opens it.
+    {
+        QQuickItem *card = islandByKey(win, "kernel-search");
+        const QPointF c = itemRect(card).center();
+        map->setProperty("cursorX", c.x());
+        map->setProperty("cursorY", c.y());
+        settle(30);
+        GamepadSnapshot a;
+        a.a = true;
+        pad->processSnapshot(a, 50000);
+        pad->processSnapshot(GamepadSnapshot(), 50050);
+        settle(450);
+        check(app->property("lens").toInt() > 0 && app->property("projectKey").toString() == "kernel-search",
+              "map ui: a quick ✕ tap on the card under the cursor opens it");
+        GamepadSnapshot b;
+        b.b = true;
+        pad->processSnapshot(b, 51000);
+        pad->processSnapshot(GamepadSnapshot(), 51050);
+        settle(450);
+        check(app->property("lens").toInt() == 0, "map ui: ○ comes back to the map");
+    }
+
+    // ✕ held on a card grabs it (lift + accent), the card tracks the cursor with zero lag, and a
+    // release mid-motion flicks it: it coasts on, slows by friction and settles inside the
+    // window, clear of other cards, persisted.
+    {
+        QQuickItem *card = islandByKey(win, "yoctogpt");
+        const QPointF c0 = itemRect(card).center();
+        map->setProperty("cursorX", c0.x());
+        map->setProperty("cursorY", c0.y());
+        settle(30);
+        GamepadSnapshot a;
+        a.a = true;
+        pad->processSnapshot(a, 60000);
+        settle(30);
+        const bool grabbed = card->property("grabbed").toBool();
+        // Down, into the open band between the Projects and Quick Qs clusters.
+        QMetaObject::invokeMethod(map, "setStick", Q_ARG(QVariant, 0.0), Q_ARG(QVariant, 0.5));
+        QMetaObject::invokeMethod(map, "advance", Q_ARG(QVariant, 0.04));
+        const QPointF cur(map->property("cursorX").toReal(), map->property("cursorY").toReal());
+        const QPointF mid = itemRect(card).center();
+        const bool tracks = std::abs((mid - c0).y() - (cur.y() - c0.y())) < 0.5 && std::abs(mid.x() - c0.x()) < 0.5
+                            && cur.y() > c0.y() + 20;
+        const double vx = map->property("cursorVy").toReal();
+        pad->processSnapshot(GamepadSnapshot(), 60300);  // ✕ up while the stick still pushes down
+        QMetaObject::invokeMethod(map, "setStick", Q_ARG(QVariant, 0.0), Q_ARG(QVariant, 0.0));
+        const bool flying = map->property("flightCount").toInt() == 1;
+        const double releaseY = mid.y();
+        const bool landed = waitUntil([&] { return map->property("flightCount").toInt() == 0; }, 5000);
+        settle(60);
+        const QRectF r = itemRect(card);
+        QStringList pairs;
+        check(grabbed && tracks, "map ui: ✕ held grabs the card and it tracks the cursor with zero lag",
+              QStringLiteral("grabbed %1 card dy %2 cursor dy %3").arg(grabbed).arg((mid - c0).y()).arg(cur.y() - c0.y()));
+        check(!card->property("grabbed").toBool() && vx > 400 && flying && landed,
+              "map ui: releasing mid-motion launches a flick that comes to rest",
+              QStringLiteral("vy %1 flying %2 landed %3").arg(vx).arg(flying).arg(landed));
+        check(r.center().y() > releaseY + 40 && r.left() >= 0 && r.top() >= 64 && r.right() <= 1920 && r.bottom() <= 1080
+                  && overlapPairs(mapIslands(win), &pairs) == 0 && backend.cardPositions().contains("yoctogpt"),
+              "map ui: the flicked card coasts past the release point, settles inside the window, clear of others, persisted",
+              QStringLiteral("release y %1 -> rest %2,%3 %4").arg(releaseY).arg(r.center().x()).arg(r.center().y()).arg(pairs.join(";")));
+    }
+
+    // Mouse flick: a fast drag released in motion carries the card further than the pointer.
+    {
+        QQuickItem *card = islandByKey(win, "kernel-search");
+        const QPointF from = card->mapToScene(QPointF(card->width() / 2, card->height() / 2));
+        mouseMove(win, from);
+        mouseButton(win, QEvent::MouseButtonPress, from, Qt::LeftButton);
+        for (int i = 1; i <= 8; ++i) {
+            mouseMove(win, from + QPointF(0, 12.0 * i), Qt::LeftButton);
+            settle(6);
+        }
+        mouseButton(win, QEvent::MouseButtonRelease, from + QPointF(0, 96), Qt::LeftButton);
+        const bool flying = map->property("flightCount").toInt() == 1;
+        waitUntil([&] { return map->property("flightCount").toInt() == 0; }, 5000);
+        settle(60);
+        const double travelled = itemRect(card).center().y() - from.y();
+        check(flying && travelled > 110 && app->property("lens").toInt() == 0,
+              "map ui: a mouse drag released in motion flicks the card on past the pointer",
+              QStringLiteral("flying %1 travelled %2 px for a 96 px drag").arg(flying).arg(travelled));
+    }
+    backend.resetCardPositions();
+    settle(200);
+
+    // Rubber band (pad): ✕ held on empty space draws the marquee; release selects every card it
+    // touches, pins them as session targets, and the ask card carries them all.
+    {
+        QQuickItem *a = islandByKey(win, "cluster-serving");
+        QQuickItem *b = islandByKey(win, "kernel-search");
+        const QRectF ra = itemRect(a), rb = itemRect(b);
+        const QPointF start(ra.left() - 20, ra.top() - 40);
+        map->setProperty("cursorX", start.x());
+        map->setProperty("cursorY", start.y());
+        settle(30);
+        check(map->property("hoverIndex").toInt() == -1, "map ui: marquee starts on empty space");
+        GamepadSnapshot x;
+        x.a = true;
+        pad->processSnapshot(x, 70000);
+        settle(20);
+        map->setProperty("cursorX", rb.center().x());
+        map->setProperty("cursorY", ra.bottom() - 10);
+        settle(40);
+        QQuickItem *mq = firstItem(win, "marqueeRect");
+        const bool drawn = mq && mq->isVisible() && mq->width() > 100 && mq->height() > 100;
+        pad->processSnapshot(GamepadSnapshot(), 70400);
+        settle(60);
+        const QStringList sel = map->property("selectedKeys").toStringList();
+        int rings = 0;
+        for (QQuickItem *r : findItems(win->contentItem(), "islandSelectRing"))
+            rings += r->isVisible();
+        QStringList pinned;
+        for (const QVariant &v : reg->pinnedTargets())
+            pinned << v.toMap().value("sessionId").toString();
+        check(drawn && sel.contains("cluster-serving") && sel.contains("kernel-search") && sel.size() >= 2
+                  && rings == sel.size() && reg->pinnedCount() == sel.size() && pinned.contains("kernel-search"),
+              "map ui: ✕ drag on empty space draws a marquee; the cards it covers get rings and pin into backend.targets",
+              QStringLiteral("sel %1 rings %2 pins %3").arg(sel.join(",")).arg(rings).arg(pinned.join(",")));
+
+        // Grabbing one selected card moves the whole selection together.
+        QList<QPointF> before;
+        for (const QString &k : sel)
+            before << itemRect(islandByKey(win, k)).center();
+        const QPointF ca = itemRect(a).center();
+        map->setProperty("cursorX", ca.x());
+        map->setProperty("cursorY", ca.y());
+        settle(20);
+        pad->processSnapshot(x, 71000);
+        settle(20);
+        map->setProperty("cursorX", ca.x() + 40);
+        map->setProperty("cursorY", ca.y() + 30);
+        QMetaObject::invokeMethod(map, "advance", Q_ARG(QVariant, 1.0 / 120));
+        bool together = true;
+        for (int i = 0; i < sel.size(); ++i) {
+            const QPointF now = itemRect(islandByKey(win, sel[i])).center();
+            together = together && std::abs(now.x() - before[i].x() - 40) < 0.5 && std::abs(now.y() - before[i].y() - 30) < 0.5;
+        }
+        pad->processSnapshot(GamepadSnapshot(), 71400);
+        waitUntil([&] { return map->property("flightCount").toInt() == 0; }, 5000);
+        settle(60);
+        check(together, "map ui: dragging one selected card moves the whole selection together");
+
+        // The ask card (Cmd+K) opens about every selected card at once.
+        sendKey(win, Qt::Key_K, Qt::ControlModifier);
+        settle(60);
+        QObject *omni = win->findChild<QObject *>("floatingOmnibar");
+        const QVariantList chips = omni ? omni->property("chips").toList() : QVariantList();
+        const QString slice = reg->buildCombinedSlice(4000);
+        check(omni && omni->property("open").toBool() && chips.size() == sel.size() && slice.contains("cluster-serving")
+                  && slice.contains("kernel-search"),
+              "map ui: Cmd+K asks about all selected cards (one chip each, all in the Tier 3 slice)",
+              QString::number(chips.size()));
+        sendKey(win, Qt::Key_Escape);
+        settle(60);
+        QMetaObject::invokeMethod(app, "takeFocus");
+        sendKey(win, Qt::Key_Escape);
+        settle(60);
+        check(map->property("selectedKeys").toStringList().isEmpty() && reg->pinnedCount() == 0,
+              "map ui: Esc clears the multi-selection and its pins");
+    }
+    backend.resetCardPositions();
+    settle(200);
+
+    // Rubber band (mouse) over empty space, then ○ clears it; a plain click on empty space too.
+    {
+        QQuickItem *q1 = islandByKey(win, "~tab:aa11bb22");
+        const QRectF rq = itemRect(q1);
+        const QPointF from(rq.left() - 16, rq.top() - 30);
+        mouseDrag(win, from, QPointF(rq.width() + 40, rq.height() + 50));
+        settle(60);
+        const QStringList sel = map->property("selectedKeys").toStringList();
+        check(sel.contains("~tab:aa11bb22") && reg->pinnedCount() == sel.size(), "map ui: a mouse drag on empty space selects too",
+              sel.join(","));
+        GamepadSnapshot b;
+        b.b = true;
+        pad->processSnapshot(b, 80000);
+        pad->processSnapshot(GamepadSnapshot(), 80050);
+        settle(60);
+        check(map->property("selectedKeys").toStringList().isEmpty() && reg->pinnedCount() == 0 && app->property("lens").toInt() == 0,
+              "map ui: ○ clears the selection (and stays on the map)");
+        mouseDrag(win, from, QPointF(rq.width() + 40, rq.height() + 50));
+        settle(60);
+        mouseClick(win, QPointF(from.x(), from.y()), Qt::LeftButton);
+        settle(60);
+        check(map->property("selectedKeys").toStringList().isEmpty(), "map ui: clicking empty space clears it");
+    }
+    check(map->property("needsMeOnly").toBool() == false, "map ui: needsMeOnly mirrors the filter");
+    pad->setConnected(false, QString());
+    settle(60);
+}
+
+}  // namespace
+
+// --snap-map OUT.png: the clustered Constellation with the free pad cursor mid-marquee and a
+// finished multi-selection (rings), dark, 1920x1080.
+int snapMap(const QString &outPath)
+{
+    Backend backend(Backend::Mode::Mock);
+    QQmlApplicationEngine engine;
+    QQuickWindow *win = createStudioWindow(engine, &backend, false, QSize(1920, 1080));
+    if (!win) {
+        std::fprintf(stderr, "snap-map: QML failed to load\n");
+        return 2;
+    }
+    QObject *map = win->findChild<QObject *>("constellation");
+    Gamepad *pad = backend.gamepad();
+    if (!map || !pad)
+        return 3;
+    QDir().mkpath(QFileInfo(outPath).absolutePath());
+    settle(450);
+    seedPhase3Scene(backend);
+    seedClusterScene(backend);
+    pad->setConnected(true, QStringLiteral("DualShock 4"));
+    settle(500);
+    // A finished selection: the two Apps cards.
+    map->setProperty("selectedKeys", QStringList{});
+    QMetaObject::invokeMethod(map, "setSelection", Q_ARG(QVariant, QVariant(QStringList{"lapis", "phonon"})));
+    // A marquee in progress from empty space over the Quick Qs cards, the cursor at its corner.
+    QQuickItem *q1 = islandByKey(win, "~tab:aa11bb22");
+    QQuickItem *q2 = islandByKey(win, "~tab:cc33dd44");
+    if (q1 && q2) {
+        const QRectF a = itemRect(q1), b = itemRect(q2);
+        map->setProperty("cursorX", a.left() - 26);
+        map->setProperty("cursorY", a.top() - 30);
+        settle(30);
+        QMetaObject::invokeMethod(map, "padGrab", Q_ARG(QVariant, true));
+        map->setProperty("cursorX", b.center().x() + 20);
+        map->setProperty("cursorY", b.center().y() + 10);
+    }
+    mouseMove(win, QPointF(4, 1076));
+    settle(700);
+    const QImage img = win->grabWindow();
+    const bool saved = img.save(outPath);
+    std::printf("snap-map: %s (%dx%d) forbidden=%d\n", qPrintable(outPath), img.width(), img.height(), forbiddenPixels(img));
+    return saved ? 0 : 1;
+}
+
 int runTests()
 {
     unitTests();
+    mapUnitTests();
     studioControlTests();
     gamepadUnitTests();
     openAiCompatUnitTests();
@@ -5456,6 +6065,7 @@ int runTests()
     formFactorTests();
     phase3UnitTests();
     phase3UiTests();
+    mapUiTests();
     slowmixUiTests();
     omnibarUiTests();
     memoryTierTests();

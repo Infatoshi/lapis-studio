@@ -427,6 +427,14 @@ FocusScope {
             takeFocus();
             goLens(0);
             break;
+        case "sort_map":
+        case "move_cluster":
+            // The backend already re-sorted (and reset dragged cards): the islands glide there.
+            if (music.open) music.hide();
+            takeFocus();
+            goLens(0);
+            constellation.animateRelayout();
+            break;
         case "show_diffs":
             // The backend flipped the pref; land on the first diff, or keep the index in range.
             if (arg === "1" && lens === 2) {
@@ -642,6 +650,8 @@ FocusScope {
                 proseOpen = false;
             else if (lens > 0)
                 goLens(0);
+            else if (constellation.hasSelection)
+                constellation.clearSelection();
             e.accepted = true;
             return;
         }
@@ -684,16 +694,19 @@ FocusScope {
                 enterProject(constellation.slotOf(selectedIsland) >= 0 ? selectedIsland : constellation.slots[0]);
                 e.accepted = true;
             } else if (k === Qt.Key_Right) {
-                selectedIsland = constellation.stepSelection(selectedIsland, 1, true);
+                selectedIsland = constellation.navStep(selectedIsland, 1, 0);
                 e.accepted = true;
-            } else if (k === Qt.Key_Left || k === Qt.Key_Backtab) {
+            } else if (k === Qt.Key_Backtab) {
                 selectedIsland = constellation.stepSelection(selectedIsland, -1, true);
                 e.accepted = true;
+            } else if (k === Qt.Key_Left) {
+                selectedIsland = constellation.navStep(selectedIsland, -1, 0);
+                e.accepted = true;
             } else if (k === Qt.Key_Down) {
-                selectedIsland = constellation.stepSelection(selectedIsland, constellation.columns, false);
+                selectedIsland = constellation.navStep(selectedIsland, 0, 1);
                 e.accepted = true;
             } else if (k === Qt.Key_Up) {
-                selectedIsland = constellation.stepSelection(selectedIsland, -constellation.columns, false);
+                selectedIsland = constellation.navStep(selectedIsland, 0, -1);
                 e.accepted = true;
             }
             return;
@@ -792,8 +805,7 @@ FocusScope {
             stage.terms.step(dx + dy);
         } else if (lens === 0) {
             if (constellation.count === 0) return;
-            if (dx !== 0) selectedIsland = constellation.stepSelection(selectedIsland, dx, true);
-            else selectedIsland = constellation.stepSelection(selectedIsland, dy * constellation.columns, false);
+            selectedIsland = constellation.navStep(selectedIsland, dx, dy);
         } else if (dx !== 0) {
             if (lens === 2) stepArtifact(dx);
         } else {
@@ -825,6 +837,7 @@ FocusScope {
         else if (answers.pickerOpen) answers.pickerOpen = false;  // the composer keeps focus
         else if (answers.inputFocused) { if (!answers.toggleHighlight()) answers.send(0); }
         else if (lens === 2 && stage.terms.active) scopeToParam(stage.terms.current());
+        else if (lens === 0 && mapCursorOwnsPad) return;  // ✕ is hold-to-grab here (onConfirmHeld)
         else if (lens === 0) { if (constellation.count > 0) enterProject(constellation.slotOf(selectedIsland) >= 0 ? selectedIsland : constellation.slots[0]); }
         else if (lens === 1 && artifacts.length > 0) goLens(2);
         else omnibar.openAt(-1, -1);  // ✕ Prompt: the ask card, beside what the cursor is on
@@ -844,6 +857,7 @@ FocusScope {
         else if (lens === 2 && stage.terms.active) stage.terms.close();
         else if (proseOpen) proseOpen = false;
         else if (lens > 0) { takeFocus(); goLens(0); }
+        else if (constellation.hasSelection) constellation.clearSelection();
     }
     function padAcceptPrediction() {
         poke();
@@ -938,6 +952,19 @@ FocusScope {
         else if (lens > 0) answers.focusInput("");
         else if (!settings.open) briefing.show();  // the Constellation has nothing to send: Morning Briefing
     }
+    // On the settled Constellation with nothing over it, the left stick drives the free map
+    // cursor (analog, 240 Hz) and ✕ is hold-to-grab; everywhere else the stick navigates in steps.
+    readonly property bool mapCursorOwnsPad: padConnected && lens === 0 && zoom < 0.01 && !omnibar.open
+                                             && !controllerMap.open && !briefing.open && !review.open && !music.open
+                                             && !onboarding.open && !dialog.open && !settings.open
+                                             && !answers.inputFocused && !answers.pickerOpen
+    onMapCursorOwnsPadChanged: if (!mapCursorOwnsPad) constellation.setStick(0, 0)
+    Binding {
+        target: app.gamepad
+        when: app.gamepad !== null
+        property: "analogCursor"
+        value: app.mapCursorOwnsPad
+    }
     // While the Music card is open it owns the pad: ↕ pick · ✕ play · □ pause · ◄► / L1 / R1
     // speed · △ reverb · L2 loop · R2 bass · ○ close (music keeps playing).
     Binding {
@@ -976,6 +1003,21 @@ FocusScope {
         target: app.gamepad
         function onNav(dx, dy) { if (music.open) app.musicPad("nav", { dx: dx, dy: dy }); else app.padNav(dx, dy); }
         function onConfirm() { if (music.open) app.musicPad("confirm"); else app.padConfirm(); }
+        function onConfirmHeld(down) {
+            // A release always reaches a grab in progress, even if something opened meanwhile.
+            if (app.mapCursorOwnsPad || (!down && constellation.grabMode !== "")) {
+                app.poke();
+                constellation.padGrab(down);
+            }
+        }
+        function onCursorMove(vx, vy) {
+            if (app.mapCursorOwnsPad) {
+                app.poke();
+                constellation.setStick(vx, vy);
+            } else {
+                constellation.setStick(0, 0);
+            }
+        }
         function onBack() { if (music.open) app.musicPad("back"); else app.padBack(); }
         function onBackHeld(down) { if (!music.open) answers.setBackHeld(down); }
         function onAcceptPrediction() { if (music.open) app.musicPad("nextTab"); else app.padAcceptPrediction(); }
@@ -1025,6 +1067,7 @@ FocusScope {
     // Lens 1: constellation of project islands.
     Constellation {
         id: constellation
+        objectName: "constellation"
         anchors.fill: parent
         projects: app.projects
         selectedIndex: app.selectedIsland
@@ -1036,6 +1079,10 @@ FocusScope {
         targets: app.lens === 0 ? app.targets : null
         filter: app.islandFilter
         cardPositions: app.backend ? app.backend.cardPositions : ({})
+        clusterOrder: app.backend ? app.backend.clusterOrder : ["Work", "Projects", "Apps", "Quick Qs"]
+        mapSort: app.backend ? app.backend.mapSort : "category"
+        freeCursor: app.padConnected && app.lens === 0
+        onCursorPicked: (i) => { app.poke(); app.selectedIsland = i; }
         onEnter: (i) => app.enterProject(i)
         onZoomBy: (f) => app.zoomBy(f)
         onNewSession: dialog.show()

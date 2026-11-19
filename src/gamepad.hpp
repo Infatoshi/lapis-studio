@@ -60,12 +60,15 @@ struct GamepadAction {
         HorizontalInspect,
         VoiceHold,
         Send,
-        RawCaptured
+        RawCaptured,
+        ConfirmHeld,  // value 1.0 on the confirm input's press edge, 0.0 on its release
+        Cursor        // vx, vy: the shaped left stick (screen y down), every poll while deflected
     };
     Kind kind;
     int dx = 0, dy = 0;   // Nav: screen direction (dy +1 = down); Step: dx = -1 / +1
     double value = 0;     // Zoom: uiScale delta; Scroll: pixels; VoiceHold: 1.0 down / 0.0 up
     QString inputId = {}; // RawCaptured: physical slot id ("a", "l2", ...)
+    double vx = 0, vy = 0;  // Cursor: -1..+1 per axis after the deadzone and response curve
     static GamepadAction make(Kind k, int dx = 0, int dy = 0, double v = 0, const QString &in = {})
     {
         return {k, dx, dy, v, in};
@@ -84,6 +87,11 @@ public:
     static constexpr qint64 kScrollTickMs = 8;
     static constexpr double kScrollPxPerSec = 2000;  // full deflection
     static constexpr double kZoomStep = 0.10;
+    static constexpr double kCursorDeadzone = 0.14;  // analog cursor: radial deadzone
+
+    // The analog cursor's response: a radial deadzone, then a quadratic curve on the magnitude
+    // (fine aim near the centre, a fast sweep at full tilt), direction kept. Screen y is down.
+    static void shapeStick(double lx, double ly, double *outX, double *outY);
 
     static QHash<QString, QString> defaultBindings();
     static QStringList validInputs();
@@ -95,6 +103,13 @@ public:
     const QHash<QString, QString> &bindings() const { return m_bindings; }
     void setCaptureMode(bool on) { m_capture = on; }
     bool captureMode() const { return m_capture; }
+    // Analog cursor mode (the Constellation's free cursor owns the left stick): the stick stops
+    // emitting discrete Nav and emits Cursor velocity every poll instead; the d-pad still navs.
+    void setAnalogCursor(bool on);
+    bool analogCursor() const { return m_analog; }
+    // The shaped left stick from the latest poll (0, 0 inside the deadzone). Always tracked.
+    double leftX() const { return m_leftX; }
+    double leftY() const { return m_leftY; }
 
     QList<GamepadAction> process(const GamepadSnapshot &s, qint64 nowMs);
     void reset();
@@ -115,6 +130,8 @@ private:
     int m_rNavDx = 0;
     qint64 m_nextRNavMs = 0;
     bool m_chord = false;  // L1 + R1 held together: one ToggleMusic, no single-shoulder actions
+    bool m_analog = false;
+    double m_leftX = 0, m_leftY = 0;
 };
 
 class Gamepad : public QObject {
@@ -129,6 +146,11 @@ class Gamepad : public QObject {
     // True while the Music overlay owns the pad (StudioApp binds it): L2 then toggles loop
     // instead of holding the Phonon voice key.
     Q_PROPERTY(bool musicMode READ musicMode WRITE setMusicMode NOTIFY musicModeChanged)
+    // True while the Constellation's free cursor owns the left stick (StudioApp binds it).
+    Q_PROPERTY(bool analogCursor READ analogCursor WRITE setAnalogCursor NOTIFY analogCursorChanged)
+    // The shaped left stick (-1..+1, screen y down; 0 inside the 0.14 deadzone), per poll.
+    Q_PROPERTY(double leftX READ leftX NOTIFY leftStickChanged)
+    Q_PROPERTY(double leftY READ leftY NOTIFY leftStickChanged)
 
 public:
     using Snapshot = GamepadSnapshot;
@@ -143,6 +165,10 @@ public:
     bool voiceActive() const { return m_voiceActive; }
     bool musicMode() const { return m_musicMode; }
     void setMusicMode(bool on);
+    bool analogCursor() const { return m_state.analogCursor(); }
+    void setAnalogCursor(bool on);
+    double leftX() const { return m_leftX; }
+    double leftY() const { return m_leftY; }
     // Interactive live window only: starts watching GCController connect / disconnect.
     void setEnabled(bool on);
     void setCaptureMode(bool on);
@@ -173,8 +199,14 @@ signals:
     void voiceActiveChanged();
     void bindingsChanged();
     void musicModeChanged();
+    void analogCursorChanged();
+    void leftStickChanged();
     void nav(int dx, int dy);
     void confirm();
+    // The confirm input (✕ by default) went down / up: hold-to-grab on the Constellation.
+    void confirmHeld(bool down);
+    // Analog cursor mode: shaped left-stick velocity, every poll while deflected, then one 0, 0.
+    void cursorMove(double vx, double vy);
     void back();
     void backHeld(bool down);
     void acceptPrediction();
@@ -205,6 +237,7 @@ private:
     bool m_voiceActive = false;
     bool m_musicMode = false;
     bool m_prevR3 = false;
+    double m_leftX = 0, m_leftY = 0;
     QString m_name;
     std::unique_ptr<Platform> m_platform;
     friend struct Platform;

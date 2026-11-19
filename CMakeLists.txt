@@ -112,6 +112,7 @@ qt_add_qml_module(lapis_studio
     qml/ProsePanel.qml
     qml/PredictorRing.qml
     qml/FocusCursor.qml
+    qml/MapCursor.qml
     qml/TermZoomBar.qml
     qml/SettingsOverlay.qml
     qml/ControllerMapOverlay.qml
