@@ -14,7 +14,11 @@
 #include <QJsonObject>
 #include <QSet>
 #include <QDateTime>
+#include <QElapsedTimer>
+#include <QTcpServer>
+#include <QTcpSocket>
 #include <QTemporaryDir>
+#include <QThread>
 #include <QWheelEvent>
 #include <QGuiApplication>
 #include <QQmlApplicationEngine>
@@ -2971,6 +2975,118 @@ void openAiCompatUnitTests()
     }
 }
 
+// Backend on top of lapis_llm: the context trunk / slice split, askStream refusing in mock mode,
+// and a two-turn conversation through an injected LlmRouter against a local SSE server.
+void llmRouterBackendTests()
+{
+    Backend b(Backend::Mode::Mock);
+    const QVariantList ps = b.projects();
+    QString key;
+    for (const QVariant &v : ps) {
+        const QString k = v.toMap().value("key").toString();
+        if (!b.contextSlice(k, 0).isEmpty()) {
+            key = k;
+            break;
+        }
+    }
+    check(!key.isEmpty(), "llm ctx: a mock project has an on-screen slice");
+    const QString full = b.contextFor(key, 0);
+    const QString trunk = b.contextTrunk(key);
+    const QString slice = b.contextSlice(key, 0);
+    check(slice.startsWith("On screen:") && !trunk.contains("On screen:"),
+          "llm ctx: slice holds the on-screen artifact, the trunk never does", slice.left(80));
+    check(QString(full).replace(QLatin1Char(' ') + slice, QString()) == trunk,
+          "llm ctx: contextFor = trunk with the slice spliced in (unchanged output)");
+    check(b.contextTrunk(key) == trunk && b.contextSlice(key, 1) != slice,
+          "llm ctx: switching artifacts changes only the slice, never the Tier 1 trunk");
+
+    // Mock mode with no router: refuse with an error, touch nothing.
+    QStringList finished;
+    QObject::connect(&b, &Backend::streamFinished, [&finished](const QString &id, const QString &err) {
+        finished << id + "|" + err;
+    });
+    b.askStream(QStringLiteral("s1"), key, 0, QStringLiteral("why?"));
+    check(finished.size() == 1 && finished[0].startsWith("s1|no LLM router") && b.spawnCount() == 0,
+          "llm stream: mock mode without a router finishes with an error, no network", finished.join(';'));
+    b.askStream(QStringLiteral("__quick__"), key, 0, QStringLiteral("x"));
+    check(finished.size() == 1, "llm stream: the internal quick stream id is refused");
+
+    // Injected router + local SSE server: a two-turn conversation keeps Tier 2.
+    QTcpServer server;
+    QList<QByteArray> bodies;
+    int replyNo = 0;
+    QObject::connect(&server, &QTcpServer::newConnection, [&] {
+        while (QTcpSocket *s = server.nextPendingConnection()) {
+            auto buf = std::make_shared<QByteArray>();
+            QObject::connect(s, &QTcpSocket::readyRead, s, [&, s, buf] {
+                *buf += s->readAll();
+                const qsizetype he = buf->indexOf("\r\n\r\n");
+                if (he < 0)
+                    return;
+                const QByteArray head = buf->left(he).toLower();
+                const qsizetype cl = head.indexOf("content-length:");
+                const qsizetype eol = head.indexOf("\r\n", cl);
+                const qsizetype len = cl < 0 ? 0 : head.mid(cl + 15, eol < 0 ? -1 : eol - cl - 15).trimmed().toLongLong();
+                if (buf->size() < he + 4 + len)
+                    return;
+                bodies << buf->mid(he + 4, len);
+                const QByteArray answer = ++replyNo == 1 ? "126 tok/s at c1." : "MTP adds 15 tok/s.";
+                const QByteArray body = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"checking\"}}]}\n\n"
+                                        "data: {\"choices\":[{\"delta\":{\"content\":\"" + answer + "\"}}]}\n\n"
+                                        "data: [DONE]\n\n";
+                s->write("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\nContent-Length: "
+                         + QByteArray::number(body.size()) + "\r\n\r\n" + body);
+                s->disconnectFromHost();
+            });
+            QObject::connect(s, &QTcpSocket::disconnected, s, &QObject::deleteLater);
+        }
+    });
+    check(server.listen(QHostAddress::LocalHost, 0), "llm stream: local SSE server listens");
+    LlmRouter router;
+    b.setLlmRouter(&router);
+    b.setOpenaiCompatUrl(QStringLiteral("http://127.0.0.1:%1/v1").arg(server.serverPort()));
+    QString text, thinking;
+    QObject::connect(&b, &Backend::streamDelta, [&](const QString &id, const QString &t, const QString &th) {
+        if (id == "conv") {
+            text += t;
+            thinking += th;
+        }
+    });
+    auto waitFinished = [&](int n) {
+        QElapsedTimer t;
+        t.start();
+        while (finished.size() < n && t.elapsed() < 5000) {
+            QCoreApplication::processEvents(QEventLoop::AllEvents, 5);
+            QThread::msleep(1);
+        }
+        return finished.size() >= n;
+    };
+    b.askStream(QStringLiteral("conv"), key, 0, QStringLiteral("what is the tok/s?"));
+    check(waitFinished(2) && finished.value(1) == "conv|" && text == "126 tok/s at c1." && thinking == "checking",
+          "llm stream: askStream streams deltas through the injected router", finished.join(';') + " / " + text);
+    const QVector<ChatTurn> h = b.streamHistory(QStringLiteral("conv"));
+    check(h.size() == 2 && h[0].content == "what is the tok/s?" && h[1].role == "assistant"
+              && h[1].content == "126 tok/s at c1.",
+          "llm stream: a clean finish appends the exchange to Tier 2");
+    b.askStream(QStringLiteral("conv"), key, 0, QStringLiteral("and with MTP?"));
+    check(waitFinished(3) && finished.value(2) == "conv|", "llm stream: second turn finished", finished.join(';'));
+    const QJsonArray m1 = QJsonDocument::fromJson(bodies.value(0)).object().value("messages").toArray();
+    const QJsonArray m2 = QJsonDocument::fromJson(bodies.value(1)).object().value("messages").toArray();
+    check(m1.size() == 3 && m2.size() == 5 && m1[0] == m2[0] && m1[1] == m2[1]
+              && m2[1].toObject().value("content").toString() == "Pinned context:\n" + trunk,
+          "llm stream: both turns send byte-identical Tier 0 + Tier 1 (the trunk)",
+          QStringLiteral("%1/%2").arg(m1.size()).arg(m2.size()));
+    check(m2[2].toObject().value("content") == "what is the tok/s?" && m2[3].toObject().value("content") == "126 tok/s at c1."
+              && m2[4].toObject().value("content").toString().endsWith("Question: and with MTP?")
+              && m2[4].toObject().value("content").toString().contains("On screen now:\n" + slice),
+          "llm stream: Tier 2 history precedes the Tier 3 leaf (slice + question last)",
+          m2.size() > 4 ? m2[4].toObject().value("content").toString().left(160) : QString());
+    b.clearStreamHistory(QStringLiteral("conv"));
+    check(b.streamHistory(QStringLiteral("conv")).isEmpty() && b.spawnCount() == 0,
+          "llm stream: history clears; no processes spawned");
+    b.setLlmRouter(nullptr);
+}
+
 Turn mkTurn(const QString &role, const QString &text)
 {
     Turn t;
@@ -3191,6 +3307,7 @@ int runTests()
     unitTests();
     gamepadUnitTests();
     openAiCompatUnitTests();
+    llmRouterBackendTests();
     formFactorTests();
     uiTests();
     gamepadUiTests();

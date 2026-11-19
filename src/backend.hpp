@@ -3,6 +3,11 @@
 
 #include "gamepad.hpp"
 #include "transcript.hpp"
+#include "core/types.hpp"
+#include "ingest/phonon.hpp"
+#include "llm/prefix.hpp"
+#include "llm/router.hpp"
+#include "llm/sse.hpp"
 
 #include <QElapsedTimer>
 #include <QFileSystemWatcher>
@@ -124,27 +129,10 @@ StreamProgress agyProgress(const QJsonObject &line);     // agy stream-json (ste
 StreamProgress claudeProgress(const QJsonObject &line);  // claude stream-json (stream_event deltas)
 // The newest `maxWords` words of a stream (the live thinking line scrolls, it never freezes).
 QString tailWords(const QString &s, int maxWords);
-// OpenAI-compatible HTTP/SSE fast-feedback helpers (unit-tested).
-struct OpenAiSseEvent {
-    enum Kind { None, Delta, Done, Error };
-    Kind kind = None;
-    QString thinking;
-    QString text;
-    QString error;
-};
-QByteArray buildOpenAiCompatRequest(const QString &model, const QString &systemPrompt,
-                                      const QString &context, const QString &question,
-                                      const QString &effort = QString());
-// KV pre-warm: the same system + "Pinned context:" messages as buildOpenAiCompatRequest, so the
-// server prefills (and caches) that prefix; max_tokens 1, not streamed, and no question message.
-QByteArray buildOpenAiWarmRequest(const QString &model, const QString &systemPrompt,
-                                  const QString &context);
-// The quick-ask system prompt shared by asks and warms (byte-identical prefix).
-extern const QString kCompatSystemPrompt;
-OpenAiSseEvent parseOpenAiSseLine(const QByteArray &line);
-// Read the last `maxLines` non-empty lines from Phonon's live meeting/audio transcript
-// if modified within `maxAgeMs` (returns empty if missing or stale).
-QString readPhononTail(const QString &path, int maxLines = 15, qint64 maxAgeMs = 10 * 60 * 1000);
+// OpenAI-compatible HTTP/SSE fast-feedback helpers (OpenAiSseEvent, parseOpenAiSseLine,
+// buildOpenAiCompatRequest, buildOpenAiWarmRequest, kCompatSystemPrompt) live in lapis_llm
+// (llm/sse.hpp, llm/prefix.hpp); readPhononTail / readPhononSnapshot live in lapis_ingest
+// (ingest/phonon.hpp). All are re-exported through the includes at the top of this header.
 
 // Human-interest filter: the request asking the fast model to keep only what matches the human's
 // direction (goal), pinned params / terms and what they are inspecting right now (recent actions),
@@ -332,10 +320,25 @@ public:
     Q_INVOKABLE void filterForHuman(const QString &projectKey);
     int filterRequests() const { return m_filterRequests; }
     // Live only, with an OpenAI-compatible endpoint: opening an island prefills the fast model's
-    // KV cache with exactly the prefix the next ask sends (system prompt + contextFor(key, 0)).
+    // KV cache with exactly the prefix the next ask sends: Tier 0 system prompt + Tier 1 trunk
+    // (contextTrunk(key)), sent through LlmRouter::warmPrefix.
     // Async, fire-and-forget; repeats for the same project + transcript mtime are dropped.
     Q_INVOKABLE void warmProjectPrefix(const QString &projectKey);
     int warmRequests() const { return m_warmRequests; }
+    // Concurrent OpenAI-compatible conversations keyed by streamId, all multiplexed by LlmRouter
+    // (no 6-per-host cap). A stream keeps its prior turns as Tier 2; restarting an active id
+    // cancels the old request. Emits streamDelta / streamFinished.
+    Q_INVOKABLE void askStream(const QString &streamId, const QString &projectKey, int artifactIndex,
+                               const QString &question);
+    Q_INVOKABLE void cancelStream(const QString &streamId);
+    Q_INVOKABLE void clearStreamHistory(const QString &streamId);
+    QVector<ChatTurn> streamHistory(const QString &streamId) const { return m_streamHistory.value(streamId); }
+    // Live mode owns a router (created lazily); tests may inject one (not owned) in any mode.
+    LlmRouter *llmRouter();
+    void setLlmRouter(LlmRouter *router);
+    // Tier 1 trunk (stable project context, no on-screen artifact) and the on-screen slice.
+    QString contextTrunk(const QString &projectKey) const;
+    QString contextSlice(const QString &projectKey, int artifactIndex) const;
     // Island metrics stay hidden unless pinned for that project.
     Q_INVOKABLE void toggleMetricPin(const QString &projectKey);
     // What the latest ask was routed to (tests): model, effort and channel key.
@@ -358,7 +361,7 @@ public:
     QStringList recentActions() const { return m_recentActions; }
     QString activeCategory() const { return m_activeCategory; }
     QString phononTail() const { return m_phononTail; }
-    bool phononLive() const { return !m_phononTail.isEmpty(); }
+    bool phononLive() const { return m_phononLive; }  // fresh turns and Status not "complete"
 
     // The prompt preamble for quick asks and traces: on-screen artifact, last turns, files, tools, write-up.
     QString contextFor(const QString &projectKey, int artifactIndex) const;
@@ -428,6 +431,8 @@ signals:
     void phononTailChanged();
     void sessionStarted(const QString &projectKey);
     void quickTick();
+    void streamDelta(const QString &streamId, const QString &textDelta, const QString &thinkingDelta);
+    void streamFinished(const QString &streamId, const QString &error);
 
 private:
     struct Ladder {
@@ -508,8 +513,13 @@ private:
     void onTraceOutput();
     void finishTrace();
     void askOpenAiCompat(const QString &projectKey, int artifactIndex, const QString &question);
-    void onOpenAiCompatReadyRead();
-    void onOpenAiCompatFinished();
+    void onRouterDelta(const QString &streamId, const QString &text, const QString &thinking);
+    void onRouterFinished(const QString &streamId, const QString &error);
+    // contextFor() = head + slice + rest; contextTrunk() = head + rest. False if no such project.
+    bool contextPieces(const QString &projectKey, int artifactIndex, QString *head, QString *slice,
+                       QString *rest) const;
+    QString compatModel() const;  // m_openaiCompatModel, env, then the chat model
+    QString compatKey() const;    // m_openaiCompatKey, then env
     void sendWithRetry(const QString &agent, const QString &text, int attempt);
     void loadFolders();
 
@@ -546,8 +556,15 @@ private:
     QString m_openaiCompatUrl;
     QString m_openaiCompatModel = QStringLiteral("qwen3.8-flash-next");
     QString m_openaiCompatKey;
-    QNetworkAccessManager m_nam;
-    QPointer<QNetworkReply> m_compatReply;
+    QNetworkAccessManager m_nam;  // suggestion, filter and briefing (one request each at most)
+    std::unique_ptr<LlmRouter> m_ownedRouter;
+    QPointer<LlmRouter> m_router;
+    struct StreamAsk {
+        QString question;
+        QString answer;
+    };
+    QHash<QString, StreamAsk> m_streamAsks;               // in-flight askStream ids
+    QHash<QString, QVector<ChatTurn>> m_streamHistory;    // Tier 2 per conversation stream
     QPointer<QNetworkReply> m_suggestReply;
     QPointer<QNetworkReply> m_briefingReply;
     struct HumanFilter {
@@ -560,15 +577,14 @@ private:
     QSet<QString> m_filterDone;                 // "key@mtime" already asked (no respamming)
     QStringList m_filterQueue;                  // project keys waiting for the slot
     int m_filterRequests = 0;
-    QSet<QString> m_warmDone;                   // "key@mtime" already prefilled
-    int m_warmRequests = 0;
+    int m_warmRequests = 0;  // dedup of "key@mtime@hash" lives in LlmRouter::warmPrefix
     QString compatEndpoint() const;             // "" when no OpenAI-compatible URL is configured
     QVariantList m_briefing;
     QString m_briefingSource;
     QSet<QString> m_pinnedMetrics;
-    QByteArray m_compatBuf;
     QString m_activeCategory;
     QString m_phononTail;
+    bool m_phononLive = false;
     qint64 m_phononMtime = 0;
     QStringList m_selectedAgentIds;
     QStringList m_recentActions;

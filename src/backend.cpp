@@ -35,10 +35,10 @@ QString lapisPeers() { return home() + QStringLiteral("/.local/bin/lapis-peers")
 QString claudeBin() { return home() + QStringLiteral("/.local/bin/claude"); }
 QString agyBin() { return home() + QStringLiteral("/.local/bin/agy"); }
 QString workspacePath() { return home() + QStringLiteral("/.lapis/runtime/workspace.json"); }
-QString phononLatestPath()
-{
-    return home() + QStringLiteral("/Library/Application Support/Phonon/Meetings/latest.txt");
-}
+// The quick ask's router stream id (askStream() refuses it, so the two never collide).
+constexpr char kQuickStreamId[] = "__quick__";
+// Tier 2 cap per conversation stream, in messages (user + assistant pairs).
+constexpr int kMaxStreamHistory = 24;
 
 QString expandHome(const QString &p)
 {
@@ -718,86 +718,7 @@ QString channelKeyFor(const QString &model, const QString &effort)
     return {};
 }
 
-const QString kCompatSystemPrompt = QStringLiteral(
-    "You are Lapis Studio's fast-feedback engineering assistant. "
-    "Answer concisely in plain English, grounded in the pinned context.");
-
-// System prompt + pinned context: the cacheable prefix shared by asks and KV warms.
-static QJsonArray compatPrefixMessages(const QString &systemPrompt, const QString &context)
-{
-    QJsonArray msgs;
-    if (!systemPrompt.isEmpty())
-        msgs << QJsonObject{{QStringLiteral("role"), QStringLiteral("system")},
-                            {QStringLiteral("content"), systemPrompt}};
-    if (!context.isEmpty())
-        msgs << QJsonObject{{QStringLiteral("role"), QStringLiteral("user")},
-                            {QStringLiteral("content"), QStringLiteral("Pinned context:\n") + context}};
-    return msgs;
-}
-
-QByteArray buildOpenAiWarmRequest(const QString &model, const QString &systemPrompt, const QString &context)
-{
-    QJsonObject body;
-    body.insert(QStringLiteral("model"), model);
-    body.insert(QStringLiteral("stream"), false);
-    body.insert(QStringLiteral("max_tokens"), 1);
-    body.insert(QStringLiteral("messages"), compatPrefixMessages(systemPrompt, context));
-    return QJsonDocument(body).toJson(QJsonDocument::Compact);
-}
-
-QByteArray buildOpenAiCompatRequest(const QString &model, const QString &systemPrompt,
-                                      const QString &context, const QString &question,
-                                      const QString &effort)
-{
-    // Keep the shared system prompt and pinned repo/artifact context at the front of `messages`
-    // so prefix-caching backends (e.g. 1600-token KV blocks) reuse prefilled KV across turns.
-    QJsonArray msgs = compatPrefixMessages(systemPrompt, context);
-    msgs << QJsonObject{{QStringLiteral("role"), QStringLiteral("user")},
-                        {QStringLiteral("content"), QStringLiteral("Question: ") + question}};
-    QJsonObject body;
-    body.insert(QStringLiteral("model"), model);
-    body.insert(QStringLiteral("stream"), true);
-    body.insert(QStringLiteral("messages"), msgs);
-    if (!effort.isEmpty())
-        body.insert(QStringLiteral("reasoning_effort"), effort);
-    return QJsonDocument(body).toJson(QJsonDocument::Compact);
-}
-
-OpenAiSseEvent parseOpenAiSseLine(const QByteArray &raw)
-{
-    OpenAiSseEvent ev;
-    const QByteArray line = raw.trimmed();
-    if (!line.startsWith("data:"))
-        return ev;
-    const QByteArray payload = line.mid(5).trimmed();
-    if (payload.isEmpty())
-        return ev;
-    if (payload == "[DONE]") {
-        ev.kind = OpenAiSseEvent::Done;
-        return ev;
-    }
-    const QJsonObject o = QJsonDocument::fromJson(payload).object();
-    if (o.isEmpty())
-        return ev;
-    if (o.contains(QLatin1String("error"))) {
-        ev.kind = OpenAiSseEvent::Error;
-        const QJsonValue err = o.value(QLatin1String("error"));
-        ev.error = err.isObject() ? err.toObject().value(QLatin1String("message")).toString()
-                                  : err.toString();
-        return ev;
-    }
-    const QJsonArray choices = o.value(QLatin1String("choices")).toArray();
-    if (choices.isEmpty())
-        return ev;
-    const QJsonObject delta = choices.first().toObject().value(QLatin1String("delta")).toObject();
-    ev.thinking = delta.value(QLatin1String("reasoning_content")).toString();
-    if (ev.thinking.isEmpty())
-        ev.thinking = delta.value(QLatin1String("reasoning")).toString();
-    ev.text = delta.value(QLatin1String("content")).toString();
-    if (!ev.thinking.isEmpty() || !ev.text.isEmpty())
-        ev.kind = OpenAiSseEvent::Delta;
-    return ev;
-}
+// kCompatSystemPrompt, the tiered request builders and parseOpenAiSseLine live in lapis_llm.
 
 QByteArray buildFilterPrompt(const QString &model, const QString &goal, const QVariantList &params,
                              const QStringList &recentActions, const QString &latestTurn)
@@ -1085,12 +1006,8 @@ Backend::~Backend()
 {
     if (m_prefsSave.isActive())
         savePrefs();
-    if (m_compatReply) {
-        m_compatReply->disconnect(this);
-        m_compatReply->abort();
-        m_compatReply->deleteLater();
-        m_compatReply.clear();
-    }
+    if (m_router)
+        m_router->disconnect(this);  // an injected router may outlive this backend
     if (m_suggestReply) {
         m_suggestReply->disconnect(this);
         m_suggestReply->abort();
@@ -1420,35 +1337,6 @@ void Backend::recordAction(const QString &action)
         m_recentActions.removeFirst();
 }
 
-QString readPhononTail(const QString &path, int maxLines, qint64 maxAgeMs)
-{
-    const QFileInfo fi(path);
-    const QString target = fi.canonicalFilePath();
-    if (target.isEmpty())
-        return {};
-    const QFileInfo tf(target);
-    if (!tf.exists() || !tf.isReadable())
-        return {};
-    const qint64 ageMs = QDateTime::currentMSecsSinceEpoch() - tf.lastModified().toMSecsSinceEpoch();
-    if (maxAgeMs > 0 && ageMs > maxAgeMs)
-        return {};
-    QFile f(target);
-    if (!f.open(QIODevice::ReadOnly))
-        return {};
-    if (f.size() > 16384)
-        f.seek(f.size() - 16384);
-    const QString text = QString::fromUtf8(f.readAll());
-    QStringList lines;
-    for (const QString &raw : text.split(QLatin1Char('\n'))) {
-        const QString s = raw.trimmed();
-        if (!s.isEmpty())
-            lines << s;
-    }
-    if (lines.size() > maxLines)
-        lines = lines.mid(lines.size() - maxLines);
-    return lines.join(QLatin1Char('\n'));
-}
-
 void Backend::pollPhonon()
 {
     if (m_mode != Mode::Live)
@@ -1463,9 +1351,10 @@ void Backend::pollPhonon()
             return;  // unchanged and still fresh
     }
     m_phononMtime = mtime;
-    const QString tail = readPhononTail(path);
-    if (tail != m_phononTail) {
-        m_phononTail = tail;
+    const PhononSnapshot snap = readPhononSnapshot(path);
+    if (snap.tail != m_phononTail || snap.live != m_phononLive) {
+        m_phononTail = snap.tail;
+        m_phononLive = snap.live;
         emit phononTailChanged();
     }
 }
@@ -1937,12 +1826,39 @@ void Backend::advance(double dt)
 
 QString Backend::contextFor(const QString &projectKey, int artifactIndex) const
 {
+    QString head, slice, rest;
+    if (!contextPieces(projectKey, artifactIndex, &head, &slice, &rest))
+        return {};
+    return head + slice + rest;
+}
+
+QString Backend::contextTrunk(const QString &projectKey) const
+{
+    QString head, rest;
+    if (!contextPieces(projectKey, -1, &head, nullptr, &rest))
+        return {};
+    return head + rest;
+}
+
+QString Backend::contextSlice(const QString &projectKey, int artifactIndex) const
+{
+    QString slice;
+    if (!contextPieces(projectKey, artifactIndex, nullptr, &slice, nullptr))
+        return {};
+    return slice.trimmed();
+}
+
+bool Backend::contextPieces(const QString &projectKey, int artifactIndex, QString *head, QString *slice,
+                            QString *rest) const
+{
     for (const Project &p : m_projects) {
         if (p.key != projectKey)
             continue;
-        QString ctx = QStringLiteral("Project: %1 (%2).").arg(p.name, tildePath(expandHome(p.dir)));
-        const QVariantMap a = p.ex.artifacts.value(artifactIndex).toMap();
-        if (!a.isEmpty()) {
+        if (head)
+            *head = QStringLiteral("Project: %1 (%2).").arg(p.name, tildePath(expandHome(p.dir)));
+        QString ctx;  // the on-screen slice
+        const QVariantMap a = artifactIndex >= 0 ? p.ex.artifacts.value(artifactIndex).toMap() : QVariantMap();
+        if (slice && !a.isEmpty()) {
             const QString kind = a.value(QStringLiteral("kind")).toString();
             ctx += QStringLiteral(" On screen: %1 \"%2\" (%3).")
                        .arg(kind, a.value(QStringLiteral("title")).toString(),
@@ -1975,6 +1891,11 @@ QString Backend::contextFor(const QString &projectKey, int artifactIndex) const
                 ctx += QStringLiteral("\nFile: ") + tildePath(a.value(QStringLiteral("path")).toString());
             }
         }
+        if (slice)
+            *slice = ctx;
+        if (!rest)
+            return true;
+        ctx.clear();  // from here on: the stable trunk after the header
         if (!p.ex.artifacts.isEmpty()) {
             QStringList all;
             for (const QVariant &v : p.ex.artifacts) {
@@ -1994,9 +1915,10 @@ QString Backend::contextFor(const QString &projectKey, int artifactIndex) const
             ctx += QStringLiteral("\nRecent tool calls:\n- ") + p.ex.toolCalls.join(QStringLiteral("\n- "));
         if (!p.ex.prose.isEmpty())
             ctx += QStringLiteral("\nAgent's latest write-up:\n") + p.ex.prose.left(1500);
-        return ctx;
+        *rest = ctx;
+        return true;
     }
-    return {};
+    return false;
 }
 
 void Backend::clearAnswers()
@@ -2255,117 +2177,171 @@ void Backend::askOpenAiCompat(const QString &projectKey, int artifactIndex, cons
     const QString endpoint = base.endsWith(QLatin1String("/chat/completions"))
                                  ? base
                                  : base + QStringLiteral("/chat/completions");
-    QString model = m_openaiCompatModel;
-    if (model.isEmpty())
-        model = qEnvironmentVariable("LAPIS_OPENAI_COMPAT_MODEL").trimmed();
-    if (model.isEmpty())
-        model = m_chatModel;
-    QString key = m_openaiCompatKey;
-    if (key.isEmpty())
-        key = qEnvironmentVariable("LAPIS_OPENAI_COMPAT_KEY").trimmed();
+    const QString model = compatModel();
+    const QString key = compatKey();
 
-    if (m_compatReply) {
-        m_compatReply->disconnect(this);
-        m_compatReply->abort();
-        m_compatReply->deleteLater();
-        m_compatReply.clear();
-    }
     if (m_suggestReply) {
         m_suggestReply->disconnect(this);
         m_suggestReply->abort();
         m_suggestReply->deleteLater();
         m_suggestReply.clear();
     }
-    m_compatBuf.clear();
     m_quickChannel = channelKeyFor(m_chatModel, m_chatEffort);
+    LlmRouter *router = llmRouter();
+    if (!router) {
+        m_quickAnswer = QStringLiteral("openai-compat: no router");
+        finishQuick();
+        return;
+    }
 
-    // Recent actions ride with the question, not the pinned context, so the context message stays
-    // byte-identical to the one warmProjectPrefix() prefilled when the island opened.
-    const QString ctx = contextFor(projectKey, artifactIndex);
-    QString q = question;
-    if (!m_recentActions.isEmpty())
-        q += QStringLiteral("\n\nRecent user actions:\n- ") + m_recentActions.join(QStringLiteral("\n- "));
-    if (!m_phononTail.isEmpty())
-        q += QStringLiteral("\n\nLive Phonon audio transcript:\n") + m_phononTail;
-    const QByteArray payload = buildOpenAiCompatRequest(model, kCompatSystemPrompt, ctx, q, m_chatEffort);
-
-    QNetworkRequest req{QUrl(endpoint)};
-    req.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json"));
-    req.setRawHeader("Accept", "text/event-stream");
-    if (!key.isEmpty())
-        req.setRawHeader("Authorization", QByteArray("Bearer ") + key.toUtf8());
-
-    QNetworkReply *reply = m_nam.post(req, payload);
-    m_compatReply = reply;
-    connect(reply, &QNetworkReply::readyRead, this, &Backend::onOpenAiCompatReadyRead);
-    connect(reply, &QNetworkReply::finished, this, &Backend::onOpenAiCompatFinished);
+    // Tier 0 system + Tier 1 trunk are byte-identical to what warmProjectPrefix() prefilled when
+    // the island opened; the on-screen slice, recent actions, Phonon tail and question ride last.
+    TieredPrompt p;
+    p.model = model;
+    p.effort = m_chatEffort;
+    p.systemPrompt = kCompatSystemPrompt;
+    p.trunk = contextTrunk(projectKey);
+    p.targetSlice = contextSlice(projectKey, artifactIndex);
+    p.recentActions = m_recentActions;
+    p.phononTail = m_phononTail;
+    p.question = question;
+    LlmStreamRequest req;
+    req.streamId = QString::fromLatin1(kQuickStreamId);
+    req.endpoint = endpoint;
+    req.apiKey = key;
+    req.payload = buildTieredChatRequest(p);
+    router->startStream(req);  // replaces any quick ask still streaming
 }
 
-void Backend::onOpenAiCompatReadyRead()
+// --- LlmRouter streams ----------------------------------------------------------------------
+
+LlmRouter *Backend::llmRouter()
 {
-    if (!m_compatReply)
-        return;
-    m_compatBuf += m_compatReply->readAll();
-    bool changed = false;
-    bool done = false;
-    qsizetype nl;
-    while ((nl = m_compatBuf.indexOf('\n')) >= 0) {
-        const QByteArray line = m_compatBuf.left(nl);
-        m_compatBuf.remove(0, nl + 1);
-        const OpenAiSseEvent ev = parseOpenAiSseLine(line);
-        if (ev.kind == OpenAiSseEvent::Delta) {
-            if (!ev.thinking.isEmpty()) {
-                noteThinking(ev.thinking);
-                changed = true;
-            }
-            if (!ev.text.isEmpty()) {
-                appendAnswer(ev.text);
-                changed = true;
-            }
-        } else if (ev.kind == OpenAiSseEvent::Error) {
-            m_quickAnswer = QStringLiteral("openai-compat: ") + oneLine(ev.error, 12);
-            done = true;
-        } else if (ev.kind == OpenAiSseEvent::Done) {
-            done = true;
-        }
+    if (!m_router && m_mode == Mode::Live) {
+        m_ownedRouter = std::make_unique<LlmRouter>();
+        setLlmRouter(m_ownedRouter.get());
     }
-    if (done)
-        finishQuick();
-    else if (changed)
+    return m_router.data();
+}
+
+void Backend::setLlmRouter(LlmRouter *router)
+{
+    if (m_router == router)
+        return;
+    if (m_router)
+        m_router->disconnect(this);
+    m_router = router;
+    if (!router)
+        return;
+    connect(router, &LlmRouter::streamDelta, this, &Backend::onRouterDelta);
+    connect(router, &LlmRouter::streamFinished, this, &Backend::onRouterFinished);
+}
+
+QString Backend::compatModel() const
+{
+    QString model = m_openaiCompatModel;
+    if (model.isEmpty())
+        model = qEnvironmentVariable("LAPIS_OPENAI_COMPAT_MODEL").trimmed();
+    if (model.isEmpty())
+        model = m_chatModel;
+    return model;
+}
+
+QString Backend::compatKey() const
+{
+    QString key = m_openaiCompatKey;
+    if (key.isEmpty())
+        key = qEnvironmentVariable("LAPIS_OPENAI_COMPAT_KEY").trimmed();
+    return key;
+}
+
+void Backend::onRouterDelta(const QString &streamId, const QString &text, const QString &thinking)
+{
+    if (streamId == QLatin1String(kQuickStreamId)) {
+        if (!thinking.isEmpty())
+            noteThinking(thinking);
+        if (!text.isEmpty())
+            appendAnswer(text);
         emit quickChanged();
+        return;
+    }
+    auto it = m_streamAsks.find(streamId);
+    if (it == m_streamAsks.end())
+        return;  // not ours (a shared, injected router)
+    it->answer += text;
+    emit streamDelta(streamId, text, thinking);
 }
 
-void Backend::onOpenAiCompatFinished()
+void Backend::onRouterFinished(const QString &streamId, const QString &error)
 {
-    QNetworkReply *reply = m_compatReply.data();
-    m_compatReply.clear();
-    if (!reply)
+    if (streamId == QLatin1String(kQuickStreamId)) {
+        if (!error.isEmpty())
+            m_quickAnswer = QStringLiteral("openai-compat: ") + oneLine(error, 12);
+        if (m_quickBusy)
+            finishQuick();
         return;
-    if (reply->bytesAvailable() > 0) {
-        m_compatBuf += reply->readAll();
     }
-    if (!m_compatBuf.trimmed().isEmpty()) {
-        const QList<QByteArray> rest = m_compatBuf.split('\n');
-        m_compatBuf.clear();
-        for (const QByteArray &line : rest) {
-            const OpenAiSseEvent ev = parseOpenAiSseLine(line);
-            if (ev.kind == OpenAiSseEvent::Delta) {
-                if (!ev.thinking.isEmpty())
-                    noteThinking(ev.thinking);
-                if (!ev.text.isEmpty())
-                    appendAnswer(ev.text);
-            } else if (ev.kind == OpenAiSseEvent::Error) {
-                m_quickAnswer = QStringLiteral("openai-compat: ") + oneLine(ev.error, 12);
-            }
-        }
+    auto it = m_streamAsks.find(streamId);
+    if (it == m_streamAsks.end())
+        return;
+    const StreamAsk done = it.value();
+    m_streamAsks.erase(it);
+    if (error.isEmpty() && !done.answer.trimmed().isEmpty()) {
+        QVector<ChatTurn> &h = m_streamHistory[streamId];
+        h << ChatTurn{QStringLiteral("user"), done.question} << ChatTurn{QStringLiteral("assistant"), done.answer};
+        while (h.size() > kMaxStreamHistory)
+            h.remove(0, 2);  // drop the oldest exchange (re-prefills Tier 2 once)
     }
-    if (reply->error() != QNetworkReply::NoError && reply->error() != QNetworkReply::OperationCanceledError
-        && m_quickAnswer.isEmpty()) {
-        m_quickAnswer = QStringLiteral("openai-compat: ") + oneLine(reply->errorString(), 12);
+    emit streamFinished(streamId, error);
+}
+
+void Backend::askStream(const QString &streamId, const QString &projectKey, int artifactIndex,
+                        const QString &question)
+{
+    const QString q = question.trimmed();
+    if (streamId.isEmpty() || streamId == QLatin1String(kQuickStreamId) || q.isEmpty())
+        return;
+    LlmRouter *router = llmRouter();
+    if (!router) {
+        emit streamFinished(streamId, QStringLiteral("no LLM router (mock mode)"));
+        return;
     }
-    reply->deleteLater();
-    if (m_quickBusy)
-        finishQuick();
+    const QString endpoint = compatEndpoint();
+    if (endpoint.isEmpty()) {
+        emit streamFinished(streamId, QStringLiteral("Set openaiCompatUrl in studio_prefs.json or LAPIS_OPENAI_COMPAT_URL"));
+        return;
+    }
+    TieredPrompt p;
+    p.model = compatModel();
+    p.effort = m_chatEffort;
+    p.systemPrompt = kCompatSystemPrompt;
+    p.trunk = contextTrunk(projectKey);
+    p.history = m_streamHistory.value(streamId);
+    p.targetSlice = contextSlice(projectKey, artifactIndex);
+    p.recentActions = m_recentActions;
+    p.phononTail = m_phononTail;
+    p.question = q;
+    m_streamAsks.insert(streamId, StreamAsk{q, QString()});
+    LlmStreamRequest req;
+    req.streamId = streamId;
+    req.endpoint = endpoint;
+    req.apiKey = compatKey();
+    req.payload = buildTieredChatRequest(p);
+    router->startStream(req);
+}
+
+void Backend::cancelStream(const QString &streamId)
+{
+    if (streamId.isEmpty() || streamId == QLatin1String(kQuickStreamId))
+        return;
+    m_streamAsks.remove(streamId);
+    if (m_router)
+        m_router->cancelStream(streamId);
+}
+
+void Backend::clearStreamHistory(const QString &streamId)
+{
+    m_streamHistory.remove(streamId);
 }
 
 void Backend::notePhase(const QString &phase)
@@ -3325,41 +3301,27 @@ void Backend::warmProjectPrefix(const QString &projectKey)
     // Redacted (infinity) projects never leave the process.
     if (std::any_of(p->sessions.cbegin(), p->sessions.cend(), [](const SessionInfo &s) { return s.redacted; }))
         return;
-    const QString ctx = contextFor(projectKey, 0);
-    if (ctx.isEmpty())
+    const QString trunk = contextTrunk(projectKey);
+    if (trunk.isEmpty())
         return;
-    // key@mtime, plus the context hash: the human filter can rewrite a summary artifact's text
-    // without the transcript changing, and that is a different prefix.
-    const QString tag = QStringLiteral("%1@%2@%3").arg(projectKey).arg(p->mtime).arg(qHash(ctx));
-    if (m_warmDone.contains(tag))
-        return;
-    if (m_warmDone.size() > 512)
-        m_warmDone.clear();
-    m_warmDone.insert(tag);
-    ++m_warmRequests;
-
     QString model = m_openaiCompatModel;
     if (model.isEmpty())
         model = qEnvironmentVariable("LAPIS_OPENAI_COMPAT_MODEL").trimmed();
     if (model.isEmpty())
         model = QStringLiteral("qwen3.8-flash-next");
-    QString apiKey = m_openaiCompatKey;
-    if (apiKey.isEmpty())
-        apiKey = qEnvironmentVariable("LAPIS_OPENAI_COMPAT_KEY").trimmed();
-
-    QNetworkRequest req{QUrl(endpoint)};
-    req.setTransferTimeout(30000);
-    req.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json"));
-    if (!apiKey.isEmpty())
-        req.setRawHeader("Authorization", QByteArray("Bearer ") + apiKey.toUtf8());
-    QNetworkReply *reply = m_nam.post(req, buildOpenAiWarmRequest(model, kCompatSystemPrompt, ctx));
-    // Fire-and-forget: the server keeps the prefilled KV; the one token is discarded. A failed
-    // warm drops its tag so the next focus retries.
-    connect(reply, &QNetworkReply::finished, this, [this, reply, tag] {
-        if (reply->error() != QNetworkReply::NoError)
-            m_warmDone.remove(tag);
-        reply->deleteLater();
-    });
+    LlmRouter *router = llmRouter();
+    if (!router)
+        return;
+    // key@mtime, plus the trunk hash: the trunk can change without the transcript mtime moving.
+    const QString tag = QStringLiteral("%1@%2@%3").arg(projectKey).arg(p->mtime).arg(qHash(trunk));
+    TieredPrompt tp;
+    tp.model = model;
+    tp.systemPrompt = kCompatSystemPrompt;
+    tp.trunk = trunk;
+    // Fire-and-forget: the server keeps the prefilled KV; the one token is discarded. The router
+    // drops a repeat of the same tag and forgets a failed one so the next focus retries.
+    if (router->warmPrefix(endpoint, compatKey(), buildTieredWarmRequest(tp), tag))
+        ++m_warmRequests;
 }
 
 // --- Morning Briefing ------------------------------------------------------------------------

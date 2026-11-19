@@ -10,20 +10,62 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 find_package(Qt6 6.11 REQUIRED COMPONENTS Core Gui Qml Quick QuickControls2 QuickShapes Multimedia Svg Network Concurrent)
+find_package(CURL REQUIRED)
 qt_standard_project_setup(REQUIRES 6.11)
+
+function(lapis_warnings target)
+  target_compile_options(${target} PRIVATE -Wall -Wextra)
+endfunction()
+
+# --- Layered static libraries (one-way dependencies: core <- ingest, core <- llm) ----------
+
+# Value types and the lock-free SPSC ring. QtCore only.
+add_library(lapis_core STATIC
+  src/core/types.hpp src/core/types.cpp
+  src/core/ring_buffer.hpp
+)
+target_include_directories(lapis_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(lapis_core PUBLIC Qt6::Core)
+lapis_warnings(lapis_core)
+
+# Transcript parsing and Phonon live-transcript ingest.
+add_library(lapis_ingest STATIC
+  src/ingest/phonon.hpp src/ingest/phonon.cpp
+  src/transcript.hpp src/transcript.cpp
+)
+target_link_libraries(lapis_ingest PUBLIC lapis_core Qt6::Core)
+lapis_warnings(lapis_ingest)
+
+# APC-aligned prompt builder, SSE parser and the libcurl-multi LlmRouter.
+add_library(lapis_llm STATIC
+  src/llm/prefix.hpp src/llm/prefix.cpp
+  src/llm/sse.hpp src/llm/sse.cpp
+  src/llm/router.hpp src/llm/router.cpp
+)
+target_link_libraries(lapis_llm PUBLIC lapis_core Qt6::Core PRIVATE CURL::libcurl)
+lapis_warnings(lapis_llm)
+
+# macOS-only rendering and input: PDFKit pages, GameController pad, offscreen Metal target.
+add_library(lapis_mac STATIC
+  src/pdfrender.hpp src/pdfrender.mm
+  src/gamepad.hpp src/gamepad.cpp src/gamepad_mac.mm
+  src/metalbench.hpp src/metalbench.mm
+)
+target_include_directories(lapis_mac PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(lapis_mac PUBLIC Qt6::Core Qt6::Gui Qt6::Quick
+  "-framework PDFKit" "-framework AppKit" "-framework CoreGraphics" "-framework Metal" "-framework GameController")
+lapis_warnings(lapis_mac)
+
+# --- App -----------------------------------------------------------------------------------
 
 qt_add_executable(lapis_studio
   src/main.cpp
   src/backend.hpp src/backend.cpp
-  src/transcript.hpp src/transcript.cpp
-  src/pdfrender.hpp src/pdfrender.mm
   src/providers.hpp src/providers.cpp
   src/fixtures.hpp src/fixtures.cpp
   src/demo.hpp src/demo.cpp
   src/tests.cpp
   src/bench.cpp
-  src/metalbench.hpp src/metalbench.mm
-  src/gamepad.hpp src/gamepad.cpp src/gamepad_mac.mm
 )
 # A plain Unix executable at build/lapis_studio, as the brief asks (no .app bundle).
 set_target_properties(lapis_studio PROPERTIES MACOSX_BUNDLE OFF)
@@ -59,8 +101,20 @@ qt_add_qml_module(lapis_studio
     qml/MorningBriefingOverlay.qml
 )
 
-target_compile_options(lapis_studio PRIVATE -Wall -Wextra)
+lapis_warnings(lapis_studio)
 target_link_libraries(lapis_studio PRIVATE
+  lapis_core lapis_ingest lapis_llm lapis_mac
   Qt6::Core Qt6::Gui Qt6::Qml Qt6::Quick Qt6::QuickControls2 Qt6::QuickShapes
-  Qt6::Multimedia Qt6::Svg Qt6::Network Qt6::Concurrent
-  "-framework PDFKit" "-framework AppKit" "-framework CoreGraphics" "-framework Metal" "-framework GameController")
+  Qt6::Multimedia Qt6::Svg Qt6::Network Qt6::Concurrent)
+
+# --- Fast per-module tests (no QML, no GUI) ------------------------------------------------
+
+qt_add_executable(test_core_ingest tests/test_core_ingest.cpp)
+set_target_properties(test_core_ingest PROPERTIES MACOSX_BUNDLE OFF)
+target_link_libraries(test_core_ingest PRIVATE lapis_core lapis_ingest Qt6::Core)
+lapis_warnings(test_core_ingest)
+
+qt_add_executable(test_llm tests/test_llm.cpp)
+set_target_properties(test_llm PROPERTIES MACOSX_BUNDLE OFF)
+target_link_libraries(test_llm PRIVATE lapis_llm lapis_core Qt6::Core)
+lapis_warnings(test_llm)
