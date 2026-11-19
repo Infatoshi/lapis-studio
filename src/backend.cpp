@@ -2783,11 +2783,40 @@ void Backend::askOpenAiCompat(const QString &projectKey, int artifactIndex, cons
     router->startStream(req);  // replaces any quick ask still streaming
 }
 
+namespace {
+QString readEnvVarsFileKey(const QString &varName)
+{
+    QFile f(QDir::homePath() + QStringLiteral("/.env_vars"));
+    if (!f.open(QIODevice::ReadOnly | QIODevice::Text))
+        return {};
+    QTextStream in(&f);
+    const QString prefix = varName + QLatin1Char('=');
+    while (!in.atEnd()) {
+        QString line = in.readLine().trimmed();
+        if (line.isEmpty() || line.startsWith(QLatin1Char('#')))
+            continue;
+        if (line.startsWith(QLatin1String("export ")))
+            line = line.mid(7).trimmed();
+        if (!line.startsWith(prefix))
+            continue;
+        QString val = line.mid(prefix.size()).trimmed();
+        if (val.size() >= 2 && ((val.front() == QLatin1Char('"') && val.back() == QLatin1Char('"'))
+                                || (val.front() == QLatin1Char('\'') && val.back() == QLatin1Char('\'')))) {
+            val = val.mid(1, val.size() - 2);
+        }
+        return val.trimmed();
+    }
+    return {};
+}
+} // namespace
+
 QString Backend::openrouterKey() const
 {
     QString key = m_openrouterKey;
     if (key.isEmpty())
         key = qEnvironmentVariable("OPENROUTER_API_KEY").trimmed();
+    if (key.isEmpty() && m_mode == Mode::Live)
+        key = readEnvVarsFileKey(QStringLiteral("OPENROUTER_API_KEY"));
     return key;
 }
 
@@ -2873,6 +2902,13 @@ QString Backend::compatKey() const
     QString key = m_openaiCompatKey;
     if (key.isEmpty())
         key = qEnvironmentVariable("LAPIS_OPENAI_COMPAT_KEY").trimmed();
+    if (key.isEmpty()) {
+        const QString url = !m_openaiCompatUrl.isEmpty()
+                                ? m_openaiCompatUrl
+                                : qEnvironmentVariable("LAPIS_OPENAI_COMPAT_URL").trimmed();
+        if (url.contains(QLatin1String("openrouter.ai"), Qt::CaseInsensitive))
+            key = openrouterKey();
+    }
     return key;
 }
 
