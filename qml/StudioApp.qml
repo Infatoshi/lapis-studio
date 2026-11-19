@@ -45,10 +45,16 @@ FocusScope {
 
     // Music (slowmix): "♪ night drive" while a track plays, a bare "♪" otherwise.
     readonly property QtObject player: backend ? backend.slowmix : null
-    readonly property bool musicPlaying: player ? player.playing : false
+    readonly property QtObject spotify: backend ? backend.spotify : null
+    readonly property bool spotifyPlaying: spotify ? spotify.playing : false
+    readonly property bool musicPlaying: (player ? player.playing : false) || spotifyPlaying
     // Idle in controller mode it names the chord that opens it: "♪ L1+R1".
-    readonly property string musicLabel: musicPlaying && player.currentTrack.length > 0 ? "♪ " + player.currentTrack
+    readonly property string musicLabel: player && player.playing && player.currentTrack.length > 0 ? "♪ " + player.currentTrack
+                                         : spotifyPlaying && spotify.track.length > 0 ? "♪ " + spotify.track
                                          : (padHints ? "♪ L1+R1" : "♪")
+    // Ambient voice (Cmd+Shift+V or the Ambient pill): Phonon "You:" lines become intents.
+    readonly property bool ambientOn: backend ? backend.ambientVoiceEnabled : false
+    function toggleAmbient() { if (backend) backend.toggleAmbientVoice(); }
     // L1 + R1 from anywhere: whatever else is up steps aside for the music card.
     function padToggleMusic() {
         poke();
@@ -377,7 +383,30 @@ FocusScope {
         if (onboarding.open || controllerMap.open)
             return;
         switch (action) {
-        case "open_music": clearOverlaysFor("music"); if (!music.open) music.show(); break;
+        case "open_music": clearOverlaysFor("music"); music.showTab("slowmix"); break;
+        case "open_spotify": clearOverlaysFor("music"); music.showTab("spotify"); break;
+        case "go_home":
+            if (music.open) music.hide();
+            takeFocus();
+            goLens(0);
+            break;
+        case "focus_project":
+        case "open_stage":
+        case "open_ladder": {
+            const i = backend ? backend.projectIndex(arg) : -1;
+            if (i < 0)
+                break;
+            if (music.open) music.hide();
+            takeFocus();
+            if (action === "focus_project") {
+                goLens(0);
+                selectedIsland = i;
+            } else {
+                enterProject(i);
+                goLens(action === "open_stage" && projects[i].artifacts.length > 0 ? 2 : 1);
+            }
+            break;
+        }
         case "close_music": if (music.open) music.hide(); break;
         case "open_review": clearOverlaysFor("review"); if (!review.open) review.show(); break;
         case "open_settings": clearOverlaysFor("settings"); if (!settings.open) settings.show(); break;
@@ -417,7 +446,7 @@ FocusScope {
     // What is on screen, for the model's Tier 3 "Studio live state:" (re-pushed on every change).
     readonly property var uiStateMap: {
         const overlays = [];
-        if (music.open) overlays.push("Music (Slowmix)");
+        if (music.open) overlays.push(music.tab === "spotify" ? "Music (Spotify)" : "Music (Slowmix)");
         if (settings.open) overlays.push("Settings");
         if (briefing.open) overlays.push("Morning Briefing");
         if (review.open) overlays.push("Session Review");
@@ -499,6 +528,12 @@ FocusScope {
             } else if (!settings.open && !briefing.open && !controllerMap.open) {
                 review.show();
             }
+            e.accepted = true;
+            return;
+        }
+        // Cmd+Shift+V: ambient voice on / off (Phonon "You:" lines become intents).
+        if (ctrl && (e.modifiers & Qt.ShiftModifier) !== 0 && e.key === Qt.Key_V) {
+            toggleAmbient();
             e.accepted = true;
             return;
         }
@@ -814,6 +849,10 @@ FocusScope {
         poke();
         if (onboarding.open || dialog.open || settings.open)
             return;
+        if (omnibar.open) {
+            omnibar.pinActive();  // R1 is the pad's Tab: pin the hovered target, like ⇥
+            return;
+        }
         acceptPrediction();
     }
     function padSecondary() {
@@ -909,6 +948,18 @@ FocusScope {
     }
     function musicPad(kind, v) {
         poke();
+        // Spotify tab: □ / ✕ play-pause · L1 prev · R1 next · ↕ volume · ◄► prev / next · ○ close.
+        if (music.tab === "spotify") {
+            switch (kind) {
+            case "nav": if (v.dy !== 0) music.stepSpotifyVolume(-v.dy); else if (v.dx < 0) music.spotifyPrev(); else music.spotifyNext(); break;
+            case "confirm":
+            case "secondary": music.spotifyToggle(); break;
+            case "nextTab": music.spotifyNext(); break;  // R1 (accept_prediction)
+            case "step": if (v < 0) music.spotifyPrev(); break;  // L1; △ does nothing here
+            case "back": music.hide(); break;
+            }
+            return;
+        }
         switch (kind) {
         case "nav": if (v.dy !== 0) music.move(v.dy); else music.stepSpeed(v.dx); break;
         case "confirm": music.playRow(music.row); break;
@@ -930,11 +981,19 @@ FocusScope {
         function onAcceptPrediction() { if (music.open) app.musicPad("nextTab"); else app.padAcceptPrediction(); }
         function onSecondary() { if (music.open) app.musicPad("secondary"); else app.padSecondary(); }
         function onStep(d) { if (music.open) app.musicPad("step", d); else app.padStep(d); }
-        function onZoomStep(d) { app.padZoom(d); }
+        function onZoomStep(d) { if (!music.open) app.padZoom(d); }  // R3 switches the music tab instead
+        function onR3Pressed() { if (music.open) { app.poke(); music.switchTab(); } }
         function onZoomReset() { if (app.backend) app.backend.resetZoom(); }
         function onToggleSettings() { if (!music.open) app.padSettings(); }
         function onToggleNewSession() { if (!music.open) app.padNewSession(); }
         function onToggleMusic() { app.padToggleMusic(); }
+        function onToggleReview() {
+            app.poke();
+            if (review.open)
+                review.hide();
+            else if (!music.open && !onboarding.open && !dialog.open && !settings.open && !controllerMap.open && !briefing.open)
+                review.show();
+        }
         function onToggleBriefing() {
             app.poke();
             if (!music.open && !onboarding.open && !dialog.open && !settings.open && !controllerMap.open)
@@ -987,6 +1046,11 @@ FocusScope {
         musicLabel: app.musicLabel
         musicPlaying: app.musicPlaying
         onMusicRequested: app.toggleMusic()
+        ambientOn: app.ambientOn
+        ambientBusy: app.backend ? app.backend.ambientBusy : false
+        onAmbientRequested: app.toggleAmbient()
+        padHints: app.padHints
+        padGlyphs: app.padGlyphs
     }
 
     // The shared element: a card that starts as the island and becomes the whole window.
@@ -1059,7 +1123,7 @@ FocusScope {
                     objectName: "headerJob"
                     anchors.left: headerName.right
                     anchors.leftMargin: 14
-                    anchors.right: codePill.visible ? codePill.left : headerMusic.left
+                    anchors.right: codePill.visible ? codePill.left : headerAmbient.left
                     anchors.rightMargin: 24
                     anchors.verticalCenter: parent.verticalCenter
                     visible: text.length > 0
@@ -1076,7 +1140,7 @@ FocusScope {
                     objectName: "codePill"
                     readonly property bool on: app.backend ? app.backend.showCodeDiffs : false
                     visible: app.lens === 2 && app.project !== null && (app.project.diffCount || 0) > 0
-                    anchors.right: headerMusic.left
+                    anchors.right: headerAmbient.left
                     anchors.rightMargin: 12
                     anchors.verticalCenter: parent.verticalCenter
                     width: codeText.implicitWidth + 26
@@ -1095,6 +1159,30 @@ FocusScope {
                     }
                     HoverHandler { id: codeHover; cursorShape: Qt.PointingHandCursor }
                     TapHandler { onTapped: app.toggleCodeDiffs() }
+                }
+                // Ambient voice: the same pill as the Constellation's top bar (Cmd+Shift+V).
+                Rectangle {
+                    id: headerAmbient
+                    objectName: "headerAmbientPill"
+                    anchors.right: headerMusic.left
+                    anchors.rightMargin: 12
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: headerAmbientText.implicitWidth + 26
+                    height: 28
+                    radius: 14
+                    color: headerAmbientHover.hovered ? Theme.card : "transparent"
+                    border.width: 1
+                    border.color: app.ambientOn ? Theme.goldA(0.55) : Theme.line
+                    Text {
+                        id: headerAmbientText
+                        anchors.centerIn: parent
+                        text: app.backend && app.backend.ambientBusy ? "Ambient ·" : "Ambient"
+                        color: app.ambientOn ? Theme.gold : Theme.dim
+                        font.family: Theme.mono
+                        font.pixelSize: 14
+                    }
+                    HoverHandler { id: headerAmbientHover; cursorShape: Qt.PointingHandCursor }
+                    TapHandler { onTapped: app.toggleAmbient() }
                 }
                 // Music: the same quiet ♪ pill as the Constellation's top bar.
                 Rectangle {
@@ -1549,6 +1637,8 @@ FocusScope {
                                  : (app.projects.length > 0 ? app.projects[Math.min(app.selectedIsland, app.projects.length - 1)].key : "")
         artifactIndex: app.lens === 2 ? app.artifactIndex : -1
         mouseMode: app.navMode === "mouse"
+        padHints: app.padHints
+        padGlyphs: app.padGlyphs
         suppressed: settings.open || dialog.open || onboarding.open || briefing.open || controllerMap.open || review.open || music.open
         onClosed: app.takeFocus()
     }
@@ -1629,6 +1719,63 @@ FocusScope {
     }
     // --- Music -----------------------------------------------------------------------------------
     // Cmd+M or the ♪ pill: the curated slowmix rotation and its five controls.
+    // Ambient voice reply: what was heard, faint, and the short answer or action confirmation.
+    // Anchored under the top bar's right side, quiet, gone after 9 s. [[IGNORE]] never shows.
+    Rectangle {
+        id: ambientCard
+        objectName: "ambientAnswerCard"
+        readonly property string answer: app.backend ? app.backend.ambientAnswer : ""
+        readonly property string heard: app.backend ? app.backend.ambientHeard : ""
+        anchors.top: parent.top
+        anchors.topMargin: 70
+        anchors.right: parent.right
+        anchors.rightMargin: 24
+        width: Math.min(460, parent.width * 0.4)
+        height: ambientCol.implicitHeight + 24
+        radius: 14
+        color: "#0b0a08"
+        border.width: 1
+        border.color: Theme.line
+        opacity: answer.length > 0 && !music.open && !settings.open ? 1 : 0
+        visible: opacity > 0.01
+        Behavior on opacity { NumberAnimation { duration: 180; easing.type: Easing.OutCubic } }
+        Column {
+            id: ambientCol
+            x: 16
+            y: 12
+            width: parent.width - 32
+            spacing: 6
+            Text {
+                objectName: "ambientHeard"
+                width: parent.width
+                text: ambientCard.heard.length > 0 ? "“" + ambientCard.heard + "”" : ""
+                visible: text.length > 0
+                color: Theme.faint
+                elide: Text.ElideRight
+                font.family: Theme.sans
+                font.pixelSize: 14
+            }
+            Text {
+                objectName: "ambientAnswerText"
+                width: parent.width
+                text: ambientCard.answer
+                color: Theme.text
+                wrapMode: Text.Wrap
+                maximumLineCount: 4
+                elide: Text.ElideRight
+                font.family: Theme.sans
+                font.pixelSize: 16
+            }
+        }
+        TapHandler { onTapped: if (app.backend) app.backend.clearAmbientAnswer() }
+        onAnswerChanged: if (answer.length > 0) ambientTimer.restart()
+        Timer {
+            id: ambientTimer
+            interval: 9000
+            onTriggered: if (app.backend) app.backend.clearAmbientAnswer()
+        }
+    }
+
     SlowmixOverlay {
         id: music
         anchors.fill: parent

@@ -14,7 +14,9 @@ const QString kCompatSystemPrompt = QStringLiteral(
     "To control the Studio UI itself, start your answer with [[ACTION:name]] or [[ACTION:name:arg]] "
     "(open_music, close_music, play_track:<song>, pause_music, resume_music, open_review, filter_needs_me, "
     "filter_all, reset_layout, open_settings, open_briefing, set_theme:blue|gold, show_diffs:1|0, "
-    "spawn_agent:<task> to start a coding agent on real work).");
+    "set_volume:<pct>, open_spotify, spotify_play, spotify_play:<song>, spotify_pause, spotify_next, spotify_prev, "
+    "spotify_volume:<pct>, focus_project:<name>, open_stage:<name>, open_ladder:<name>, go_home, "
+    "spawn_agent:<task> to start a coding agent on real work). Several tags may go in one answer.");
 
 namespace {
 
@@ -26,6 +28,11 @@ QJsonObject message(const QString &role, const QString &content)
 constexpr qint64 kStudioContextCapBytes = 4096;
 
 }  // namespace
+
+bool isNoThinkEffort(const QString &effort)
+{
+    return effort == QLatin1String("fast") || effort == QLatin1String("none");
+}
 
 QString loadLocalStudioContext(const QString &path)
 {
@@ -110,7 +117,9 @@ QByteArray buildTieredChatRequest(const TieredPrompt &p)
     body.insert(QStringLiteral("model"), p.model);
     body.insert(QStringLiteral("stream"), true);
     body.insert(QStringLiteral("messages"), msgs);
-    if (!p.effort.isEmpty())
+    if (isNoThinkEffort(p.effort))
+        body.insert(QStringLiteral("chat_template_kwargs"), QJsonObject{{QStringLiteral("enable_thinking"), false}});
+    else if (!p.effort.isEmpty())
         body.insert(QStringLiteral("reasoning_effort"), p.effort);
     return QJsonDocument(body).toJson(QJsonDocument::Compact);
 }

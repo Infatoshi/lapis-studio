@@ -24,6 +24,12 @@ Item {
     signal musicRequested()
     property string musicLabel: "♪"     // "♪ night drive" while a track plays
     property bool musicPlaying: false
+    signal ambientRequested()
+    property bool ambientOn: false      // ambient voice listening (gold while on)
+    property bool ambientBusy: false
+    // Controller mode: pills carry the pad button bound to them (StudioApp binds these).
+    property bool padHints: false
+    property var padGlyphs: ({})
 
     // Which projects have a slot on screen, in order (project indices). The filter never
     // reorders: islands keep their relative order, so muscle memory survives toggling it.
@@ -288,22 +294,47 @@ Item {
     component BarPill: Rectangle {
         id: bp
         property string label: ""
+        property string glyph: ""  // pad button badge, shown in controller mode only
         property bool on: false
         signal tapped()
-        width: bpText.implicitWidth + 28
+        width: bpRow.implicitWidth + 28
         height: 30
         radius: 15
         color: bpHover.hovered ? Theme.card : "transparent"
         border.width: 1
         border.color: on ? Theme.goldA(0.55) : Theme.line
-        Text {
-            id: bpText
-            objectName: "barPillText"
+        Row {
+            id: bpRow
             anchors.centerIn: parent
-            text: bp.label
-            color: bp.on ? Theme.gold : (bpHover.hovered ? Theme.text : Theme.dim)
-            font.family: Theme.mono
-            font.pixelSize: 14
+            spacing: 8
+            Text {
+                id: bpText
+                objectName: "barPillText"
+                anchors.verticalCenter: parent.verticalCenter
+                text: bp.label
+                color: bp.on ? Theme.gold : (bpHover.hovered ? Theme.text : Theme.dim)
+                font.family: Theme.mono
+                font.pixelSize: 14
+            }
+            Rectangle {
+                objectName: "barPillGlyph"
+                anchors.verticalCenter: parent.verticalCenter
+                visible: root.padHints && bp.glyph.length > 0
+                width: bpGlyph.implicitWidth + 10
+                height: 18
+                radius: 5
+                color: "transparent"
+                border.width: 1
+                border.color: Theme.line
+                Text {
+                    id: bpGlyph
+                    anchors.centerIn: parent
+                    text: bp.glyph
+                    color: Theme.dim
+                    font.family: Theme.mono
+                    font.pixelSize: 11
+                }
+            }
         }
         HoverHandler { id: bpHover; cursorShape: Qt.PointingHandCursor }
         TapHandler { onTapped: bp.tapped() }
@@ -344,8 +375,15 @@ Item {
                 onTapped: root.resetLayout()
             }
             BarPill {
+                objectName: "ambientPill"
+                label: root.ambientBusy ? "Ambient ·" : "Ambient"
+                on: root.ambientOn
+                onTapped: root.ambientRequested()
+            }
+            BarPill {
                 objectName: "reviewPill"
                 label: "Review"
+                glyph: root.padGlyphs["toggle_review"] || ""
                 onTapped: root.reviewRequested()
             }
             BarPill {

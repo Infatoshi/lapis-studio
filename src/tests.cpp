@@ -558,8 +558,8 @@ void unitTests()
         b.cycleEffort(1);
         check(b.chatEffort() == "xhigh", "picker: effort stops at the model's top (no wrap)", b.chatEffort());
         b.cycleModel(-1);  // W / k / Up from the first model wraps to the last (qwen3.8-flash-next)
-        check(b.chatModel() == "qwen3.8-flash-next" && b.chatEffort() == "high" && b.chatProvider() == "openai-compat",
-              "picker: W wraps to Qwen3.8 Flash and clamps xhigh -> high", b.chatModel() + " " + b.chatEffort());
+        check(b.chatModel() == "qwen3.8-flash-next" && b.chatEffort() == "fast" && b.chatProvider() == "openai-compat",
+              "picker: W wraps to Qwen3.8 Flash and lands on no-think fast", b.chatModel() + " " + b.chatEffort());
         b.cycleModel(-1);
         check(b.chatModel() == "gemini-4-argon" && b.chatEffort() == "high" && b.chatProvider() == "google",
               "picker: W steps to Gemini 4 Argon", b.chatModel() + " " + b.chatEffort());
@@ -4476,6 +4476,61 @@ void slowmixUiTests()
     sendKey(win, Qt::Key_Space);
     check(player->playing(), "music ui: Space resumes");
 
+    // Volume: five chips, 80% lit by default, a click sets the daemon's linear gain.
+    check(visibleItems("slowmixVolume").size() == 5 && chip("slowmixVolume", "80%")
+              && chip("slowmixVolume", "80%")->property("on").toBool(),
+          "music ui: VOLUME row shows 20..100% with 80% on by default",
+          QString::number(visibleItems("slowmixVolume").size()));
+    click(chip("slowmixVolume", "40%"));
+    check(std::abs(player->volume() - 0.4) < 1e-9 && chip("slowmixVolume", "40%")->property("on").toBool(),
+          "music ui: the 40% chip sets slowmix volume 0.40", QString::number(player->volume()));
+    player->setVolume(0.8);
+
+    // Tab flips to Spotify (header tabs), where the slowmix rows hide and Spotify's controls show.
+    {
+        SpotifyController *sp = backend.spotifyController();
+        sendKey(win, Qt::Key_Tab);
+        settle(60);
+        QQuickItem *spView = firstItem(win, "spotifyView");
+        check(overlay->property("tab").toString() == "spotify" && spView && spView->isVisible()
+                  && visibleItems("slowmixVolume").isEmpty() && visibleItems("spotifyVolume").size() == 5,
+              "music ui: Tab switches to the Spotify tab (5 volume chips, slowmix rows hidden)",
+              overlay->property("tab").toString());
+        check(sp->polling(), "music ui: the Spotify tab turns polling on while visible");
+        click(firstItem(win, "spotifyPlay"));
+        check(sp->playing() && !player->playing(),
+              "music ui: Spotify Play pauses slowmix (never both)", QString::number(player->playing()));
+        click(firstItem(win, "spotifyNext"));
+        click(firstItem(win, "spotifyPrev"));
+        click(chip("spotifyVolume", "60%"));
+        const QStringList log = sp->commandLog();
+        check(log.mid(log.size() - 4) == QStringList{"playback play-pause", "playback next", "playback previous", "playback volume 60"}
+                  && sp->volume() == 60,
+              "music ui: Play / Next / Prev / 60% map to spotify_player commands", log.join(" | "));
+        if (QQuickItem *in = firstItem(win, "spotifySearch")) {
+            in->forceActiveFocus();
+            in->setProperty("text", QStringLiteral("midnight city"));
+            sendKey(win, Qt::Key_Return);
+            settle(60);
+        }
+        QQuickItem *searchBox = firstItem(win, "spotifySearch");
+        check(sp->commandLog().contains("search midnight city") && sp->track() == "midnight city" && overlay->hasActiveFocus()
+                  && searchBox && !searchBox->hasActiveFocus(),
+              "music ui: the search box runs search-and-play and hands focus back",
+              QStringLiteral("overlayFocus=%1 searchFocus=%2 track=%3 focusItem=%4")
+                  .arg(overlay->hasActiveFocus())
+                  .arg(searchBox && searchBox->hasActiveFocus())
+                  .arg(sp->track())
+                  .arg(win->activeFocusItem() ? win->activeFocusItem()->objectName() : QString("none")));
+        sendKey(win, Qt::Key_Tab);
+        settle(60);
+        check(overlay->property("tab").toString() == "slowmix" && !sp->polling(),
+              "music ui: Tab returns to Slowmix and stops Spotify polling");
+        sendKey(win, Qt::Key_Space);
+        check(player->playing() && !sp->playing(), "music ui: resuming slowmix pauses Spotify");
+        check(sp->spawnCount() == 0, "music ui: mock mode never spawns spotify_player");
+    }
+
     click(firstItem(win, "slowmixAll"));
     settle(100);
     check(visibleItems("slowmixTrack").size() == 7 && player->showArchive(),
@@ -4487,7 +4542,12 @@ void slowmixUiTests()
     sendKey(win, Qt::Key_Escape);
     settle(300);
     check(!overlay->property("open").toBool() && player->playing() && player->currentTrack() == "afterglow extended",
-          "music ui: Esc closes the overlay without stopping playback");
+          "music ui: Esc closes the overlay without stopping playback",
+          QStringLiteral("open=%1 playing=%2 track=%3 focus=%4")
+              .arg(overlay->property("open").toBool())
+              .arg(player->playing())
+              .arg(player->currentTrack())
+              .arg(win->activeFocusItem() ? win->activeFocusItem()->objectName() + "/" + win->activeFocusItem()->metaObject()->className() : QString("none")));
     check(pillText() == QStringLiteral("♪ afterglow extended"), "music ui: top-bar pill names the playing track", pillText());
     sendKey(win, Qt::Key_M, Qt::ControlModifier);
     settle(200);
@@ -4554,7 +4614,20 @@ int snapSlowmix(const QString &outPath)
                 qPrintable(player->reverb()));
     std::printf("snap-slowmix: %s %s (%d blue/green px), spawned %d\n", barSaved ? "saved" : "FAILED",
                 qPrintable(barPath), forbiddenPixels(bar), player->spawnCount());
-    return saved && barSaved ? 0 : 1;
+    // The Spotify tab, in a dry run (no process): a search-and-play stands in for real playback.
+    QString spPath = outPath;
+    spPath.insert(outPath.endsWith(QLatin1String(".png"), Qt::CaseInsensitive) ? outPath.size() - 4 : outPath.size(),
+                  QLatin1String("-spotify"));
+    SpotifyController *sp = backend.spotifyController();
+    sp->searchAndPlay(QStringLiteral("midnight city"));
+    sp->setVolume(60);
+    sendKey(win, Qt::Key_Tab);
+    settle(500);
+    const QImage spImg = win->grabWindow();
+    const bool spSaved = spImg.save(spPath);
+    std::printf("snap-slowmix: %s %s (%d blue/green px), spotify spawned %d\n", spSaved ? "saved" : "FAILED",
+                qPrintable(spPath), forbiddenPixels(spImg), sp->spawnCount());
+    return saved && barSaved && spSaved ? 0 : 1;
 }
 
 // --- Cross-session memory in Tier 3 -------------------------------------------------------------
@@ -5071,6 +5144,35 @@ void studioControlTests()
         tap([](S &s) { s.r2 = 1.0; });
         check(player->bass() != b0, "pad music: R2 cycles bass", QString::number(player->bass()));
     }
+    {
+        // R3 flips the card to Spotify (no zoom); there □ plays / pauses, R1 next, L1 prev, ↕ volume.
+        SpotifyController *sp = backend.spotifyController();
+        const double scale0 = backend.uiScale();
+        int r3s = 0;
+        QObject::connect(pad, &Gamepad::r3Pressed, [&r3s] { ++r3s; });
+        tap([](S &s) { s.r3 = true; });
+        check(r3s == 1 && overlay->property("tab").toString() == "spotify" && std::abs(backend.uiScale() - scale0) < 1e-9,
+              "pad music: R3 switches to the Spotify tab and does not zoom",
+              overlay->property("tab").toString() + " " + QString::number(backend.uiScale()));
+        QQuickItem *badge = nullptr;
+        for (QQuickItem *it : findItems(qobject_cast<QQuickItem *>(overlay), "padBadge"))
+            if (it->isVisible() && it->childItems().value(0) && it->childItems()[0]->property("text").toString() == "R3")
+                badge = it;
+        check(badge != nullptr, "pad music: the header shows an R3 glyph badge in controller mode");
+        const int n0 = int(sp->commandLog().size());
+        tap([](S &s) { s.x = true; });
+        check(sp->playing() && !player->playing(), "pad spotify: □ plays Spotify and pauses slowmix");
+        tap([](S &s) { s.r1 = true; });
+        tap([](S &s) { s.l1 = true; });
+        tap([](S &s) { s.dpadY = 1; });  // up: volume one chip higher (unknown volume starts at 60)
+        const QStringList log = sp->commandLog().mid(n0);
+        check(log == QStringList{"playback play-pause", "playback next", "playback previous", "playback volume 80"},
+              "pad spotify: □ / R1 / L1 / ↑ map to play-pause / next / previous / volume", log.join(" | "));
+        tap([](S &s) { s.r3 = true; });
+        check(overlay->property("tab").toString() == "slowmix", "pad music: R3 again returns to Slowmix");
+        tap([](S &s) { s.x = true; });
+        check(player->playing() && !sp->playing(), "pad music: □ on Slowmix resumes it and pauses Spotify");
+    }
     tap([](S &s) { s.b = true; });
     settle(250);
     check(!overlay->property("open").toBool() && player->playing() && !pad->musicMode(),
@@ -5089,6 +5191,261 @@ void studioControlTests()
           "studio ui: zero processes, zero GameController calls");
 }
 
+// --- Final wiring: Spotify, slowmix volume, no-think quick asks, Tier 0 context, ambient voice ---
+
+void finalWiringTests()
+{
+    // spotify_player JSON.
+    {
+        const SpotifyPlayback pb = parseSpotifyPlayback(
+            R"({"is_playing":true,"item":{"name":"Night Drive","artists":[{"name":"Lapis"},{"name":"B"}]},"device":{"volume_percent":55}})");
+        check(pb.ok && pb.playing && pb.track == "Night Drive" && pb.artist == "Lapis" && pb.volume == 55,
+              "spotify: playback JSON -> playing, track, first artist, volume", pb.track + " " + pb.artist);
+        check(!parseSpotifyPlayback("null").ok && !parseSpotifyPlayback("").ok && !parseSpotifyPlayback("garbage").ok,
+              "spotify: null / empty / garbage playback is not ok");
+        check(parseSpotifyFirstTrackId(R"({"tracks":[{"id":"spotify:track:abc123","name":"x"},{"id":"zzz"}]})") == "abc123"
+                  && parseSpotifyFirstTrackId(R"({"tracks":[{"id":"def456"}]})") == "def456"
+                  && parseSpotifyFirstTrackId(R"({"tracks":{"items":[{"uri":"spotify:track:ghi789"}]}})") == "ghi789"
+                  && parseSpotifyFirstTrackId(R"({"tracks":[]})").isEmpty(),
+              "spotify: search JSON -> first track id (prefix stripped; id, items and uri shapes)");
+    }
+
+    // Dry run: optimistic state, recorded commands, zero processes.
+    {
+        SpotifyController sp;
+        int started = 0;
+        QObject::connect(&sp, &SpotifyController::playbackStarted, [&started] { ++started; });
+        sp.togglePlay();
+        sp.setVolume(145);
+        sp.nextTrack();
+        check(sp.playing() && started == 1 && sp.volume() == 100 && sp.spawnCount() == 0
+                  && sp.commandLog() == QStringList{"playback play-pause", "playback volume 100", "playback next"},
+              "spotify: dry run updates state, clamps volume, logs commands, spawns nothing", sp.commandLog().join(" | "));
+    }
+
+    // Live path against a stub spotify_player: real QProcess round trips, search -> start --id.
+    {
+        QTemporaryDir tmp;
+        const QString log = tmp.path() + "/args.log";
+        const QString stub = tmp.path() + "/spotify_player";
+        QFile f(stub);
+        if (f.open(QIODevice::WriteOnly)) {
+            f.write(QStringLiteral("#!/bin/sh\necho \"$*\" >> '%1'\ncase \"$1 $2 $3\" in\n"
+                                   "  \"get key playback\") echo '{\"is_playing\":true,\"item\":{\"name\":\"Night Drive\","
+                                   "\"artists\":[{\"name\":\"Lapis\"}]},\"device\":{\"volume_percent\":55}}' ;;\n"
+                                   "  \"search \"*) echo '{\"tracks\":[{\"id\":\"spotify:track:abc123\"}]}' ;;\n"
+                                   "esac\nexit 0\n")
+                        .arg(log)
+                        .toUtf8());
+            f.close();
+            f.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner);
+        }
+        SpotifyController sp;
+        sp.setBinary(stub);
+        sp.setSpawnAllowed(true);  // one refresh at startup
+        const bool refreshed = waitUntil([&] { return sp.track() == "Night Drive"; }, 5000);
+        check(refreshed && sp.playing() && sp.artist() == "Lapis" && sp.volume() == 55 && !sp.busy(),
+              "spotify live: get key playback fills track / artist / volume", sp.track() + " " + sp.error());
+        sp.searchAndPlay(QStringLiteral("night drive"));
+        const bool started = waitUntil([&] {
+            QFile l(log);
+            return l.open(QIODevice::ReadOnly) && l.readAll().contains("playback start track --id abc123");
+        }, 5000);
+        QFile l(log);
+        const QString args = l.open(QIODevice::ReadOnly) ? QString::fromUtf8(l.readAll()) : QString();
+        check(started, "spotify live: search -> playback start track --id <first id>", args);
+        waitUntil([&] { return !sp.busy(); }, 3000);
+        sp.setBinary(tmp.path() + "/missing");
+        sp.nextTrack();
+        check(sp.error().contains("not found") && sp.spawnCount() >= 3,
+              "spotify live: a missing binary reports instead of spawning", sp.error());
+        check(SpotifyController::findBinary().isEmpty() || QFileInfo(SpotifyController::findBinary()).isExecutable(),
+              "spotify: findBinary returns an executable or nothing", SpotifyController::findBinary());
+    }
+
+    Backend b(Backend::Mode::Mock);
+    SpotifyController *sp = b.spotifyController();
+    SlowmixController *mix = b.slowmixController();
+
+    // One source of sound at a time.
+    {
+        b.dispatchStudioAction("resume_music");
+        const bool mixOn = mix->playing();
+        b.dispatchStudioAction("spotify_play");
+        const bool handedOver = sp->playing() && !mix->playing();
+        b.dispatchStudioAction("resume_music");
+        check(mixOn && handedOver && mix->playing() && !sp->playing() && sp->commandLog().last() == "playback pause",
+              "exclusive: Spotify starting pauses slowmix, slowmix starting pauses Spotify", sp->commandLog().join(" | "));
+    }
+
+    // Natural-language commands and their dispatch.
+    {
+        auto cmd = [](const char *t) {
+            const StudioCommand c = parseStudioCommand(QString::fromUtf8(t));
+            return c.arg.isEmpty() ? c.action : c.action + ":" + c.arg;
+        };
+        const QStringList got = {cmd("pause spotify"), cmd("hey can you skip this song on spotify"),
+                                 cmd("previous track on spotify"), cmd("play night drive on spotify"),
+                                 cmd("resume spotify please"), cmd("set the volume to 60 percent"),
+                                 cmd("spotify volume 40"), cmd("volume 30 on spotify"), cmd("open spotify"),
+                                 cmd("pause the music"), cmd("open music")};
+        const QStringList want = {"spotify_pause", "spotify_next", "spotify_prev", "spotify_play:night drive",
+                                  "spotify_play", "set_volume:60", "spotify_volume:40", "spotify_volume:30",
+                                  "open_spotify", "pause_music", "open_music"};
+        check(got == want, "nl: spotify / volume phrases map to their actions; slowmix phrases unchanged", got.join(", "));
+        QString last;
+        QObject::connect(&b, &Backend::uiActionRequested, [&last](const QString &a, const QString &arg) {
+            last = arg.isEmpty() ? a : a + ":" + arg;
+        });
+        const QString r1 = b.dispatchStudioAction("set_volume", "60%");
+        const QString r2 = b.dispatchStudioAction("spotify_volume", "0.35");
+        check(std::abs(mix->volume() - 0.6) < 1e-9 && sp->volume() == 35 && r1 == "Slowmix volume 60%."
+                  && r2 == "Spotify volume 35%." && last == "spotify_volume:35",
+              "nl: set_volume:60% and spotify_volume:0.35 land as 0.60 / 35", r1 + " " + r2);
+        const QVariantMap p0 = b.projects().value(0).toMap();
+        const QString name = p0.value("name").toString(), key = p0.value("key").toString();
+        const QString r3 = b.dispatchStudioAction("open_stage", name.toUpper());
+        check(r3.contains(name) && last == "open_stage:" + key, "nl: open_stage:<name> finds the project and emits its key",
+              r3 + " / " + last);
+        check(b.dispatchStudioAction("focus_project", "zzz-no-such-project").isEmpty(),
+              "nl: focus_project with no match does nothing");
+        b.dispatchStudioAction("go_home");
+        check(last == "go_home", "nl: go_home reaches the QML side");
+    }
+
+    // No-think by default for Qwen; thinking stays opt-in.
+    {
+        b.setChatModel("qwen3.8-flash-next");
+        check(b.chatEffort() == "fast" && b.compatEffort() == "fast" && b.chatEfforts() == QStringList{"fast", "low", "medium"},
+              "effort: Qwen3.8 Flash offers fast / low / medium and defaults to fast", b.chatEfforts().join(","));
+        TieredPrompt p;
+        p.model = "qwen3.8-flash-next";
+        p.systemPrompt = kCompatSystemPrompt;
+        p.question = "hi";
+        p.effort = "fast";
+        const QJsonObject fast = QJsonDocument::fromJson(buildTieredChatRequest(p)).object();
+        p.effort = "none";
+        const QJsonObject none = QJsonDocument::fromJson(buildTieredChatRequest(p)).object();
+        p.effort = "low";
+        const QJsonObject low = QJsonDocument::fromJson(buildTieredChatRequest(p)).object();
+        check(fast.value("chat_template_kwargs").toObject().value("enable_thinking") == QJsonValue(false)
+                  && !fast.contains("reasoning_effort") && none.value("chat_template_kwargs").toObject().contains("enable_thinking")
+                  && low.value("reasoning_effort").toString() == "low" && !low.contains("chat_template_kwargs"),
+              "effort: fast / none send enable_thinking false; low sends reasoning_effort");
+        b.setChatEffort("medium");
+        check(b.compatEffort() == "medium", "effort: picking medium on Qwen opts into thinking");
+        b.setChatModel("claude-sonnet-5-5");
+        check(b.compatEffort() == "fast" && b.chatEffort() == "medium",
+              "effort: card streams under a CLI model stay no-think; the CLI model keeps its effort", b.chatEffort());
+        // Old prefs (no effortSchema) saved "low" as Qwen's floor: they start no-think once.
+        QTemporaryDir tmp;
+        auto loadWith = [&](const QByteArray &json) {
+            QFile pf(tmp.path() + "/prefs.json");
+            if (!pf.open(QIODevice::WriteOnly | QIODevice::Truncate))
+                return QStringLiteral("unwritable");
+            pf.write(json);
+            pf.close();
+            Backend c(Backend::Mode::Mock);
+            c.setPrefsPath(pf.fileName());
+            return c.chatEffort();
+        };
+        const QString old = loadWith(R"({"defaultModel":"qwen3.8-flash-next","defaultEffort":"low"})");
+        const QString kept = loadWith(R"({"defaultModel":"qwen3.8-flash-next","defaultEffort":"low","effortSchema":2})");
+        check(old == "fast" && kept == "low", "effort: pre-schema prefs migrate low -> fast; schema 2 keeps low", old + " " + kept);
+    }
+
+    // Tier 0 local studio context rides in every compat request, byte-identical to the warm.
+    {
+        b.setStudioContext("CTX-MARKER tetra 4x RTX PRO 6000");
+        const QString key = b.projects().value(0).toMap().value("key").toString();
+        const TieredPrompt p = b.tieredPrompt(key, QString(), "what is tetra?");
+        const QJsonObject body = QJsonDocument::fromJson(buildTieredChatRequest(p)).object();
+        const QString sys = body.value("messages").toArray().first().toObject().value("content").toString();
+        const QJsonObject warm = QJsonDocument::fromJson(buildTieredWarmRequest(p)).object();
+        check(sys.contains("Local studio context:\nCTX-MARKER") && sys.contains("Your model ID is")
+                  && warm.value("messages").toArray().first() == body.value("messages").toArray().first(),
+              "tier0: studio context sits in the system message, same bytes in ask and warm", sys.right(80));
+        b.setStudioContext(QString());
+    }
+
+    // Ambient voice over a local SSE server: compound tags in one turn, [[IGNORE]] silent, fast path local.
+    {
+        QTcpServer server;
+        QList<QByteArray> bodies;
+        QList<QByteArray> replies = {"[[ACTION:set_volume:40]] [[ACTION:spotify_next]] Done.", "[[IGNORE]]"};
+        QObject::connect(&server, &QTcpServer::newConnection, [&] {
+            while (QTcpSocket *s = server.nextPendingConnection()) {
+                auto buf = std::make_shared<QByteArray>();
+                QObject::connect(s, &QTcpSocket::readyRead, s, [&, s, buf] {
+                    *buf += s->readAll();
+                    const qsizetype he = buf->indexOf("\r\n\r\n");
+                    if (he < 0)
+                        return;
+                    const QByteArray head = buf->left(he).toLower();
+                    const qsizetype cl = head.indexOf("content-length:");
+                    const qsizetype eol = head.indexOf("\r\n", cl);
+                    const qsizetype len = cl < 0 ? 0 : head.mid(cl + 15, eol < 0 ? -1 : eol - cl - 15).trimmed().toLongLong();
+                    if (buf->size() < he + 4 + len)
+                        return;
+                    bodies << buf->mid(he + 4, len);
+                    const QByteArray answer = replies.isEmpty() ? QByteArray("ok") : replies.takeFirst();
+                    const QByteArray body = "data: {\"choices\":[{\"delta\":{\"content\":\"" + answer + "\"}}]}\n\n"
+                                            "data: [DONE]\n\n";
+                    s->write("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\nContent-Length: "
+                             + QByteArray::number(body.size()) + "\r\n\r\n" + body);
+                    s->disconnectFromHost();
+                });
+                QObject::connect(s, &QTcpSocket::disconnected, s, &QObject::deleteLater);
+            }
+        });
+        check(server.listen(QHostAddress::LocalHost, 0), "ambient: local SSE server listens");
+        LlmRouter router;
+        b.setLlmRouter(&router);
+        b.setOpenaiCompatUrl(QStringLiteral("http://127.0.0.1:%1/v1").arg(server.serverPort()));
+        b.setStudioContext("CTX-AMBIENT");
+        mix->setVolume(0.8);
+        const int n0 = int(sp->commandLog().size());
+
+        b.feedAmbientTail("0:01 You: turn it down and skip this one");  // off: ignored
+        b.setAmbientVoiceEnabled(true);
+        b.feedAmbientTail("0:01 You: turn it down and skip this one\n0:03 Call: sure\n0:04 You: turn it down and skip this one");
+        QElapsedTimer t;
+        t.start();
+        const bool sent = waitUntil([&] { return !bodies.isEmpty(); }, 3000);
+        const qint64 debounceMs = t.elapsed();
+        const bool done = waitUntil([&] { return !b.ambientBusy() && !b.ambientAnswer().isEmpty(); }, 5000);
+        const QJsonObject req = bodies.isEmpty() ? QJsonObject() : QJsonDocument::fromJson(bodies.first()).object();
+        const QString sys = req.value("messages").toArray().first().toObject().value("content").toString();
+        const QString leaf = req.value("messages").toArray().last().toObject().value("content").toString();
+        check(sent && debounceMs >= 700 && req.value("chat_template_kwargs").toObject().value("enable_thinking") == QJsonValue(false)
+                  && sys.contains("CTX-AMBIENT") && leaf.endsWith("Spoken: turn it down and skip this one"),
+              "ambient: only the new You: line goes out, after the 800 ms debounce, no-think, Tier 0 context",
+              QString::number(debounceMs) + "ms " + leaf.right(60));
+        check(done && std::abs(mix->volume() - 0.4) < 1e-9 && sp->commandLog().mid(n0).contains("playback next")
+                  && b.ambientAnswer() == "Done.",
+              "ambient: a compound reply runs both actions in one turn and shows the clean answer", b.ambientAnswer());
+
+        const QString answerBefore = b.ambientAnswer();
+        const int n1 = int(sp->commandLog().size());
+        b.feedAmbientTail("0:04 You: turn it down and skip this one\n0:09 You: lol yeah totally");
+        b.flushAmbient();
+        waitUntil([&] { return bodies.size() == 2 && !b.ambientBusy(); }, 5000);
+        check(bodies.size() == 2 && sp->commandLog().size() == n1 && std::abs(mix->volume() - 0.4) < 1e-9
+                  && b.ambientHeard().isEmpty() && b.ambientAnswer() == answerBefore,
+              "ambient: [[IGNORE]] runs nothing and shows nothing new");
+
+        b.feedAmbientTail("0:09 You: lol yeah totally\n0:12 You: pause spotify");
+        b.flushAmbient();
+        settle(50);
+        check(bodies.size() == 2 && sp->commandLog().last() == "playback pause" && b.ambientAnswer() == "Paused Spotify.",
+              "ambient: a plain UI command runs locally, no model call", b.ambientAnswer());
+        b.setAmbientVoiceEnabled(false);
+        b.feedAmbientTail("0:12 You: pause spotify\n0:15 You: open music");
+        check(!b.ambientBusy() && bodies.size() == 2, "ambient: off means nothing is sent");
+        b.setLlmRouter(nullptr);
+    }
+}
+
 int runTests()
 {
     unitTests();
@@ -5102,6 +5459,7 @@ int runTests()
     slowmixUiTests();
     omnibarUiTests();
     memoryTierTests();
+    finalWiringTests();
     hotReloadTests();
     uiTests();
     gamepadUiTests();

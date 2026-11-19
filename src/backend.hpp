@@ -8,6 +8,7 @@
 #include "ingest/memory.hpp"
 #include "ingest/phonon.hpp"
 #include "ingest/slowmix.hpp"
+#include "ingest/spotify.hpp"
 #include "llm/prefix.hpp"
 #include "llm/router.hpp"
 #include "llm/sse.hpp"
@@ -195,7 +196,9 @@ ProjectId sessionProjectId(const SessionInfo &s, const Extracted &ex, const QStr
 // "[[ACTION:name]]" / "[[ACTION:name:arg]]" tag. Actions: open_music, close_music,
 // play_track:<query>, pause_music, resume_music, toggle_music, open_review, filter_needs_me,
 // filter_all, reset_layout, open_settings, open_briefing, set_theme:blue|gold, show_diffs:1|0,
-// spawn_agent:<task>.
+// spawn_agent:<task>, set_volume:<pct>, open_spotify, spotify_play[:<song>], spotify_pause,
+// spotify_next, spotify_prev, spotify_volume:<pct>, focus_project:<name>, open_stage:<name>,
+// open_ladder:<name>, go_home. A model reply may carry several; all run in one turn.
 struct StudioCommand {
     QString action;
     QString arg;
@@ -268,6 +271,15 @@ class Backend : public QObject {
     // slowmix music player (SlowmixController). Spawns `slowmix --stdio` only after main()'s live
     // window calls setSpawnAllowed(true); Mock and every offscreen mode are dry runs.
     Q_PROPERTY(QObject *slowmix READ slowmix CONSTANT)
+    // Spotify via the spotify_player CLI (SpotifyController); same spawn rule as slowmix. Starting
+    // one pauses the other.
+    Q_PROPERTY(QObject *spotify READ spotify CONSTANT)
+    // Ambient voice: new "You:" lines in the Phonon tail become a no-think intent request (800 ms
+    // debounce): [[IGNORE]] stays silent, action tags run, a short answer lands in ambientAnswer.
+    Q_PROPERTY(bool ambientVoiceEnabled READ ambientVoiceEnabled WRITE setAmbientVoiceEnabled NOTIFY ambientChanged)
+    Q_PROPERTY(bool ambientBusy READ ambientBusy NOTIFY ambientChanged)
+    Q_PROPERTY(QString ambientAnswer READ ambientAnswer NOTIFY ambientChanged)
+    Q_PROPERTY(QString ambientHeard READ ambientHeard NOTIFY ambientChanged)
     // Hovered / pinned semantic targets (TargetRegistry); viewers push, FloatingOmnibar reads.
     Q_PROPERTY(QObject *targets READ targets CONSTANT)
     // Morning Briefing: changed / active projects in two lines each (see localBriefing()).
@@ -444,6 +456,26 @@ public:
     void setWindowState(const WindowState &state);
     QObject *slowmix() { return &m_slowmix; }
     SlowmixController *slowmixController() { return &m_slowmix; }
+    QObject *spotify() { return &m_spotify; }
+    SpotifyController *spotifyController() { return &m_spotify; }
+
+    // Ambient voice (see the Q_PROPERTYs). feedAmbientTail is what pollPhonon calls with each new
+    // tail; tests call it directly. flushAmbient skips the 800 ms debounce.
+    bool ambientVoiceEnabled() const { return m_ambientEnabled; }
+    void setAmbientVoiceEnabled(bool on);
+    Q_INVOKABLE void toggleAmbientVoice() { setAmbientVoiceEnabled(!m_ambientEnabled); }
+    bool ambientBusy() const { return m_ambientBusy; }
+    QString ambientAnswer() const { return m_ambientAnswer; }
+    QString ambientHeard() const { return m_ambientHeard; }
+    Q_INVOKABLE void clearAmbientAnswer();
+    void feedAmbientTail(const QString &tail);
+    void flushAmbient();
+    // The Tier 0 local studio context (loadLocalStudioContext, live mode only; tests may set it).
+    QString studioContext() const { return m_studioContext; }
+    void setStudioContext(const QString &ctx) { m_studioContext = ctx; }
+    // The effort an OpenAI-compatible request actually sends: the picker's effort when the chat
+    // model is the compat model, else "fast" (no thinking). "fast" / "none" mean enable_thinking off.
+    QString compatEffort() const;
     QVector<ChatTurn> streamHistory(const QString &streamId) const { return m_streamHistory.value(streamId); }
     // Live mode owns a router (created lazily); tests may inject one (not owned) in any mode.
     LlmRouter *llmRouter();
@@ -562,6 +594,7 @@ signals:
     void reflectionChanged();
     void tasteRulesChanged();
     void phononTailChanged();
+    void ambientChanged();
     void sessionStarted(const QString &projectKey);
     void quickTick();
     void streamDelta(const QString &streamId, const QString &textDelta, const QString &thinkingDelta);
@@ -687,6 +720,7 @@ private:
     bool m_firstLaunch = false;
     QString m_chatModel = QStringLiteral("claude-sonnet-5-5");
     QString m_chatEffort = QStringLiteral("low");
+    QString m_effortBeforeFast;  // the thinking effort in use before a no-think ("fast") model
     bool m_modelSuggestions = false;
     QString m_suggestion, m_suggestionKey, m_suggestPendingKey;
     QString m_lastAskModel, m_lastAskEffort, m_lastAskChannel;
@@ -751,7 +785,21 @@ private:
     QStringList m_projectOrder;  // locks card slots so background updates never shuffle muscle memory
     Gamepad m_gamepad;
     std::unique_ptr<TargetRegistry> m_targets;  // lazy: targets()
-    SlowmixController m_slowmix;  // its destructor sends `quit`, so no audio outlives the app
+    SlowmixController m_slowmix;  // its destructor only hangs up; the daemon keeps playing
+    SpotifyController m_spotify;
+    bool m_slowmixWasPlaying = false;
+    // Ambient voice.
+    void runAmbient(const QString &spoken);
+    bool m_ambientEnabled = false;
+    bool m_ambientBusy = false;
+    QString m_ambientPrevTail;
+    QStringList m_ambientPending;
+    QString m_ambientRaw;
+    QString m_ambientAnswer;
+    QString m_ambientHeard;
+    QString m_ambientProject;
+    QTimer m_ambientDebounce;
+    QString m_studioContext;  // Tier 0 tail, loaded once in live mode
     MemoryIndex m_memory;
     QTimer m_memoryTimer;  // live: periodic background rescan
     void refreshMemory();

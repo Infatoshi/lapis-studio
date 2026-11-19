@@ -40,6 +40,10 @@ struct TieredPrompt {
     QString question;
 };
 
+// "fast" and "none": the request sends chat_template_kwargs.enable_thinking = false and no
+// reasoning_effort (Qwen3.8 no_think). Any other non-empty effort rides as reasoning_effort.
+bool isNoThinkEffort(const QString &effort);
+
 // Optional local studio context (default ~/.lapis-next/studio_context.md), capped at 4 KB.
 // Returns empty when the file is missing or unreadable. Lives in Tier 0, so it stays APC-hot.
 QString loadLocalStudioContext(const QString &path = {});

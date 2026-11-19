@@ -224,20 +224,46 @@ FocusScope {
                         anchors.right: parent.right
                         anchors.rightMargin: 14
                         anchors.verticalCenter: parent.verticalCenter
-                        width: saveText.implicitWidth + 26
+                        width: saveRow.implicitWidth + 26
                         height: 30
                         radius: 15
                         color: "transparent"
                         border.width: 1
                         border.color: ruleRow.done ? Theme.goldA(0.55) : Theme.line
-                        Text {
-                            id: saveText
-                            objectName: "saveRuleText"
+                        Row {
+                            id: saveRow
                             anchors.centerIn: parent
-                            text: ruleRow.done ? "Saved" : "Save Rule"
-                            color: ruleRow.done ? Theme.gold : (ruleRow.sel ? Theme.text : Theme.dim)
-                            font.family: Theme.mono
-                            font.pixelSize: 14
+                            spacing: 8
+                            Text {
+                                id: saveText
+                                objectName: "saveRuleText"
+                                anchors.verticalCenter: parent.verticalCenter
+                                text: ruleRow.done ? "Saved" : "Save Rule"
+                                color: ruleRow.done ? Theme.gold : (ruleRow.sel ? Theme.text : Theme.dim)
+                                font.family: Theme.mono
+                                font.pixelSize: 14
+                            }
+                            // The pad button that saves the selected rule, controller mode only.
+                            Rectangle {
+                                objectName: "saveRuleGlyph"
+                                readonly property string g: root.padGlyphs["confirm"] || ""
+                                anchors.verticalCenter: parent.verticalCenter
+                                visible: root.padHints && ruleRow.sel && !ruleRow.done && g.length > 0
+                                width: saveGlyphText.implicitWidth + 10
+                                height: 18
+                                radius: 5
+                                color: "transparent"
+                                border.width: 1
+                                border.color: Theme.line
+                                Text {
+                                    id: saveGlyphText
+                                    anchors.centerIn: parent
+                                    text: parent.g
+                                    color: Theme.dim
+                                    font.family: Theme.mono
+                                    font.pixelSize: 11
+                                }
+                            }
                         }
                         TapHandler {
                             onTapped: {

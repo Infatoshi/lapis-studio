@@ -73,6 +73,7 @@ class SlowmixController : public QObject {
     Q_PROPERTY(double speed READ speed NOTIFY stateChanged)
     Q_PROPERTY(QString reverb READ reverb NOTIFY stateChanged)
     Q_PROPERTY(double bass READ bass NOTIFY stateChanged)
+    Q_PROPERTY(double volume READ volume WRITE setVolume NOTIFY stateChanged)
     Q_PROPERTY(bool looping READ looping NOTIFY stateChanged)
     Q_PROPERTY(double position READ position NOTIFY positionChanged)
     Q_PROPERTY(double duration READ duration NOTIFY positionChanged)
@@ -108,6 +109,7 @@ public:
     double speed() const { return m_speed; }
     QString reverb() const { return m_reverb; }
     double bass() const { return m_bass; }
+    double volume() const { return m_volume; }  // linear 0.0..1.0, slowmix `volume`
     bool looping() const { return m_looping; }
     double position() const { return m_pos; }
     double duration() const { return m_dur; }
@@ -117,6 +119,8 @@ public:
 
     Q_INVOKABLE void selectTrack(const QString &path);  // applies its favorite preset, then plays
     Q_INVOKABLE void togglePlay();
+    Q_INVOKABLE void pause();  // no-op unless playing (used to hand the speakers to Spotify)
+    Q_INVOKABLE void setVolume(double v);
     Q_INVOKABLE void setSpeed(double speed);
     Q_INVOKABLE void setReverb(const QString &reverb);
     Q_INVOKABLE void setBass(double db);
@@ -159,6 +163,7 @@ private:
     double m_speed = 1.0;
     QString m_reverb = QStringLiteral("hall");
     double m_bass = 0.0;
+    double m_volume = 0.8;
     bool m_looping = true;
     double m_pos = 0;
     double m_dur = 0;

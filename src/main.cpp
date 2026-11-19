@@ -185,6 +185,8 @@ int main(int argc, char **argv)
     backend.gamepad()->setEnabled(true);
     // Likewise the only place `slowmix --stdio` may ever be spawned (lazily, on first play).
     backend.slowmixController()->setSpawnAllowed(true);
+    // And `spotify_player`: never in Mode::Mock, --test or any offscreen mode.
+    backend.spotifyController()->setSpawnAllowed(true);
     // C++ owns the window and the Backend; QmlHost owns only the replaceable QML root + engine.
     // The window starts hidden on the theme background and is placed before it is ever shown.
     QQuickWindow window;

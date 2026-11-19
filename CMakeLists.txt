@@ -33,6 +33,7 @@ lapis_warnings(lapis_core)
 add_library(lapis_ingest STATIC
   src/ingest/phonon.hpp src/ingest/phonon.cpp
   src/ingest/slowmix.hpp src/ingest/slowmix.cpp
+  src/ingest/spotify.hpp src/ingest/spotify.cpp
   src/ingest/memory.hpp src/ingest/memory.cpp
   src/ingest/ambient.hpp src/ingest/ambient.cpp
   src/transcript.hpp src/transcript.cpp

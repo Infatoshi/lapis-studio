@@ -1,6 +1,7 @@
 #include "backend.hpp"
 
 #include "fixtures.hpp"
+#include "ingest/ambient.hpp"
 #include "pdfrender.hpp"
 
 #include <QDateTime>
@@ -38,6 +39,7 @@ QString workspacePath() { return home() + QStringLiteral("/.lapis/runtime/worksp
 // The quick ask's router stream id (askStream() refuses it, so the two never collide).
 constexpr char kQuickStreamId[] = "__quick__";
 constexpr char kReflectionStreamId[] = "reflection:1";
+constexpr char kAmbientStreamId[] = "__ambient__";
 // Tier 2 cap per conversation stream, in messages (user + assistant pairs).
 constexpr int kMaxStreamHistory = 24;
 
@@ -586,7 +588,9 @@ const QList<ModelSpec> &modelCatalog()
         {QStringLiteral("gemini-4-carbon"), QStringLiteral("google"), QStringLiteral("Gemini 4 Carbon"), lmh, QStringLiteral("Teach")},
         {QStringLiteral("gemini-4-hydrogen"), QStringLiteral("google"), QStringLiteral("Gemini 4 Hydrogen"), all, QStringLiteral("Deep Think")},
         {QStringLiteral("gemini-4-argon"), QStringLiteral("google"), QStringLiteral("Gemini 4 Argon"), lmh, QStringLiteral("Balanced")},
-        {QStringLiteral("qwen3.8-flash-next"), QStringLiteral("openai-compat"), QStringLiteral("Qwen3.8 Flash"), lmh, QStringLiteral("Fast")},
+        // "fast" = no thinking (enable_thinking false), the default; low / medium opt into it.
+        {QStringLiteral("qwen3.8-flash-next"), QStringLiteral("openai-compat"), QStringLiteral("Qwen3.8 Flash"),
+         QStringList{QStringLiteral("fast"), QStringLiteral("low"), QStringLiteral("medium")}, QStringLiteral("Fast")},
     };
     return c;
 }
@@ -674,8 +678,8 @@ const ModelSpec *specFor(const QString &model)
 }
 int effortRank(const QString &e)
 {
-    static const QStringList order = {QStringLiteral("low"), QStringLiteral("medium"), QStringLiteral("high"),
-                                      QStringLiteral("xhigh")};
+    static const QStringList order = {QStringLiteral("fast"), QStringLiteral("low"), QStringLiteral("medium"),
+                                      QStringLiteral("high"), QStringLiteral("xhigh")};
     return int(order.indexOf(e));
 }
 }  // namespace
@@ -1093,6 +1097,17 @@ Backend::Backend(Mode mode, QObject *parent, bool warmHelpers)
     m_prefsSave.setSingleShot(true);
     m_prefsSave.setInterval(400);  // a wheel zoom fires dozens of changes; write once it settles
     connect(&m_prefsSave, &QTimer::timeout, this, [this] { savePrefs(); });
+    // One source of sound at a time: Spotify starting pauses slowmix, slowmix starting pauses Spotify.
+    connect(&m_spotify, &SpotifyController::playbackStarted, this, [this] { m_slowmix.pause(); });
+    connect(&m_slowmix, &SlowmixController::stateChanged, this, [this] {
+        const bool now = m_slowmix.playing();
+        if (now && !m_slowmixWasPlaying && m_spotify.playing())
+            m_spotify.pause();
+        m_slowmixWasPlaying = now;
+    });
+    m_ambientDebounce.setSingleShot(true);
+    m_ambientDebounce.setInterval(800);
+    connect(&m_ambientDebounce, &QTimer::timeout, this, &Backend::flushAmbient);
     if (m_mode == Mode::Mock) {
         ensureFixtureFiles();
         const QString clips = ensureSlowmixFixture();
@@ -1108,6 +1123,8 @@ Backend::Backend(Mode mode, QObject *parent, bool warmHelpers)
         return;
     }
     loadFolders();
+    // Tier 0 tail: identity + workstation notes, byte-stable so the prefix stays hot in vLLM.
+    m_studioContext = loadLocalStudioContext();
     // Read-only until the overlay asks (refresh); spawning stays off unless main() allows it.
     m_slowmix.setLibrary(SlowmixController::defaultClipsDir(),
                          SlowmixController::defaultClipsDir() + QStringLiteral("/.plays.tsv"));
@@ -1365,7 +1382,18 @@ void Backend::setChatModel(const QString &model)
     if (!specFor(model) || model == m_chatModel)
         return;
     m_chatModel = model;
-    m_chatEffort = clampEffort(model, m_chatEffort);
+    // A no-think default ("fast") wins on the way in; thinking stays opt-in via the effort strip.
+    // Leaving it restores the thinking level the user had before, so the picker never loses it.
+    const QStringList e = effortsFor(model);
+    if (!e.isEmpty() && e.first() == QLatin1String("fast")) {
+        if (m_chatEffort != QLatin1String("fast"))
+            m_effortBeforeFast = m_chatEffort;
+        m_chatEffort = e.first();
+    } else {
+        const QString want = m_chatEffort == QLatin1String("fast") && !m_effortBeforeFast.isEmpty() ? m_effortBeforeFast
+                                                                                                  : m_chatEffort;
+        m_chatEffort = clampEffort(model, want);
+    }
     emit prefsChanged();
     if (!m_prefsPath.isEmpty())
         m_prefsSave.start();
@@ -1484,6 +1512,9 @@ void Backend::loadPrefs()
     if (specFor(model))
         m_chatModel = model;
     m_chatEffort = clampEffort(m_chatModel, o.value(QLatin1String("defaultEffort")).toString(m_chatEffort));
+    // Files from before "fast" existed saved "low" as the floor: those start at no-think once.
+    if (o.value(QLatin1String("effortSchema")).toInt(1) < 2 && effortsFor(m_chatModel).value(0) == QLatin1String("fast"))
+        m_chatEffort = QStringLiteral("fast");
     m_modelSuggestions = o.value(QLatin1String("modelSuggestions")).toBool(false);
     m_openaiCompatUrl = o.value(QLatin1String("openaiCompatUrl")).toString().trimmed();
     m_compatUrlCleared = false;
@@ -1560,7 +1591,99 @@ void Backend::pollPhonon()
         m_phononTail = snap.tail;
         m_phononLive = snap.live;
         emit phononTailChanged();
+        feedAmbientTail(snap.tail);
     }
+}
+
+// --- Ambient voice -----------------------------------------------------------------------------
+
+void Backend::setAmbientVoiceEnabled(bool on)
+{
+    if (on == m_ambientEnabled)
+        return;
+    m_ambientEnabled = on;
+    // Only what is said from now on counts: the tail already seen (fed while off, or on disk) is old news.
+    if (m_ambientPrevTail.isEmpty())
+        m_ambientPrevTail = m_phononTail;
+    m_ambientPending.clear();
+    m_ambientDebounce.stop();
+    if (!on && m_ambientBusy) {
+        if (m_router)
+            m_router->cancelStream(QString::fromLatin1(kAmbientStreamId));
+        m_ambientBusy = false;
+    }
+    emit ambientChanged();
+}
+
+void Backend::clearAmbientAnswer()
+{
+    if (m_ambientAnswer.isEmpty() && m_ambientHeard.isEmpty())
+        return;
+    m_ambientAnswer.clear();
+    m_ambientHeard.clear();
+    emit ambientChanged();
+}
+
+void Backend::feedAmbientTail(const QString &tail)
+{
+    const QString prev = m_ambientPrevTail;
+    m_ambientPrevTail = tail;
+    if (!m_ambientEnabled)
+        return;
+    const QStringList said = extractNewUserUtterances(prev, tail);
+    if (said.isEmpty())
+        return;
+    m_ambientPending << said;
+    m_ambientDebounce.start();  // 800 ms after the last new line, the batch goes out
+}
+
+void Backend::flushAmbient()
+{
+    m_ambientDebounce.stop();
+    if (m_ambientPending.isEmpty())
+        return;
+    const QString spoken = m_ambientPending.join(QLatin1Char(' ')).simplified();
+    m_ambientPending.clear();
+    if (spoken.isEmpty() || !m_ambientEnabled)
+        return;
+    runAmbient(spoken);
+}
+
+void Backend::runAmbient(const QString &spoken)
+{
+    // A plain UI command needs no model: "open music", "pause spotify", "volume 40".
+    QString reply;
+    if (handleStudioCommand(spoken, m_focusedProject, &reply)) {
+        m_ambientHeard = spoken;
+        m_ambientAnswer = reply;
+        emit ambientChanged();
+        return;
+    }
+    LlmRouter *router = llmRouter();
+    const QString endpoint = compatEndpoint();
+    if (!router || endpoint.isEmpty())
+        return;  // headless or no local model: banter stays banter
+    const QString project = m_focusedProject;
+    // Redacted (infinity) projects never leave the process: no trunk for them.
+    const Project *p = find(project);
+    const bool redacted = p && std::any_of(p->sessions.cbegin(), p->sessions.cend(),
+                                           [](const SessionInfo &s) { return s.redacted; });
+    QString hover;
+    if (m_targets && m_targets->hasActiveTarget())
+        hover = formatTargetSlice({m_targets->active()}, 1500);
+    LlmStreamRequest req;
+    req.streamId = QString::fromLatin1(kAmbientStreamId);
+    req.endpoint = endpoint;
+    req.apiKey = compatKey();
+    req.payload = buildAmbientIntentRequest(compatModel(), kCompatSystemPrompt, m_studioContext,
+                                            redacted ? QString() : contextTrunk(project), studioLiveState(), hover,
+                                            spoken);
+    m_ambientRaw.clear();
+    m_ambientProject = project;
+    m_ambientHeard = spoken;
+    m_ambientBusy = true;
+    emit ambientChanged();
+    router->startStream(req);  // replaces an ambient ask still streaming
 }
 
 void Backend::setOpenaiCompatUrl(const QString &url)
@@ -1619,6 +1742,7 @@ bool Backend::savePrefs()
     o.insert(QStringLiteral("theme"), m_theme);
     o.insert(QStringLiteral("defaultModel"), m_chatModel);
     o.insert(QStringLiteral("defaultEffort"), m_chatEffort);
+    o.insert(QStringLiteral("effortSchema"), 2);
     o.insert(QStringLiteral("modelSuggestions"), m_modelSuggestions);
     if (!m_openaiCompatUrl.isEmpty())
         o.insert(QStringLiteral("openaiCompatUrl"), m_openaiCompatUrl);
@@ -2556,6 +2680,15 @@ QString Backend::compatModel() const
     return model;
 }
 
+QString Backend::compatEffort() const
+{
+    // The picker's effort applies only when the picked model is the OpenAI-compatible one; card
+    // streams under a CLI model (Sonnet, GPT-6, ...) still go to the compat endpoint, no thinking.
+    if (providerFor(m_chatModel) != QLatin1String("openai-compat"))
+        return QStringLiteral("fast");
+    return m_chatEffort.isEmpty() ? QStringLiteral("fast") : m_chatEffort;
+}
+
 QString Backend::compatKey() const
 {
     QString key = m_openaiCompatKey;
@@ -2569,6 +2702,11 @@ void Backend::onRouterDelta(const QString &streamId, const QString &text, const 
     if (streamId == QLatin1String(kReflectionStreamId)) {
         if (m_reflectionBusy)
             m_reflectionRaw += text;
+        return;
+    }
+    if (streamId == QLatin1String(kAmbientStreamId)) {
+        if (m_ambientBusy)
+            m_ambientRaw += text;  // thinking is off; any that arrives is dropped
         return;
     }
     if (streamId == QLatin1String(kQuickStreamId)) {
@@ -2605,6 +2743,33 @@ void Backend::onRouterFinished(const QString &streamId, const QString &error)
         }
         m_reflectionRaw.clear();
         emit reflectionChanged();
+        return;
+    }
+    if (streamId == QLatin1String(kAmbientStreamId)) {
+        if (!m_ambientBusy)
+            return;
+        m_ambientBusy = false;
+        const QString raw = m_ambientRaw;
+        m_ambientRaw.clear();
+        if (!error.isEmpty() || !m_ambientEnabled) {
+            emit ambientChanged();
+            return;
+        }
+        const ParsedModelOutput out = parseStudioModelOutput(raw);
+        if (out.ignore) {
+            m_ambientHeard.clear();  // banter: say nothing, show nothing
+            emit ambientChanged();
+            return;
+        }
+        const QString keep = m_commandProject;
+        m_commandProject = m_ambientProject;
+        QString answer = raw;
+        runAnswerTags(&answer);  // every tag runs, in order, this turn
+        m_commandProject = keep;
+        m_ambientAnswer = answer.trimmed();
+        if (!m_ambientAnswer.isEmpty())
+            noteExchange(m_ambientProject, compatModel(), m_ambientHeard, m_ambientAnswer);
+        emit ambientChanged();
         return;
     }
     if (streamId == QLatin1String(kQuickStreamId)) {
@@ -2694,8 +2859,9 @@ TieredPrompt Backend::tieredPrompt(const QString &projectKey, const QString &sli
 {
     TieredPrompt p;
     p.model = compatModel();
-    p.effort = m_chatEffort;
+    p.effort = compatEffort();             // "fast" -> enable_thinking false
     p.systemPrompt = kCompatSystemPrompt;  // Tier 0
+    p.extraSystemContext = m_studioContext;  // Tier 0 tail, same bytes as the warm
     p.trunk = contextTrunk(projectKey);    // Tier 1: byte-identical to warmProjectPrefix()
     p.history = history;                   // Tier 2
     p.targetSlice = slice;                 // Tier 3 from here on
@@ -3697,6 +3863,7 @@ void Backend::warmProjectPrefix(const QString &projectKey)
     TieredPrompt tp;
     tp.model = model;
     tp.systemPrompt = kCompatSystemPrompt;
+    tp.extraSystemContext = m_studioContext;
     tp.trunk = trunk;
     // Fire-and-forget: the server keeps the prefilled KV; the one token is discarded. The router
     // drops a repeat of the same tag and forgets a failed one so the next focus retries.
@@ -4055,7 +4222,11 @@ QStringList studioActionNames()
             QStringLiteral("pause_music"),    QStringLiteral("resume_music"),  QStringLiteral("toggle_music"),
             QStringLiteral("open_review"),    QStringLiteral("filter_needs_me"), QStringLiteral("filter_all"),
             QStringLiteral("reset_layout"),   QStringLiteral("open_settings"), QStringLiteral("open_briefing"),
-            QStringLiteral("set_theme"),      QStringLiteral("show_diffs"),    QStringLiteral("spawn_agent")};
+            QStringLiteral("set_theme"),      QStringLiteral("show_diffs"),    QStringLiteral("spawn_agent"),
+            QStringLiteral("set_volume"),     QStringLiteral("open_spotify"),  QStringLiteral("spotify_play"),
+            QStringLiteral("spotify_pause"),  QStringLiteral("spotify_next"),  QStringLiteral("spotify_prev"),
+            QStringLiteral("spotify_volume"), QStringLiteral("focus_project"), QStringLiteral("open_stage"),
+            QStringLiteral("open_ladder"),    QStringLiteral("go_home")};
 }
 
 StudioCommand parseStudioCommand(const QString &text)
@@ -4137,6 +4308,50 @@ StudioCommand parseStudioCommand(const QString &text)
         m = diffOnOff.match(n);
         if (m.hasMatch() && onlyFiller(m.captured(2)))
             return cmd("show_diffs", m.captured(1) == QLatin1String("on") ? QStringLiteral("1") : QStringLiteral("0"));
+    }
+
+    // Spotify (spotify_player), before the generic music rules so "pause spotify" never means slowmix.
+    if (n.contains(QLatin1String("spotify"))) {
+        if (verbObject(n, kOpenVerbs, QStringLiteral("spotify|spotify tab|spotify player")))
+            return cmd("open_spotify");
+        static const QRegularExpression pauseRe(
+            QStringLiteral("^(?:pause|stop|mute|halt)\\s+(?:the\\s+|my\\s+)?(?:music\\s+on\\s+|song\\s+on\\s+)?spotify(.*)$"));
+        auto m = pauseRe.match(n);
+        if (m.hasMatch() && onlyFiller(m.captured(1)))
+            return cmd("spotify_pause");
+        static const QRegularExpression resumeRe(
+            QStringLiteral("^(?:resume|unpause|play|start|continue)\\s+(?:the\\s+|my\\s+)?(?:music\\s+on\\s+)?spotify(.*)$"));
+        m = resumeRe.match(n);
+        if (m.hasMatch() && onlyFiller(m.captured(1)))
+            return cmd("spotify_play");
+        static const QRegularExpression nextRe(QStringLiteral(
+            "^(?:next|skip)(?:\\s+(?:this|the))?(?:\\s+(?:song|track))?\\s+(?:on\\s+|in\\s+)?spotify(.*)$|^spotify\\s+(?:next|skip)(.*)$"));
+        m = nextRe.match(n);
+        if (m.hasMatch() && onlyFiller(m.captured(1) + m.captured(2)))
+            return cmd("spotify_next");
+        static const QRegularExpression prevRe(QStringLiteral(
+            "^(?:previous|prev|last|go back)(?:\\s+(?:a|the))?(?:\\s+(?:song|track))?\\s+(?:on\\s+|in\\s+)?spotify(.*)$|"
+            "^spotify\\s+(?:previous|prev|back)(.*)$"));
+        m = prevRe.match(n);
+        if (m.hasMatch() && onlyFiller(m.captured(1) + m.captured(2)))
+            return cmd("spotify_prev");
+        static const QRegularExpression playOnRe(QStringLiteral(
+            "^(?:play|put on|queue up|queue|throw on|listen to|start playing)\\s+(.+?)\\s+(?:on|in|from|with|via)\\s+spotify(.*)$"));
+        m = playOnRe.match(n);
+        if (m.hasMatch() && onlyFiller(m.captured(2)))
+            return cmd("spotify_play", m.captured(1).trimmed());
+    }
+    {
+        // "volume 60", "set the volume to 60 percent", "spotify volume 40", "volume 40 on spotify".
+        static const QRegularExpression volRe(QStringLiteral(
+            "^(?:set|turn|put|change|make)?\\s*(?:the\\s+|my\\s+)?(spotify\\s+|slowmix\\s+|music\\s+)?volume\\s+"
+            "(?:to\\s+|at\\s+)?(\\d{1,3})(?:\\s+percent)?(?:\\s+(?:on|in|for)\\s+(spotify|slowmix|music))?(.*)$"));
+        const auto m = volRe.match(n);
+        if (m.hasMatch() && onlyFiller(m.captured(4))) {
+            const bool spotify = m.captured(1).startsWith(QLatin1String("spotify"))
+                                 || m.captured(3) == QLatin1String("spotify");
+            return cmd(spotify ? "spotify_volume" : "set_volume", m.captured(2));
+        }
     }
 
     // Music overlay and playback.
@@ -4363,6 +4578,75 @@ QString Backend::dispatchStudioAction(const QString &action, const QString &arg)
         }
         if (reply.isEmpty())
             reply = QStringLiteral("Playing %1.").arg(m_slowmix.currentTrack());
+    } else if (a == QLatin1String("set_volume") || a == QLatin1String("spotify_volume")) {
+        // "60", "60%", "0.6" -> 60.
+        QString v = arg.trimmed();
+        v.remove(QLatin1Char('%'));
+        bool ok = false;
+        double x = v.toDouble(&ok);
+        if (!ok)
+            return {};
+        if (x > 0 && x <= 1.0 && v.contains(QLatin1Char('.')))
+            x *= 100.0;
+        const int pct = std::clamp(int(std::lround(x)), 0, 100);
+        emitArg = QString::number(pct);
+        if (a == QLatin1String("set_volume")) {
+            m_slowmix.setVolume(pct / 100.0);
+            reply = QStringLiteral("Slowmix volume %1%.").arg(pct);
+        } else {
+            m_spotify.setVolume(pct);
+            reply = QStringLiteral("Spotify volume %1%.").arg(pct);
+        }
+    } else if (a == QLatin1String("open_spotify")) {
+        reply = QStringLiteral("Opened Music (Spotify).");
+    } else if (a == QLatin1String("spotify_play")) {
+        const QString q = arg.simplified();
+        if (q.isEmpty()) {
+            m_spotify.play();
+            reply = QStringLiteral("Playing Spotify.");
+        } else {
+            m_spotify.searchAndPlay(q);
+            reply = QStringLiteral("Playing %1 on Spotify.").arg(q);
+        }
+    } else if (a == QLatin1String("spotify_pause")) {
+        m_spotify.pause();
+        reply = QStringLiteral("Paused Spotify.");
+    } else if (a == QLatin1String("spotify_next")) {
+        m_spotify.nextTrack();
+        reply = QStringLiteral("Next track on Spotify.");
+    } else if (a == QLatin1String("spotify_prev")) {
+        m_spotify.prevTrack();
+        reply = QStringLiteral("Previous track on Spotify.");
+    } else if (a == QLatin1String("go_home")) {
+        reply = QStringLiteral("Back to the Constellation.");
+    } else if (a == QLatin1String("focus_project") || a == QLatin1String("open_stage")
+               || a == QLatin1String("open_ladder")) {
+        // Best project name match: exact, prefix, then substring, punctuation ignored.
+        const QString q = squashAlnum(arg);
+        QString key, name;
+        int best = 0;
+        for (const QVariant &v : std::as_const(m_projectList)) {
+            const QVariantMap p = v.toMap();
+            const QString n = p.value(QStringLiteral("name")).toString();
+            const QString k = p.value(QStringLiteral("key")).toString();
+            int score = 0;
+            if (q.isEmpty())
+                score = k == m_focusedProject ? 1 : 0;
+            else
+                for (const QString &c : {squashAlnum(n), squashAlnum(k)})
+                    score = std::max(score, c == q ? 3 : c.startsWith(q) ? 2 : c.contains(q) ? 1 : 0);
+            if (score > best) {
+                best = score;
+                key = k;
+                name = n;
+            }
+        }
+        if (key.isEmpty())
+            return {};
+        emitArg = key;
+        reply = a == QLatin1String("focus_project") ? QStringLiteral("Focused %1.").arg(name)
+                : a == QLatin1String("open_stage")  ? QStringLiteral("Opened %1's Stage.").arg(name)
+                                                    : QStringLiteral("Opened %1's Ladder.").arg(name);
     } else if (a == QLatin1String("open_review")) {
         reply = QStringLiteral("Opened Session Review.");
     } else if (a == QLatin1String("filter_needs_me")) {
@@ -4420,19 +4704,29 @@ QString Backend::spawnAgent(const QString &projectKey, const QString &task, bool
 
 void Backend::runAnswerTags(QString *answer)
 {
-    if (!answer || !answer->trimmed().startsWith(QLatin1String("[[ACTION:")))
+    if (!answer || !answer->contains(QLatin1String("[[")))
         return;
-    const QList<StudioCommand> tags = extractActionTags(answer);
+    // Every tag anywhere in the reply runs, in order, in this one turn (compound batches).
+    const ParsedModelOutput parsed = parseStudioModelOutput(*answer);
+    if (parsed.ignore) {
+        answer->clear();
+        return;
+    }
+    if (parsed.actions.isEmpty())
+        return;
+    const QStringList known = studioActionNames();
     QStringList replies;
-    for (const StudioCommand &c : tags) {
-        const QString r = c.action == QLatin1String("spawn_agent")
+    for (const StudioAction &c : parsed.actions) {
+        const QString name = c.name.toLower();
+        if (!known.contains(name))
+            continue;
+        const QString r = name == QLatin1String("spawn_agent")
                               ? spawnAgent(m_commandProject.isEmpty() ? m_focusedProject : m_commandProject, c.arg, false)
-                              : dispatchStudioAction(c.action, c.arg);
+                              : dispatchStudioAction(name, c.arg);
         if (!r.isEmpty())
             replies << r;
     }
-    if (answer->trimmed().isEmpty())
-        *answer = replies.join(QLatin1Char(' '));
+    *answer = parsed.cleanText.isEmpty() ? replies.join(QLatin1Char(' ')) : parsed.cleanText;
 }
 
 void Backend::noteExchange(const QString &projectKey, const QString &model, const QString &prompt, const QString &answer)

@@ -16,6 +16,9 @@ Item {
     property int artifactIndex: -1
     property bool mouseMode: false
     property bool suppressed: false  // a modal overlay is up
+    // Controller mode: Ask / + Pin / × carry the pad button that does the same (✕ / R1 / ○).
+    property bool padHints: false
+    property var padGlyphs: ({})
     onSuppressedChanged: if (suppressed && open) close()  // a modal over it takes the pad and keys
 
     property bool open: false
@@ -412,6 +415,7 @@ Item {
                         font.pixelSize: Theme.px(16)
                         font.weight: Font.DemiBold
                     }
+                    PadBadge { anchors.verticalCenter: parent.verticalCenter; action: "confirm" }
                     Text {
                         anchors.verticalCenter: parent.verticalCenter
                         text: root.backend && root.backend.openaiCompatModel ? root.backend.openaiCompatModel : ""
@@ -442,6 +446,7 @@ Item {
                         font.pixelSize: 20
                         Click { onClicked: root.close() }
                     }
+                    PadBadge { anchors.verticalCenter: parent.verticalCenter; action: "back" }
                 }
             }
 
@@ -500,18 +505,24 @@ Item {
                     objectName: "omnibarPinChip"
                     visible: root.canPin
                     height: 28
-                    width: pinText.implicitWidth + 22
+                    width: pinRow.implicitWidth + 22
                     radius: 14
                     color: "transparent"
                     border.width: 1
                     border.color: Theme.faint
-                    Text {
-                        id: pinText
+                    Row {
+                        id: pinRow
                         anchors.centerIn: parent
-                        text: "+ Pin  ⇥"
-                        color: Theme.dim
-                        font.family: Theme.mono
-                        font.pixelSize: 13
+                        spacing: 8
+                        Text {
+                            id: pinText
+                            anchors.verticalCenter: parent.verticalCenter
+                            text: "+ Pin  ⇥"
+                            color: Theme.dim
+                            font.family: Theme.mono
+                            font.pixelSize: 13
+                        }
+                        PadBadge { anchors.verticalCenter: parent.verticalCenter; action: "accept_prediction" }
                     }
                     Click { onClicked: root.pinActive() }
                 }
@@ -591,6 +602,28 @@ Item {
     }
 
     // A small button's hit area (a little larger than its glyph).
+    // Mono hairline pad glyph ("✕", "R1", "○") for the bound action, controller mode only.
+    component PadBadge: Rectangle {
+        id: badge
+        property string action: ""
+        readonly property string glyph: root.padGlyphs[action] || ""
+        objectName: "omnibarPadBadge"
+        visible: root.padHints && glyph.length > 0
+        width: badgeText.implicitWidth + 10
+        height: 18
+        radius: 5
+        color: "transparent"
+        border.width: 1
+        border.color: Theme.line
+        Text {
+            id: badgeText
+            anchors.centerIn: parent
+            text: badge.glyph
+            color: Theme.dim
+            font.family: Theme.mono
+            font.pixelSize: 11
+        }
+    }
     component Click: MouseArea {
         anchors.fill: parent
         anchors.margins: -6

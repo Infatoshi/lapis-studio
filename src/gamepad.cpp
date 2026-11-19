@@ -49,6 +49,7 @@ const ActionMeta kActions[] = {
     {"toggle_settings", "Settings & Controls", "Open Settings / Controller Mapping"},
     {"toggle_new_session", "New Session", "Open New Session dialog"},
     {"toggle_music", "Music (Slowmix)", "Open or close the Slowmix music overlay"},
+    {"toggle_review", "Session Review", "Open or close the end-of-session review"},
     {"none", "Unbound", "No action"},
 };
 }  // namespace
@@ -136,6 +137,8 @@ void GamepadState::emitMappedAction(const QString &inputId, bool down, QList<Gam
         out.append(GamepadAction::make(GamepadAction::ToggleNewSession));
     else if (act == QLatin1String("toggle_music"))
         out.append(GamepadAction::make(GamepadAction::ToggleMusic));
+    else if (act == QLatin1String("toggle_review"))
+        out.append(GamepadAction::make(GamepadAction::ToggleReview));
 }
 
 void GamepadState::reset()
@@ -426,6 +429,10 @@ QVariantList Gamepad::availableActions() const
 
 void Gamepad::processSnapshot(const Snapshot &s, qint64 nowMs)
 {
+    const bool r3Edge = s.r3 && !m_prevR3;
+    m_prevR3 = s.r3;
+    if (r3Edge)
+        emit r3Pressed();
     for (const GamepadAction &a : m_state.process(s, nowMs)) {
         switch (a.kind) {
         case GamepadAction::Nav: emit nav(a.dx, a.dy); break;
@@ -441,6 +448,7 @@ void Gamepad::processSnapshot(const Snapshot &s, qint64 nowMs)
         case GamepadAction::ToggleNewSession: emit toggleNewSession(); break;
         case GamepadAction::ToggleBriefing: emit toggleBriefing(); break;
         case GamepadAction::ToggleMusic: emit toggleMusic(); break;
+        case GamepadAction::ToggleReview: emit toggleReview(); break;
         case GamepadAction::Scroll: emit scrollDelta(a.value); break;
         case GamepadAction::TouchpadPan: emit touchpadPan(double(a.dx), double(a.dy)); break;
         case GamepadAction::HorizontalInspect: emit horizontalInspect(a.dx); break;
@@ -483,6 +491,7 @@ void Gamepad::setConnected(bool on, const QString &name)
     m_connected = on;
     m_name = on ? name : QString();
     m_state.reset();
+    m_prevR3 = false;
     emit connectedChanged();
 }
 

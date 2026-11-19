@@ -389,6 +389,7 @@ bool SlowmixController::ensureConnected(bool *spawned)
             send(QByteArray("speed ") + QByteArray::number(m_speed, 'f', 2));
             send(QByteArray("reverb ") + m_reverb.toUtf8());
             send(QByteArray("bass ") + QByteArray::number(m_bass, 'f', 1));
+            send(QByteArray("volume ") + QByteArray::number(m_volume, 'f', 2));
             send(QByteArray("loop ") + (m_looping ? "1" : "0"));
             emit availableChanged();
             return true;
@@ -420,6 +421,7 @@ void SlowmixController::applyStatus(const QJsonObject &o)
     if (reverb == QLatin1String("off") || reverb == QLatin1String("hall") || reverb == QLatin1String("heavy"))
         m_reverb = reverb;
     m_bass = o.value("bass").toDouble(m_bass);
+    m_volume = std::clamp(o.value("volume").toDouble(m_volume), 0.0, 1.0);  // absent on older daemons
     QString path = o.value("path").toString();
     const QString track = o.value("track").toString();
     if (path.isEmpty() && !track.isEmpty()) {
@@ -547,6 +549,25 @@ void SlowmixController::togglePlay()
         else
             send(m_playing ? "play" : "pause");
     }
+    emit stateChanged();
+}
+
+void SlowmixController::pause()
+{
+    if (!m_playing)
+        return;
+    m_playing = false;
+    send("pause");
+    emit stateChanged();
+}
+
+void SlowmixController::setVolume(double v)
+{
+    v = std::clamp(std::round(v * 100.0) / 100.0, 0.0, 1.0);
+    if (v == m_volume)
+        return;
+    m_volume = v;
+    send(QByteArray("volume ") + QByteArray::number(m_volume, 'f', 2));
     emit stateChanged();
 }
 

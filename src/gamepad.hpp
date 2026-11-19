@@ -54,6 +54,7 @@ struct GamepadAction {
         ToggleNewSession,
         ToggleBriefing,
         ToggleMusic,
+        ToggleReview,
         Scroll,
         TouchpadPan,
         HorizontalInspect,
@@ -185,11 +186,14 @@ signals:
     void toggleNewSession();
     void toggleBriefing();
     void toggleMusic();
+    void toggleReview();  // "toggle_review": unbound by default, mappable in the controller map
     void scrollDelta(double dy);
     void touchpadPan(double dx, double dy);
     void horizontalInspect(int dir);
     void voiceHold(bool active);
     void sendPressed();
+    // Raw R3 press edge, whatever it is bound to (the Music card uses it to switch tabs).
+    void r3Pressed();
     void rawInputCaptured(const QString &inputId);
 
 private:
@@ -200,6 +204,7 @@ private:
     bool m_enabled = false;
     bool m_voiceActive = false;
     bool m_musicMode = false;
+    bool m_prevR3 = false;
     QString m_name;
     std::unique_ptr<Platform> m_platform;
     friend struct Platform;
