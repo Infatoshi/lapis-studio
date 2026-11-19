@@ -13,7 +13,9 @@ Item {
     property real cardRadius: 26
     property bool shown: false
     property bool idle: true
-    property string badgeSide: "top"  // "top" | "bottom" | "left" | "right"
+    // "topTuck": the pill straddles the target's own top border (Constellation cards), so it
+    // never climbs into the cluster label or the card above.
+    property string badgeSide: "top"  // "top" | "topTuck" | "bottom" | "left" | "right"
     // The key chip: "⇥ Tab" on the keyboard, only the bound button ("R1") in controller hints;
     // empty (no chip) when the accept action has no button.
     property string keyHint: "⇥ Tab"
@@ -100,44 +102,47 @@ Item {
         antialiasing: true
     }
 
-    // "Open Stage  R1" — placed cleanly outside both the ring and halo so borders never cross text.
+    // "Open Stage  R1" — outside both the ring and halo so borders never cross text; or, tucked,
+    // an opaque tab sitting on the card's top border (it covers the ring line beneath it).
     Rectangle {
         id: badge
         objectName: "tabBadge"
         z: 20
         visible: root.sLabel.length > 0
+        readonly property bool tucked: root.sSide === "topTuck"
         readonly property real bx: root.sSide === "right" ? ring.x + ring.width + 16
                                    : root.sSide === "left" ? ring.x - width - 16
                                    : root.cx - width / 2
         readonly property real by: root.sSide === "right" || root.sSide === "left" ? root.cy - height / 2
                                    : root.sSide === "bottom" ? ring.y + ring.height + 14
+                                   : tucked ? root.cy - root.sTarget.height / 2 - height / 2
                                    : ring.y - height - 14
         x: Math.max(8, Math.min(root.width - width - 8, bx))
         y: Math.max(8, Math.min(root.height - height - 8, by))
-        width: badgeRow.implicitWidth + 26
-        height: 34
-        radius: 17
+        width: badgeRow.implicitWidth + (tucked ? 20 : 26)
+        height: tucked ? 24 : 34
+        radius: height / 2
         color: "#000000"
         border.width: 1.5
         border.color: Theme.gold
         Row {
             id: badgeRow
             anchors.centerIn: parent
-            spacing: 12
+            spacing: badge.tucked ? 9 : 12
             Text {
                 objectName: "tabBadgeLabel"
                 text: root.sLabel
                 color: Theme.ink
                 font.family: Theme.sans
-                font.pixelSize: 16
+                font.pixelSize: badge.tucked ? 14 : 16
                 font.weight: Font.DemiBold
                 anchors.verticalCenter: parent.verticalCenter
             }
             Rectangle {
                 visible: root.keyHint.length > 0
-                width: tabKey.implicitWidth + 14
-                height: 22
-                radius: 6
+                width: tabKey.implicitWidth + (badge.tucked ? 10 : 14)
+                height: badge.tucked ? 17 : 22
+                radius: badge.tucked ? 5 : 6
                 color: Theme.goldA(0.16)
                 anchors.verticalCenter: parent.verticalCenter
                 Text {
@@ -147,7 +152,7 @@ Item {
                     text: root.keyHint
                     color: Theme.gold
                     font.family: Theme.mono
-                    font.pixelSize: 13
+                    font.pixelSize: badge.tucked ? 12 : 13
                 }
             }
         }

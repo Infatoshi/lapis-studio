@@ -17,7 +17,9 @@ Item {
     property real cornerRadius: 26
     property bool round: false        // fully rounded ends (pills, small targets)
     property string hint: ""          // "✕ Expand"; empty = no chip
-    property string hintSide: "bottom"  // "bottom" | "right"
+    // "bottomTuck": the chip straddles the target's own bottom border (Constellation cards), so
+    // it never reaches the card below.
+    property string hintSide: "bottom"  // "bottom" | "bottomTuck" | "right"
 
     readonly property bool active: shown && target.width > 0 && target.height > 0
 
@@ -127,12 +129,15 @@ Item {
         z: 20
         visible: root.hint.length > 0
         readonly property real bx: root.hintSide === "right" ? ring.x + ring.width + 12 : root.cx - width / 2
-        readonly property real by: root.hintSide === "right" ? ring.y : ring.y + ring.height + 10
+        readonly property bool tucked: root.hintSide === "bottomTuck"
+        readonly property real by: root.hintSide === "right" ? ring.y
+                                   : tucked ? root.cy + root.ch / 2 - height / 2
+                                   : ring.y + ring.height + 10
         x: Math.max(8, Math.min(root.width - width - 8, bx))
         y: Math.max(8, Math.min(root.height - height - 8, by))
-        width: hintText.implicitWidth + 20
-        height: 26
-        radius: 13
+        width: hintText.implicitWidth + (tucked ? 16 : 20)
+        height: tucked ? 22 : 26
+        radius: height / 2
         color: "#000000"
         border.width: 1
         border.color: Theme.goldA(0.6)
@@ -144,7 +149,7 @@ Item {
             text: root.hint
             color: Theme.gold
             font.family: Theme.mono
-            font.pixelSize: 13
+            font.pixelSize: chip.tucked ? 12 : 13
         }
     }
 }

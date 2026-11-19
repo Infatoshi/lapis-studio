@@ -1160,6 +1160,47 @@ QQuickItem *firstItem(QQuickWindow *w, const char *name)
     return items.isEmpty() ? nullptr : items.first();
 }
 
+// Constellation focus chrome ("Open Stage R1" badge, "✕ Expand" chip) against the map: each
+// pill may sit on the one card it belongs to (the card it overlaps most) but must not touch a
+// visible cluster label or any other card.
+int mapChromeCollisions(QQuickWindow *win, QStringList *hits)
+{
+    auto sceneRect = [](QQuickItem *it) { return it->mapRectToScene(QRectF(0, 0, it->width(), it->height())); };
+    QList<QRectF> cards, labels;
+    for (QQuickItem *it : findItems(win->contentItem(), "island"))
+        if (it->isVisible() && it->opacity() > 0.5)
+            cards << sceneRect(it);
+    for (QQuickItem *t : findItems(win->contentItem(), "clusterLabel"))
+        if (t->isVisible() && t->opacity() > 0.5)
+            labels << sceneRect(t).adjusted(0, 0, 0, 2);
+    int n = 0;
+    for (const char *name : {"tabBadge", "focusCursorHint"}) {
+        QQuickItem *pill = firstItem(win, name);
+        if (!pill || !pill->isVisible() || !pill->parentItem() || pill->parentItem()->opacity() < 0.5)
+            continue;
+        const QRectF pr = sceneRect(pill);
+        int owner = -1;
+        qreal best = 0;
+        for (int i = 0; i < cards.size(); ++i) {
+            const QRectF x = cards[i].intersected(pr);
+            if (x.width() * x.height() > best) { best = x.width() * x.height(); owner = i; }
+        }
+        for (int i = 0; i < cards.size(); ++i)
+            if (i != owner && cards[i].intersects(pr)) {
+                ++n;
+                if (hits)
+                    *hits << QStringLiteral("%1 touches card at %2,%3").arg(name).arg(cards[i].x()).arg(cards[i].y());
+            }
+        for (const QRectF &l : labels)
+            if (l.intersects(pr)) {
+                ++n;
+                if (hits)
+                    *hits << QStringLiteral("%1 touches cluster label at %2,%3").arg(name).arg(l.x()).arg(l.y());
+            }
+    }
+    return n;
+}
+
 void scanBanned(QQuickWindow *win, const char *where)
 {
     QStringList texts;
@@ -1597,7 +1638,6 @@ void uiTests()
         QQuickItem *ring = firstItem(win, "predictorRingShape");
         QQuickItem *badge = firstItem(win, "tabBadgeLabel");
         QQuickItem *badgeBox = firstItem(win, "tabBadge");
-        QQuickItem *fRing = firstItem(win, "focusCursorRing");
         const QVariantMap p = app->property("predictedAction").toMap();
         const int target = p.value("index").toInt();
         const auto isl = findItems(win->contentItem(), "island");
@@ -1605,17 +1645,20 @@ void uiTests()
               "predictor: Constellation predicts an island", p.value("targetId").toString());
         check(ring && firstItem(win, "predictorRing")->opacity() > 0.9 && badge && badge->isVisible(),
               "predictor: gold ring / badge visible when idle");
-        if (badgeBox && ring) {
+        // On the Constellation the badge is an opaque tab tucked onto the island's top border
+        // (it covers the ring line under it), so it never climbs into a cluster label or the
+        // card above.
+        if (badgeBox && isl.value(target)) {
             const QRectF br = badgeBox->mapRectToScene(QRectF(0, 0, badgeBox->width(), badgeBox->height()));
-            const QRectF pr = ring->mapRectToScene(QRectF(0, 0, ring->width(), ring->height()));
-            check(!br.intersects(pr), "predictor: tabBadge clears predictor ring",
-                  QStringLiteral("badge %1..%2 ring %3..%4").arg(br.y()).arg(br.bottom()).arg(pr.y()).arg(pr.bottom()));
-            if (fRing && fRing->isVisible()) {
-                const QRectF fr = fRing->mapRectToScene(QRectF(0, 0, fRing->width(), fRing->height()));
-                check(!br.intersects(fr), "predictor: tabBadge clears focusCursor ring",
-                      QStringLiteral("badge %1..%2 fRing %3..%4").arg(br.y()).arg(br.bottom()).arg(fr.y()).arg(fr.bottom()));
-            }
+            QQuickItem *it = isl.value(target);
+            const QRectF ir = it->mapRectToScene(QRectF(0, 0, it->width(), it->height()));
+            check(qAbs(br.center().y() - ir.top()) < 1.5 && qAbs(br.center().x() - ir.center().x()) < 1.5,
+                  "predictor: tabBadge tucked on the predicted island's top border",
+                  QStringLiteral("badge cy %1 island top %2").arg(br.center().y()).arg(ir.top()));
         }
+        QStringList chrome;
+        check(mapChromeCollisions(win, &chrome) == 0, "predictor: badge / hint clear every cluster label and other card",
+              chrome.join("; "));
         if (ring && isl.value(target)) {
             const QRectF rr = ring->mapRectToScene(QRectF(0, 0, ring->width(), ring->height()));
             const QRectF ir = isl.value(target)->mapRectToScene(QRectF(0, 0, isl.value(target)->width(), isl.value(target)->height()));
@@ -6180,8 +6223,22 @@ void halfScreenUiTests()
         check(textOverlaps(win, &tp) == 0, "half: no overlapping text anywhere (" + where + ")", tp.join("; "));
     };
 
+    // Focus chrome on the selected card: "Open Stage R1" tucked on its top border, "✕ Expand" on
+    // its bottom border, neither touching a cluster label or a neighbouring card.
+    auto chrome = [&](const QString &where) {
+        settle(800);  // idle: the predictor badge fades in
+        QQuickItem *badge = firstItem(win, "tabBadge");
+        QQuickItem *hint = firstItem(win, "focusCursorHint");
+        QStringList hits;
+        studio::check(badge && badge->isVisible() && hint && hint->isVisible(),
+                      qPrintable("half: Open Stage badge and Expand chip both shown (" + where + ")"));
+        studio::check(mapChromeCollisions(win, &hits) == 0,
+                      qPrintable("half: focus chrome clears cluster labels and neighbouring cards (" + where + ")"), hits.join("; "));
+    };
+
     // Auto-layout.
     audit("auto layout");
+    chrome("960x1080");
     std::printf("info  half: card %.0fx%.0f, %d cluster column(s), content %.0f px, scrollable %d\n",
                 map->property("islandW").toReal(), map->property("islandH").toReal(),
                 map->property("layout").toMap().value("ccols").toInt(), map->property("contentH").toReal(),
@@ -6228,6 +6285,7 @@ void halfScreenUiTests()
         QStringList pairs;
         check(crowdedPairs(mapIslands(win), 14, &pairs) == 0, "half: saved positions at 1920 wide stay clear", pairs.join("; "));
     }
+    chrome("1920x1080");
     win->resize(960, 1080);
     settle(400);
     audit("resized 1920 -> 960 with saved positions");

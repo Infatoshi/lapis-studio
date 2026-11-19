@@ -13,6 +13,8 @@
 //   lapis_studio --snap-slowmix OUT.png  offscreen dark frames: Music overlay, plus OUT-bar.png (♪ pill)
 //   lapis_studio --snap-map OUT.png      offscreen dark frame: category clusters, free pad cursor, marquee
 //   lapis_studio --snap-half OUT.png     offscreen dark frame: half-screen 960x1080 map, 11 cards (+ OUT-saved.png)
+//   lapis_studio --snap-cursor OUT.png   the agent's visible cursor overlay (glide tail, focus ring,
+//                                        click ripple, status pill) rendered on a dark desktop
 //   lapis_studio --harness codex    quick asks (Enter) go to a warm codex app-server instead of claude
 //   lapis_studio --hot-reload       (or LAPIS_HOT_RELOAD=1) load qml/ from disk ($LAPIS_QML_DIR or
 //                                   <repo>/qml) and rebuild the UI in place on save, Cmd+Shift+L or SIGUSR1
@@ -25,6 +27,7 @@
 
 #include "backend.hpp"
 #include "demo.hpp"
+#include "mac/cua_reticle.hpp"
 #include "mac/window_state.hpp"
 #include "qml_host.hpp"
 
@@ -55,6 +58,7 @@ int main(int argc, char **argv)
     QString slowmixOut;
     QString mapOut;
     QString halfOut;
+    QString cursorOut;
     QString quickHarness = QStringLiteral("claude");
     bool hotReload = qEnvironmentVariableIntValue("LAPIS_HOT_RELOAD") == 1;
     QString chatModel;
@@ -123,18 +127,24 @@ int main(int argc, char **argv)
                 return 64;
             }
             halfOut = QString::fromLocal8Bit(argv[++i]);
+        } else if (std::strcmp(argv[i], "--snap-cursor") == 0) {
+            if (i + 1 >= argc) {
+                std::fprintf(stderr, "--snap-cursor needs an output .png path\n");
+                return 64;
+            }
+            cursorOut = QString::fromLocal8Bit(argv[++i]);
         } else if (std::strcmp(argv[i], "--hot-reload") == 0) {
             hotReload = true;
         } else if (std::strcmp(argv[i], "--harness") == 0 && i + 1 < argc) {
             quickHarness = QString::fromLocal8Bit(argv[++i]);
         } else if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
-            std::printf("usage: lapis_studio [--harness claude|codex] [--hot-reload] [--test | --smoke-offscreen [DIR] | --probe-live | --probe-chat MODEL [EFFORT] | --bench-fps [--metal [DIR]] | --record-demo OUT.mp4 | --snap-omnibar OUT.png | --snap-review OUT.png | --snap-slowmix OUT.png | --snap-map OUT.png | --snap-half OUT.png]\n");
+            std::printf("usage: lapis_studio [--harness claude|codex] [--hot-reload] [--test | --smoke-offscreen [DIR] | --probe-live | --probe-chat MODEL [EFFORT] | --bench-fps [--metal [DIR]] | --record-demo OUT.mp4 | --snap-omnibar OUT.png | --snap-review OUT.png | --snap-slowmix OUT.png | --snap-map OUT.png | --snap-half OUT.png | --snap-cursor OUT.png]\n");
             return 0;
         }
     }
     const bool offscreen = test || smoke || probe || bench || !demoOut.isEmpty() || !chatModel.isEmpty()
                            || !snapOut.isEmpty() || !reviewOut.isEmpty() || !slowmixOut.isEmpty() || !mapOut.isEmpty()
-                           || !halfOut.isEmpty();
+                           || !halfOut.isEmpty() || !cursorOut.isEmpty();
     const bool metalBench = bench && metal;
     if (offscreen) {
         // Never open a visible window while building or testing on the host Mac.
@@ -195,6 +205,8 @@ int main(int argc, char **argv)
         return studio::snapMap(mapOut);
     if (!halfOut.isEmpty())
         return studio::snapHalf(halfOut);
+    if (!cursorOut.isEmpty())
+        return studio::cua::snapCursor(cursorOut);  // the real overlay view, drawn into a bitmap
 
     studio::Backend backend(studio::Backend::Mode::Live);
     backend.setQuickHarness(quickHarness);  // before the helpers warm up 0.4 s from now

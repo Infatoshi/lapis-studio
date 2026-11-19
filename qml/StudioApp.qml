@@ -1483,7 +1483,7 @@ FocusScope {
         round: tid.startsWith("pager:") || tid.startsWith("rung:") || tid === "newSession"
         cardRadius: tid === "composer" ? 22 : 26
         badgeSide: tid.startsWith("pager:") ? "right" : tid.startsWith("rung:") ? "left"
-                   : tid === "newSession" ? "bottom" : "top"
+                   : tid === "newSession" ? "bottom" : tid.startsWith("island:") ? "topTuck" : "top"
         idle: app.idle
         // One input at a time: the bound button alone with a controller ("R1"), "⇥ Tab" on keys.
         // An unbound accept action shows no key chip rather than a keyboard glyph.
@@ -1524,7 +1524,7 @@ FocusScope {
             const i = constellation.slotOf(selectedIsland) >= 0 ? selectedIsland : constellation.slots[0];
             if (!constellation.islandInBand(i))
                 return null;  // scrolled out of view: no ring or hint over the top bar / footer
-            return { item: constellation, r: constellation.islandRect(i), radius: 26, round: false, side: "bottom",
+            return { item: constellation, r: constellation.islandRect(i), radius: 26, round: false, side: "bottomTuck",
                      hint: confirmKey.length > 0 ? confirmKey + " Expand" : "" };
         }
         if (lens === 2) {
