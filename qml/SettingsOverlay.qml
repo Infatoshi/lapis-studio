@@ -19,7 +19,7 @@ FocusScope {
         { id: "wasd", name: "Gaming", tag: "" },
         { id: "mouse", name: "Mouse", tag: "" }
     ]
-    readonly property int rowCount: 7
+    readonly property int rowCount: 8
     readonly property var themes: [
         { id: "gold", name: "Gold" },
         { id: "lapis", name: "Lapis Blue" }
@@ -88,6 +88,7 @@ FocusScope {
         case 4: backend.modelSuggestions = d > 0; break;
         case 5: backend.theme = d > 0 ? "lapis" : "gold"; break;
         case 6: openControllerMap(); break;
+        case 7: backend.showCodeDiffs = d > 0; break;
         }
     }
 
@@ -413,6 +414,38 @@ FocusScope {
                         color: Theme.dim
                         font.family: Theme.sans
                         font.pixelSize: 14
+                        anchors.verticalCenter: parent.verticalCenter
+                    }
+                }
+            }
+
+            // 7. Code diffs on the Stage (visual-first: off by default; the Stage's Code pill too)
+            SettingRow {
+                index: 7
+                caption: "Code Diffs"
+                Row {
+                    spacing: 16
+                    anchors.verticalCenter: parent.verticalCenter
+                    Rectangle {
+                        objectName: "settingsCodeDiffs"
+                        width: 52
+                        height: 28
+                        radius: 14
+                        color: root.backend && root.backend.showCodeDiffs ? Theme.gold : Theme.track
+                        anchors.verticalCenter: parent.verticalCenter
+                        Rectangle {
+                            width: 22; height: 22; radius: 11
+                            y: 3
+                            x: root.backend && root.backend.showCodeDiffs ? 27 : 3
+                            color: "#000000"
+                        }
+                        TapHandler { onTapped: { root.row = 7; if (root.backend) root.backend.showCodeDiffs = !root.backend.showCodeDiffs; } }
+                    }
+                    Text {
+                        text: root.backend && root.backend.showCodeDiffs ? "Diffs follow the visuals on the Stage" : "Stage shows results only; diffs on request"
+                        color: Theme.dim
+                        font.family: Theme.sans
+                        font.pixelSize: 15
                         anchors.verticalCenter: parent.verticalCenter
                     }
                 }

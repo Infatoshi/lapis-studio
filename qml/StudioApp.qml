@@ -12,6 +12,32 @@ FocusScope {
     property int artifactIndex: 0
     property bool proseOpen: false
     property int selectedIsland: 0
+    // Constellation filter: "all" | "needs" (only sessions waiting on the human). Cmd+1 / Cmd+2.
+    property string islandFilter: "all"
+    function setIslandFilter(f) {
+        islandFilter = f === "needs" ? "needs" : "all";
+        // The ring never waits on an island the filter just hid.
+        if (constellation.count > 0 && constellation.slotOf(selectedIsland) < 0)
+            selectedIsland = constellation.slots[0];
+    }
+    // Code diffs on the Stage are opt-in (the Code pill or Settings). Turning them on lands on
+    // the first diff, so the click shows what it asked for.
+    function toggleCodeDiffs() {
+        if (!backend)
+            return;
+        const on = !backend.showCodeDiffs;
+        backend.showCodeDiffs = on;
+        if (on && lens === 2) {
+            for (let i = 0; i < artifacts.length; ++i)
+                if (artifacts[i].kind === "diff") {
+                    stage.direction = i > artifactIndex ? 1 : -1;
+                    artifactIndex = i;
+                    break;
+                }
+        } else if (artifactIndex >= artifacts.length) {
+            artifactIndex = Math.max(0, artifacts.length - 1);
+        }
+    }
 
     // UI zoom (0.75..1.60) and input mode ("vim" | "wasd" | "mouse"), persisted by the backend.
     // There is no arrows mode; arrow keys are a silent fallback in every mode.
@@ -73,7 +99,7 @@ FocusScope {
 
     // The view in charge supplies the prediction: the composer while it has focus, else the lens.
     readonly property var predictedAction: {
-        if (settings.open || onboarding.open || dialog.open || briefing.open || omnibar.open)
+        if (settings.open || onboarding.open || dialog.open || briefing.open || omnibar.open || review.open)
             return null;
         if (answers.inputFocused)
             return answers.predictedAction;
@@ -210,7 +236,7 @@ FocusScope {
                 return i;
         return -1;
     }
-    readonly property rect islandRect: projectIdx >= 0 && projectIdx < constellation.count
+    readonly property rect islandRect: projectIdx >= 0 && constellation.slotOf(projectIdx) >= 0
         ? constellation.islandRect(projectIdx)
         : Qt.rect(width / 2 - 200, height / 2 - 103, 400, 206)
     property real zoom: lens === 0 ? 0 : 1
@@ -327,6 +353,9 @@ FocusScope {
         }
         if (ctrl && e.key === Qt.Key_0) {
             setZoom(1.0);
+            // On the Constellation it also snaps dragged cards back to the auto-layout.
+            if (lens === 0 && backend && !dialog.open && !onboarding.open)
+                backend.resetCardPositions();
             e.accepted = true;
             return;
         }
@@ -349,7 +378,17 @@ FocusScope {
             e.accepted = true;
             return;
         }
-        if (settings.open || briefing.open)
+        // Cmd+Shift+R: the end-of-session review (intent vs outcome, steers, taste rules).
+        if (ctrl && (e.modifiers & Qt.ShiftModifier) !== 0 && e.key === Qt.Key_R) {
+            if (review.open) {
+                review.hide();
+            } else if (!settings.open && !briefing.open && !controllerMap.open) {
+                review.show();
+            }
+            e.accepted = true;
+            return;
+        }
+        if (settings.open || briefing.open || review.open)
             return;
         if (ctrl && e.key === Qt.Key_M) {
             if (lens > 0) {
@@ -412,8 +451,18 @@ FocusScope {
             e.accepted = true;
             return;
         }
+        // Cmd+1 / Cmd+2 on the Constellation: All / Needs Me. Elsewhere Cmd+1..3 pick the lens
+        // (Cmd+1 also clears the filter, so it always comes home to every island).
+        if (ctrl && lens === 0 && (e.key === Qt.Key_1 || e.key === Qt.Key_2)) {
+            app.takeFocus();
+            setIslandFilter(e.key === Qt.Key_2 ? "needs" : "all");
+            e.accepted = true;
+            return;
+        }
         if (ctrl && e.key >= Qt.Key_1 && e.key <= Qt.Key_3) {
             app.takeFocus();
+            if (e.key === Qt.Key_1)
+                setIslandFilter("all");
             goLens(e.key - Qt.Key_1);
             e.accepted = true;
             return;
@@ -447,8 +496,8 @@ FocusScope {
         }
         if (navMode === "vim" && e.key === Qt.Key_G && !(e.modifiers & (Qt.AltModifier | Qt.MetaModifier))) {
             const last = (e.modifiers & Qt.ShiftModifier) !== 0;
-            if (lens === 0 && projects.length > 0) {
-                selectedIsland = last ? Math.min(projects.length, constellation.count) - 1 : 0;
+            if (lens === 0 && constellation.count > 0) {
+                selectedIsland = constellation.slots[last ? constellation.count - 1 : 0];
             } else if (proseOpen) {
                 prose.scrollToEnd(last ? 1 : -1);
             } else if (lens === 2 && artifacts.length > 0) {
@@ -464,24 +513,28 @@ FocusScope {
         const nav = navArrow(e);
         const k = nav !== 0 ? nav : action;
         if (lens === 0) {
-            const n = projects.length;
+            // Islands travel in slot order (the number on each card), so the Needs Me filter
+            // and dragged cards keep 1..9 and the arrows meaning what is on screen.
+            const n = constellation.count;
             if (k >= Qt.Key_1 && k <= Qt.Key_9) {
-                enterProject(k - Qt.Key_1);
+                const pi = constellation.slotProject(k - Qt.Key_1);
+                if (pi >= 0)
+                    enterProject(pi);
                 e.accepted = true;
             } else if ((k === Qt.Key_Return || k === Qt.Key_Enter) && n > 0) {
-                enterProject(selectedIsland);
+                enterProject(constellation.slotOf(selectedIsland) >= 0 ? selectedIsland : constellation.slots[0]);
                 e.accepted = true;
             } else if (k === Qt.Key_Right) {
-                selectedIsland = (selectedIsland + 1) % Math.max(1, n);
+                selectedIsland = constellation.stepSelection(selectedIsland, 1, true);
                 e.accepted = true;
             } else if (k === Qt.Key_Left || k === Qt.Key_Backtab) {
-                selectedIsland = (selectedIsland - 1 + n) % Math.max(1, n);
+                selectedIsland = constellation.stepSelection(selectedIsland, -1, true);
                 e.accepted = true;
             } else if (k === Qt.Key_Down) {
-                selectedIsland = Math.min(n - 1, selectedIsland + constellation.columns);
+                selectedIsland = constellation.stepSelection(selectedIsland, constellation.columns, false);
                 e.accepted = true;
             } else if (k === Qt.Key_Up) {
-                selectedIsland = Math.max(0, selectedIsland - constellation.columns);
+                selectedIsland = constellation.stepSelection(selectedIsland, -constellation.columns, false);
                 e.accepted = true;
             }
             return;
@@ -557,6 +610,8 @@ FocusScope {
                 controllerMap.cycleAction(dx);
         } else if (briefing.open) {
             briefing.move(dy !== 0 ? dy : dx);
+        } else if (review.open) {
+            review.move(dy !== 0 ? dy : dx);
         } else if (onboarding.open) {
             onboarding.choice = Math.max(0, Math.min(onboarding.cards.length - 1, onboarding.choice + dx + dy));
         } else if (dialog.open) {
@@ -573,11 +628,9 @@ FocusScope {
         } else if (lens === 2 && stage.terms.active) {
             stage.terms.step(dx + dy);
         } else if (lens === 0) {
-            const n = projects.length;
-            if (n === 0) return;
-            if (dx !== 0) selectedIsland = (selectedIsland + dx + n) % n;
-            else if (dy > 0) selectedIsland = Math.min(n - 1, selectedIsland + constellation.columns);
-            else selectedIsland = Math.max(0, selectedIsland - constellation.columns);
+            if (constellation.count === 0) return;
+            if (dx !== 0) selectedIsland = constellation.stepSelection(selectedIsland, dx, true);
+            else selectedIsland = constellation.stepSelection(selectedIsland, dy * constellation.columns, false);
         } else if (dx !== 0) {
             if (lens === 2) stepArtifact(dx);
         } else {
@@ -601,12 +654,13 @@ FocusScope {
         if (controllerMap.open) controllerMap.startCapture();
         else if (onboarding.open) onboarding.confirm();
         else if (briefing.open) briefing.confirm();
+        else if (review.open) review.confirm();
         else if (dialog.open) dialog.start();
         else if (settings.open) settings.hide();
         else if (answers.pickerOpen) answers.pickerOpen = false;  // the composer keeps focus
         else if (answers.inputFocused) { if (!answers.toggleHighlight()) answers.send(0); }
         else if (lens === 2 && stage.terms.active) scopeToParam(stage.terms.current());
-        else if (lens === 0) { if (projects.length > 0) enterProject(selectedIsland); }
+        else if (lens === 0) { if (constellation.count > 0) enterProject(constellation.slotOf(selectedIsland) >= 0 ? selectedIsland : constellation.slots[0]); }
         else if (lens === 1 && artifacts.length > 0) goLens(2);
         else answers.focusInput("");
     }
@@ -615,6 +669,7 @@ FocusScope {
         if (onboarding.open) return;  // a mode has to be picked once
         if (controllerMap.open) controllerMap.hide();
         else if (briefing.open) briefing.hide();
+        else if (review.open) review.hide();
         else if (dialog.open) dialog.hide();
         else if (settings.open) settings.hide();
         else if (answers.pickerOpen) answers.pickerOpen = false;
@@ -656,9 +711,10 @@ FocusScope {
             settings.row = (settings.row + d + settings.rowCount) % settings.rowCount;
         } else if (answers.pickerOpen && backend) {
             backend.cycleModel(d);
+        } else if (review.open) {
+            review.move(d);
         } else if (lens === 0) {
-            const n = projects.length;
-            if (n > 0) selectedIsland = (selectedIsland + d + n) % n;
+            if (constellation.count > 0) selectedIsland = constellation.stepSelection(selectedIsland, d, true);
         } else if (lens === 1) {
             if (d > 0 && artifacts.length > 0) goLens(2);
             else if (d < 0) goLens(0);
@@ -758,9 +814,15 @@ FocusScope {
         visited: app.visited
         cursorActive: app.lens === 0 && focusCursor.active
         targets: app.lens === 0 ? app.targets : null
+        filter: app.islandFilter
+        cardPositions: app.backend ? app.backend.cardPositions : ({})
         onEnter: (i) => app.enterProject(i)
         onZoomBy: (f) => app.zoomBy(f)
         onNewSession: dialog.show()
+        onCardMoved: (key, x, y) => { if (app.backend) app.backend.setCardPosition(key, x, y); }
+        onFilterPicked: (f) => app.setIslandFilter(f)
+        onResetLayout: if (app.backend) app.backend.resetCardPositions()
+        onReviewRequested: review.show()
     }
 
     // The shared element: a card that starts as the island and becomes the whole window.
@@ -785,7 +847,7 @@ FocusScope {
         Island {
             enabled: false
             proj: app.project
-            number: app.projectIdx + 1
+            number: constellation.slotOf(app.projectIdx) + 1
             width: morph.from.width
             height: morph.from.height
             visible: opacity > 0.005
@@ -833,7 +895,7 @@ FocusScope {
                     objectName: "headerJob"
                     anchors.left: headerName.right
                     anchors.leftMargin: 14
-                    anchors.right: lensDots.left
+                    anchors.right: codePill.visible ? codePill.left : lensDots.left
                     anchors.rightMargin: 24
                     anchors.verticalCenter: parent.verticalCenter
                     visible: text.length > 0
@@ -842,6 +904,33 @@ FocusScope {
                     elide: Text.ElideRight
                     font.family: Theme.sans
                     font.pixelSize: Theme.px(20)
+                }
+                // Stage only, and only when this project has diffs: code stays out of the deck
+                // until asked for. Gold hairline while on.
+                Rectangle {
+                    id: codePill
+                    objectName: "codePill"
+                    readonly property bool on: app.backend ? app.backend.showCodeDiffs : false
+                    visible: app.lens === 2 && app.project !== null && (app.project.diffCount || 0) > 0
+                    anchors.right: lensDots.left
+                    anchors.rightMargin: 22
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: codeText.implicitWidth + 26
+                    height: 28
+                    radius: 14
+                    color: codeHover.hovered ? Theme.card : "transparent"
+                    border.width: 1
+                    border.color: on ? Theme.goldA(0.55) : Theme.line
+                    Text {
+                        id: codeText
+                        anchors.centerIn: parent
+                        text: "Code"
+                        color: codePill.on ? Theme.gold : Theme.dim
+                        font.family: Theme.mono
+                        font.pixelSize: 14
+                    }
+                    HoverHandler { id: codeHover; cursorShape: Qt.PointingHandCursor }
+                    TapHandler { onTapped: app.toggleCodeDiffs() }
                 }
                 Row {
                     id: lensDots
@@ -1037,13 +1126,15 @@ FocusScope {
     // Hidden in pure mouse mode, behind overlays, mid-zoom, and over the write-up.
     readonly property var cursorSpec: {
         const deps = [zoom, width, height, uiScale, lens, selectedIsland, artifactIndex, constellation.width,
-                      constellation.count, answers.inputFocused, answers.hasSelection, answers.inputText,
+                      constellation.count, constellation.slots, constellation.cardPositions, answers.inputFocused, answers.hasSelection, answers.inputText,
                       answers.height, answers.pickerOpen, stage.width, stage.height, stage.barH, stage.kind,
                       stage.terms.active, stage.terms.selected, stage.terms.count, stage.terms.expanded];
         if (deps.length === 0 || (navMode === "mouse" && !padConnected))
             return null;
-        if (settings.open || onboarding.open || dialog.open || controllerMap.open || briefing.open)
+        if (settings.open || onboarding.open || dialog.open || controllerMap.open || briefing.open || review.open)
             return null;
+        if (lens === 0 && constellation.dragging)
+            return null;  // the card under the pointer is the focus while it moves
         if (!(zoom < 0.001 || zoom > 0.999) || (proseOpen && !answers.inputFocused))
             return null;
         if (answers.inputFocused && lens > 0) {
@@ -1055,7 +1146,7 @@ FocusScope {
         if (lens === 0) {
             if (constellation.count === 0)
                 return null;
-            const i = Math.max(0, Math.min(selectedIsland, constellation.count - 1));
+            const i = constellation.slotOf(selectedIsland) >= 0 ? selectedIsland : constellation.slots[0];
             return { item: constellation, r: constellation.islandRect(i), radius: 26, round: false, side: "bottom",
                      hint: confirmKey.length > 0 ? confirmKey + " Expand" : "" };
         }
@@ -1220,7 +1311,7 @@ FocusScope {
                                  : (app.projects.length > 0 ? app.projects[Math.min(app.selectedIsland, app.projects.length - 1)].key : "")
         artifactIndex: app.lens === 2 ? app.artifactIndex : -1
         mouseMode: app.navMode === "mouse"
-        suppressed: settings.open || dialog.open || onboarding.open || briefing.open || controllerMap.open
+        suppressed: settings.open || dialog.open || onboarding.open || briefing.open || controllerMap.open || review.open
         onClosed: app.takeFocus()
     }
 
@@ -1287,6 +1378,16 @@ FocusScope {
             app.takeFocus();
         }
         onOpenProject: (i) => app.enterProject(i)
+    }
+    // --- Session review --------------------------------------------------------------------------
+    // Cmd+Shift+R or the Review pill: intent vs outcome, the human's steers, taste rules to keep.
+    SessionReviewOverlay {
+        id: review
+        anchors.fill: parent
+        backend: app.backend
+        padHints: app.padHints
+        padGlyphs: app.padGlyphs
+        onClosed: app.takeFocus()
     }
     // Quiet hint, Constellation only: where the briefing lives.
     Text {

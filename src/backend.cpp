@@ -37,6 +37,7 @@ QString agyBin() { return home() + QStringLiteral("/.local/bin/agy"); }
 QString workspacePath() { return home() + QStringLiteral("/.lapis/runtime/workspace.json"); }
 // The quick ask's router stream id (askStream() refuses it, so the two never collide).
 constexpr char kQuickStreamId[] = "__quick__";
+constexpr char kReflectionStreamId[] = "reflection:1";
 // Tier 2 cap per conversation stream, in messages (user + assistant pairs).
 constexpr int kMaxStreamHistory = 24;
 
@@ -721,7 +722,8 @@ QString channelKeyFor(const QString &model, const QString &effort)
 // kCompatSystemPrompt, the tiered request builders and parseOpenAiSseLine live in lapis_llm.
 
 QByteArray buildFilterPrompt(const QString &model, const QString &goal, const QVariantList &params,
-                             const QStringList &recentActions, const QString &latestTurn)
+                             const QStringList &recentActions, const QString &latestTurn,
+                             const QStringList &tasteRules)
 {
     static const QString kSys = QStringLiteral(
         "You filter a coding agent's latest turn for the human who directs it. Drop boilerplate, routine "
@@ -748,6 +750,11 @@ QByteArray buildFilterPrompt(const QString &model, const QString &goal, const QV
         ctx += QStringLiteral(" (none)");
     for (const QString &a : recentActions)
         ctx += QStringLiteral("\n- ") + a;
+    if (!tasteRules.isEmpty()) {
+        ctx += QStringLiteral("\nThe human's standing taste rules (filter by them):");
+        for (const QString &r : tasteRules)
+            ctx += QStringLiteral("\n- ") + r;
+    }
     QString turn = latestTurn.trimmed();
     if (turn.size() > 6000)
         turn = turn.left(6000) + QChar(0x2026);
@@ -790,6 +797,132 @@ HumanFilterReply parseFilterReply(const QString &reply)
         }
     }
     r.summary = points.join(QLatin1Char('\n'));
+    return r;
+}
+
+QVariantList stageArtifacts(const QVariantList &artifacts, bool showDiffs)
+{
+    QVariantList out, diffs;
+    for (const QVariant &v : artifacts) {
+        if (v.toMap().value(QStringLiteral("kind")).toString() == QLatin1String("diff"))
+            diffs << v;
+        else
+            out << v;
+    }
+    if (showDiffs)
+        out << diffs;
+    return out;
+}
+
+bool projectNeedsMe(const QString &status, bool blocker)
+{
+    return blocker || status == QLatin1String("needs-ok") || status == QLatin1String("needs-user")
+           || status == QLatin1String("waiting") || status == QLatin1String("gate");
+}
+
+bool isSteerTurn(const QString &text)
+{
+    static const QRegularExpression steer(
+        QStringLiteral("^(no\\b|nope\\b|not\\b|stop\\b|wait\\b|actually\\b|instead\\b|wrong\\b|rather\\b|"
+                       "don'?t\\b|do not\\b|never\\b|always\\b|please don'?t\\b)|"
+                       "\\b(instead of|rather than|don'?t|do not|never|stop|that's wrong|not what i)\\b"),
+        QRegularExpression::CaseInsensitiveOption);
+    return steer.match(text.simplified()).hasMatch();
+}
+
+namespace {
+// "don't lead with the diff; show the chart" -> "Don't lead with the diff; show the chart."
+QString asRule(const QString &text)
+{
+    QString s = sentencesOf(text).value(0, text.simplified());
+    static const QRegularExpression lead(QStringLiteral("^(no|nope|wait|actually|hmm|ok|okay)[,.!]*\\s+"),
+                                         QRegularExpression::CaseInsensitiveOption);
+    s.remove(lead);
+    s = shortLine(s, 16);
+    if (s.isEmpty())
+        return s;
+    s[0] = s[0].toUpper();
+    if (!s.endsWith(QChar(0x2026)) && !s.endsWith(QLatin1Char('.')) && !s.endsWith(QLatin1Char('!')))
+        s += QLatin1Char('.');
+    return s;
+}
+}  // namespace
+
+SessionReflection localReflection(const QVariantList &sessions)
+{
+    SessionReflection r;
+    QStringList steers;
+    QStringList steered, quiet;  // intent lines: sessions the human corrected lead
+    for (const QVariant &v : sessions) {
+        const QVariantMap s = v.toMap();
+        const QString name = s.value(QStringLiteral("name")).toString();
+        const QString goal = s.value(QStringLiteral("goal")).toString().simplified();
+        const QString last = s.value(QStringLiteral("last")).toString().simplified();
+        const QStringList users = s.value(QStringLiteral("userTurns")).toStringList();
+        bool corrected = false;
+        for (qsizetype i = 1; i < users.size(); ++i)  // the first request is the intent, not a steer
+            if (isSteerTurn(users[i])) {
+                steers << users[i];
+                corrected = true;
+            }
+        if (goal.isEmpty())
+            continue;
+        // The request verbatim (its casing keeps "65B", "DCP=4"), then where the work landed.
+        QString line = name + QStringLiteral(": asked “") + shortLine(sentencesOf(goal).value(0, goal), 10)
+                       + QStringLiteral("”");
+        if (!last.isEmpty())
+            line += QStringLiteral(", landed on ") + shortLine(last, 10);
+        (corrected ? steered : quiet) << line;
+    }
+    const QStringList intents = (steered + quiet).mid(0, 2);
+    r.intent = intents.join(QLatin1Char('\n'));
+    QStringList quoted;
+    for (qsizetype i = std::max<qsizetype>(0, steers.size() - 3); i < steers.size(); ++i)
+        quoted << QStringLiteral("“") + shortLine(sentencesOf(steers[i]).value(0, steers[i]), 12) + QStringLiteral("”");
+    r.corrections = quoted.isEmpty() ? QStringLiteral("No steers spotted.") : quoted.join(QStringLiteral("  "));
+    for (qsizetype i = steers.size() - 1; i >= 0 && r.rules.size() < 3; --i) {
+        const QString rule = asRule(steers[i]);
+        if (!rule.isEmpty() && !r.rules.contains(rule, Qt::CaseInsensitive))
+            r.rules << rule;
+    }
+    return r;
+}
+
+SessionReflection parseReflectionReply(const QString &reply)
+{
+    SessionReflection r;
+    QString section;
+    static const QRegularExpression label(
+        QStringLiteral("^[*_#\\s\\d.)]*(INTENT|CORRECTIONS|STEERS|RULES)[*_\\s]*:[*_\\s]*(.*)$"),
+        QRegularExpression::CaseInsensitiveOption);
+    static const QRegularExpression bullet(QStringLiteral("^\\s*(?:[-*•]|\\d+[.)])\\s+"));
+    QStringList intent, corrections;
+    for (const QString &raw : reply.split(QLatin1Char('\n'))) {
+        QString l = raw.trimmed();
+        if (l.isEmpty())
+            continue;
+        const auto m = label.match(l);
+        if (m.hasMatch()) {
+            section = m.captured(1).toUpper();
+            if (section == QLatin1String("STEERS"))
+                section = QStringLiteral("CORRECTIONS");
+            l = m.captured(2).trimmed();
+            if (l.isEmpty())
+                continue;
+        }
+        l = l.remove(QStringLiteral("**")).simplified();
+        if (section == QLatin1String("INTENT"))
+            intent << l.remove(bullet);
+        else if (section == QLatin1String("CORRECTIONS"))
+            corrections << l.remove(bullet);
+        else if (section == QLatin1String("RULES") && r.rules.size() < 3) {
+            l.remove(bullet);
+            if (!l.isEmpty() && l.compare(QLatin1String("none"), Qt::CaseInsensitive) != 0)
+                r.rules << l;
+        }
+    }
+    r.intent = intent.join(QLatin1Char('\n'));
+    r.corrections = corrections.join(QLatin1Char(' '));
     return r;
 }
 
@@ -1261,6 +1394,40 @@ void Backend::setModelSuggestions(bool on)
         m_prefsSave.start();
 }
 
+void Backend::setShowCodeDiffs(bool on)
+{
+    if (on == m_showCodeDiffs)
+        return;
+    m_showCodeDiffs = on;
+    emit prefsChanged();
+    if (!m_prefsPath.isEmpty())
+        m_prefsSave.start();
+    publish();  // the Stage deck gains or drops its diffs
+}
+
+void Backend::setCardPosition(const QString &projectKey, double x, double y)
+{
+    if (projectKey.isEmpty() || !std::isfinite(x) || !std::isfinite(y))
+        return;
+    const QVariantMap c{{QStringLiteral("x"), std::clamp(x, 0.0, 1.0)}, {QStringLiteral("y"), std::clamp(y, 0.0, 1.0)}};
+    if (m_cardPositions.value(projectKey).toMap() == c)
+        return;
+    m_cardPositions.insert(projectKey, c);
+    emit cardPositionsChanged();
+    if (!m_prefsPath.isEmpty())
+        m_prefsSave.start();
+}
+
+void Backend::resetCardPositions()
+{
+    if (m_cardPositions.isEmpty())
+        return;
+    m_cardPositions.clear();
+    emit cardPositionsChanged();
+    if (!m_prefsPath.isEmpty())
+        m_prefsSave.start();
+}
+
 void Backend::setPrefsPath(const QString &path)
 {
     if (m_prefsSave.isActive()) {
@@ -1299,6 +1466,17 @@ void Backend::loadPrefs()
     if (!compatModel.isEmpty())
         m_openaiCompatModel = compatModel;
     m_openaiCompatKey = o.value(QLatin1String("openaiCompatKey")).toString().trimmed();
+    m_showCodeDiffs = o.value(QLatin1String("showCodeDiffs")).toBool(false);
+    m_cardPositions.clear();
+    const QJsonObject cards = o.value(QLatin1String("cardPositions")).toObject();
+    for (auto it = cards.begin(); it != cards.end(); ++it) {
+        const QJsonObject c = it.value().toObject();
+        if (it.key().isEmpty() || !c.value(QLatin1String("x")).isDouble() || !c.value(QLatin1String("y")).isDouble())
+            continue;
+        m_cardPositions.insert(it.key(), QVariantMap{{QStringLiteral("x"), std::clamp(c.value(QLatin1String("x")).toDouble(), 0.0, 1.0)},
+                                                     {QStringLiteral("y"), std::clamp(c.value(QLatin1String("y")).toDouble(), 0.0, 1.0)}});
+    }
+    emit cardPositionsChanged();
     QHash<QString, QString> padMap = GamepadState::defaultBindings();
     const QJsonObject padObj = o.value(QLatin1String("gamepadBindings")).toObject();
     for (auto it = padObj.begin(); it != padObj.end(); ++it)
@@ -1404,6 +1582,16 @@ bool Backend::savePrefs()
         o.insert(QStringLiteral("openaiCompatModel"), m_openaiCompatModel);
     if (!m_openaiCompatKey.isEmpty())
         o.insert(QStringLiteral("openaiCompatKey"), m_openaiCompatKey);
+    o.insert(QStringLiteral("showCodeDiffs"), m_showCodeDiffs);
+    if (!m_cardPositions.isEmpty()) {
+        QJsonObject cards;
+        for (auto it = m_cardPositions.cbegin(); it != m_cardPositions.cend(); ++it) {
+            const QVariantMap c = it.value().toMap();
+            cards.insert(it.key(), QJsonObject{{QStringLiteral("x"), c.value(QStringLiteral("x")).toDouble()},
+                                               {QStringLiteral("y"), c.value(QStringLiteral("y")).toDouble()}});
+        }
+        o.insert(QStringLiteral("cardPositions"), cards);
+    }
     {
         const QHash<QString, QString> padMap = m_gamepad.bindingsMap();
         const QHash<QString, QString> defMap = GamepadState::defaultBindings();
@@ -1525,6 +1713,7 @@ QVariantMap Backend::projectMap(const Project &p) const
     m[QStringLiteral("lastLine")] = is.last;
     m[QStringLiteral("lastLong")] = is.lastLong;
     m[QStringLiteral("blocker")] = is.blocker;
+    m[QStringLiteral("needsMe")] = projectNeedsMe(status, is.blocker);
     // Plain-English job name: for pushes running over 15 min, or a folder / tab name that does
     // not read as English, the island and Stage header say what the agent is doing right now.
     qint64 started = 0;
@@ -1565,7 +1754,12 @@ QVariantMap Backend::projectMap(const Project &p) const
     }
     m[QStringLiteral("summary")] = summary;
     m[QStringLiteral("stateLine")] = stateLine;
-    m[QStringLiteral("artifacts")] = artifacts;
+    // Visual first: the deck leads with charts, tables, media and text; diffs only on request.
+    int diffCount = 0;
+    for (const QVariant &v : std::as_const(artifacts))
+        diffCount += v.toMap().value(QStringLiteral("kind")).toString() == QLatin1String("diff") ? 1 : 0;
+    m[QStringLiteral("diffCount")] = diffCount;
+    m[QStringLiteral("artifacts")] = stageArtifacts(artifacts, m_showCodeDiffs);
     m[QStringLiteral("prose")] = p.ex.prose;
     m[QStringLiteral("thinking")] = p.ex.thinking;
     // The conversation (Ladder). A session with no local transcript (remote over SSH) still has
@@ -1857,7 +2051,9 @@ bool Backend::contextPieces(const QString &projectKey, int artifactIndex, QStrin
         if (head)
             *head = QStringLiteral("Project: %1 (%2).").arg(p.name, tildePath(expandHome(p.dir)));
         QString ctx;  // the on-screen slice
-        const QVariantMap a = artifactIndex >= 0 ? p.ex.artifacts.value(artifactIndex).toMap() : QVariantMap();
+        // Indexed like the Stage deck the user sees (projectMap), not the extracted order.
+        const QVariantMap a = artifactIndex >= 0 ? stageArtifacts(p.ex.artifacts, m_showCodeDiffs).value(artifactIndex).toMap()
+                                                 : QVariantMap();
         if (slice && !a.isEmpty()) {
             const QString kind = a.value(QStringLiteral("kind")).toString();
             ctx += QStringLiteral(" On screen: %1 \"%2\" (%3).")
@@ -2257,6 +2453,11 @@ QString Backend::compatKey() const
 
 void Backend::onRouterDelta(const QString &streamId, const QString &text, const QString &thinking)
 {
+    if (streamId == QLatin1String(kReflectionStreamId)) {
+        if (m_reflectionBusy)
+            m_reflectionRaw += text;
+        return;
+    }
     if (streamId == QLatin1String(kQuickStreamId)) {
         if (!thinking.isEmpty())
             noteThinking(thinking);
@@ -2274,6 +2475,25 @@ void Backend::onRouterDelta(const QString &streamId, const QString &text, const 
 
 void Backend::onRouterFinished(const QString &streamId, const QString &error)
 {
+    if (streamId == QLatin1String(kReflectionStreamId)) {
+        if (!m_reflectionBusy)
+            return;
+        m_reflectionBusy = false;
+        // A dead endpoint or a mangled reply keeps the local lines; never an empty card.
+        const SessionReflection r = error.isEmpty() ? parseReflectionReply(m_reflectionRaw) : SessionReflection{};
+        if (!r.intent.isEmpty() || !r.rules.isEmpty()) {
+            if (r.intent.isEmpty())
+                m_reflection.rules = r.rules;
+            else
+                m_reflection = r;
+            if (m_reflection.corrections.isEmpty())
+                m_reflection.corrections = QStringLiteral("No steers spotted.");
+            m_reflectionSource = compatModel();
+        }
+        m_reflectionRaw.clear();
+        emit reflectionChanged();
+        return;
+    }
     if (streamId == QLatin1String(kQuickStreamId)) {
         if (!error.isEmpty())
             m_quickAnswer = QStringLiteral("openai-compat: ") + oneLine(error, 12);
@@ -3255,7 +3475,7 @@ void Backend::filterForHuman(const QString &projectKey)
         if (p->ex.prose.trimmed().isEmpty())
             latest = p->ex.recentTurns.join(QLatin1Char('\n'));
     }
-    const QByteArray payload = buildFilterPrompt(model, p->ex.goal, p->ex.params, m_recentActions, latest);
+    const QByteArray payload = buildFilterPrompt(model, p->ex.goal, p->ex.params, m_recentActions, latest, m_tasteRules);
     if (m_filterDone.size() > 512)
         m_filterDone.clear();
     m_filterDone.insert(tag);
@@ -3446,6 +3666,174 @@ void Backend::requestBriefing()
         emit briefingChanged();
     });
     emit briefingChanged();  // local lines now, busy until the model answers
+}
+
+// --- End-of-session reflection ------------------------------------------------------------------
+
+QVariantList Backend::reflectionSessions() const
+{
+    // Newest work first; infinity (redacted) projects never leave the process or show up here.
+    QList<const Project *> order;
+    for (const Project &p : m_projects) {
+        const bool redacted = std::any_of(p.sessions.cbegin(), p.sessions.cend(), [](const SessionInfo &s) { return s.redacted; });
+        if (!redacted)
+            order << &p;
+    }
+    std::stable_sort(order.begin(), order.end(), [](const Project *a, const Project *b) { return a->mtime > b->mtime; });
+    QVariantList out;
+    for (const Project *p : std::as_const(order)) {
+        QStringList users;
+        QStringList turns;
+        for (const QVariant &v : p->ex.threadTurns) {
+            const QVariantMap t = v.toMap();
+            const QString role = t.value(QStringLiteral("role")).toString();
+            const QString text = t.value(QStringLiteral("text")).toString().simplified();
+            if (text.isEmpty())
+                continue;
+            if (role == QLatin1String("user"))
+                users << text;
+            turns << (role == QLatin1String("user") ? QStringLiteral("User: ") : QStringLiteral("Assistant: ")) + text.left(400);
+        }
+        if (users.isEmpty())
+            continue;
+        const QVariantMap pm = m_projectList.value(projectIndex(p->key)).toMap();
+        out << QVariantMap{{QStringLiteral("key"), p->key},
+                           {QStringLiteral("name"), p->name},
+                           {QStringLiteral("goal"), p->ex.goal.isEmpty() ? users.first() : p->ex.goal},
+                           {QStringLiteral("last"), pm.value(QStringLiteral("lastLong")).toString()},
+                           {QStringLiteral("userTurns"), users},
+                           {QStringLiteral("turns"), turns.mid(std::max<qsizetype>(0, turns.size() - 8))}};
+        if (out.size() >= 6)
+            break;
+    }
+    return out;
+}
+
+QVariantMap Backend::reflection() const
+{
+    return {{QStringLiteral("intent"), m_reflection.intent},
+            {QStringLiteral("corrections"), m_reflection.corrections},
+            {QStringLiteral("rules"), m_reflection.rules}};
+}
+
+void Backend::runSessionReflection()
+{
+    const QVariantList sessions = reflectionSessions();
+    // The local lines land at once, so the overlay never opens empty or waits on the network.
+    m_reflection = localReflection(sessions);
+    if (m_reflection.intent.isEmpty())
+        m_reflection.intent = QStringLiteral("No session turns to reflect on yet.");
+    m_reflectionSource = QStringLiteral("local");
+    m_reflectionRaw.clear();
+    m_reflectionBusy = false;
+    const QString endpoint = compatEndpoint();
+    LlmRouter *router = endpoint.isEmpty() || sessions.isEmpty() ? nullptr : llmRouter();
+    if (!router) {
+        emit reflectionChanged();
+        return;
+    }
+    QString ctx;
+    for (const QVariant &v : sessions) {
+        const QVariantMap s = v.toMap();
+        ctx += QStringLiteral("\n### %1\nOriginal request: %2\nLatest step: %3\nTurns (oldest first):\n")
+                   .arg(s.value(QStringLiteral("name")).toString(), s.value(QStringLiteral("goal")).toString().left(600),
+                        s.value(QStringLiteral("last")).toString());
+        ctx += s.value(QStringLiteral("turns")).toStringList().join(QLatin1Char('\n')) + QLatin1Char('\n');
+        if (ctx.size() > 9000)
+            break;
+    }
+    if (!m_tasteRules.isEmpty())
+        ctx += QStringLiteral("\nRules the human already keeps (do not repeat them):\n- ") + m_tasteRules.join(QStringLiteral("\n- "));
+    static const QString kSys = QStringLiteral(
+        "You review a human's session directing coding agents. Be concise and concrete, plain English, no markdown. "
+        "Reply in exactly this format and nothing else:\n"
+        "INTENT: one or two lines, what they originally set out to do vs what actually matched it\n"
+        "CORRECTIONS: one line naming the human's corrections or steers you spotted, or none\n"
+        "RULES:\n- 1 to 3 crisp personal taste rules worth keeping, each an imperative under 16 words");
+    LlmStreamRequest req;
+    req.streamId = QString::fromLatin1(kReflectionStreamId);
+    req.endpoint = endpoint;
+    req.apiKey = compatKey();
+    req.payload = buildOpenAiCompatRequest(compatModel(), kSys, ctx, QStringLiteral("Reflect on this session."),
+                                           QStringLiteral("low"));
+    req.timeoutMs = 30000;  // a dead endpoint leaves the local lines, never a spinner
+    m_reflectionBusy = true;
+    emit reflectionChanged();  // local lines now, busy until the model answers
+    router->startStream(req);
+}
+
+QString Backend::defaultReviewsPath()
+{
+    return home() + QStringLiteral("/.lapis-next/session_reviews.jsonl");
+}
+
+void Backend::setReviewsPath(const QString &path)
+{
+    m_reviewsPath = path;
+    loadTasteRules();
+}
+
+void Backend::loadTasteRules()
+{
+    QStringList rules;
+    QFile f(m_reviewsPath);
+    if (!m_reviewsPath.isEmpty() && f.open(QIODevice::ReadOnly)) {
+        // Newest line per rule wins: a later rating <= 0 retires an earlier keep.
+        while (!f.atEnd()) {
+            const QJsonObject o = QJsonDocument::fromJson(f.readLine(16 * 1024)).object();
+            const QString rule = o.value(QLatin1String("rule")).toString().simplified();
+            if (rule.isEmpty())
+                continue;
+            for (qsizetype i = rules.size() - 1; i >= 0; --i)
+                if (rules[i].compare(rule, Qt::CaseInsensitive) == 0)
+                    rules.removeAt(i);
+            if (o.value(QLatin1String("rating")).toInt(1) > 0)
+                rules << rule;
+        }
+    }
+    while (rules.size() > 12)
+        rules.removeFirst();  // the filter prompt carries the newest dozen
+    if (rules != m_tasteRules) {
+        m_tasteRules = rules;
+        emit tasteRulesChanged();
+    }
+}
+
+bool Backend::saveTasteRule(const QString &rule, int rating)
+{
+    const QString r = rule.simplified();
+    if (r.isEmpty())
+        return false;
+    QStringList rules = m_tasteRules;
+    for (qsizetype i = rules.size() - 1; i >= 0; --i)
+        if (rules[i].compare(r, Qt::CaseInsensitive) == 0)
+            rules.removeAt(i);
+    if (rating > 0)
+        rules << r;
+    while (rules.size() > 12)
+        rules.removeFirst();
+    if (rules != m_tasteRules) {
+        m_tasteRules = rules;
+        emit tasteRulesChanged();
+    }
+    if (m_reviewsPath.isEmpty())
+        return false;
+    const QFileInfo fi(m_reviewsPath);
+    if (!QFileInfo::exists(fi.absolutePath())) {
+        if (!QDir().mkpath(fi.absolutePath()))
+            return false;
+        QFile::setPermissions(fi.absolutePath(), QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner);
+    }
+    QFile f(m_reviewsPath);
+    if (!f.open(QIODevice::WriteOnly | QIODevice::Append))
+        return false;
+    f.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner);
+    const QJsonObject o{{QStringLiteral("ts"), QDateTime::currentDateTimeUtc().toString(Qt::ISODate)},
+                        {QStringLiteral("rule"), r},
+                        {QStringLiteral("rating"), rating},
+                        {QStringLiteral("source"), m_reflectionSource.isEmpty() ? QStringLiteral("manual") : m_reflectionSource}};
+    const QByteArray line = QJsonDocument(o).toJson(QJsonDocument::Compact) + '\n';
+    return f.write(line) == line.size();
 }
 
 }  // namespace studio

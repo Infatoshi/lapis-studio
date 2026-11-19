@@ -138,8 +138,34 @@ QString tailWords(const QString &s, int maxWords);
 // Human-interest filter: the request asking the fast model to keep only what matches the human's
 // direction (goal), pinned params / terms and what they are inspecting right now (recent actions),
 // dropping boilerplate and routine steps, and to say whether a chart or summary text fits better.
+// tasteRules: the human's saved standing rules (session_reviews.jsonl), listed for the model.
 QByteArray buildFilterPrompt(const QString &model, const QString &goal, const QVariantList &params,
-                             const QStringList &recentActions, const QString &latestTurn);
+                             const QStringList &recentActions, const QString &latestTurn,
+                             const QStringList &tasteRules = {});
+
+// Visual-first Stage deck: every non-diff artifact (chart, table, image, pdf, media, summary, ...)
+// keeps its extracted order and leads; diffs follow only when showDiffs (the Code pill), else the
+// deck drops them. The backend indexes artifacts in this same order (contextSlice, asks).
+QVariantList stageArtifacts(const QVariantList &artifacts, bool showDiffs);
+// A project that waits on the human (the Needs Me filter): needs-ok / waiting / gate status, or
+// the agent's last turn is a question for them.
+bool projectNeedsMe(const QString &status, bool blocker);
+
+// End-of-session reflection: original intent vs what matched, the human's corrections, and 1-3
+// personal taste rules to keep.
+struct SessionReflection {
+    QString intent;
+    QString corrections;
+    QStringList rules;
+    bool isEmpty() const { return intent.isEmpty() && corrections.isEmpty() && rules.isEmpty(); }
+};
+// Local fallback (mock / offline): from each non-redacted project's goal, latest step and the
+// user turns that steer or correct the agent. Takes [{name, goal, last, userTurns: [..]}].
+SessionReflection localReflection(const QVariantList &sessions);
+// Parses "INTENT: ... / CORRECTIONS: ... / RULES: - ..." (tolerant of case and stray markdown).
+SessionReflection parseReflectionReply(const QString &reply);
+// A user turn that steers or corrects the agent ("no, lead with the chart", "don't ...").
+bool isSteerTurn(const QString &text);
 struct HumanFilterReply {
     QString stateLine;  // one plain-English line, what matters now
     QString summary;    // key points, one per line, no bullets
@@ -219,6 +245,17 @@ class Backend : public QObject {
     Q_PROPERTY(QVariantList briefing READ briefing NOTIFY briefingChanged)
     Q_PROPERTY(bool briefingBusy READ briefingBusy NOTIFY briefingChanged)
     Q_PROPERTY(QString briefingSource READ briefingSource NOTIFY briefingChanged)
+    // Visual-first Stage: diffs stay out of the deck unless the Code pill (or Settings) turns them on.
+    Q_PROPERTY(bool showCodeDiffs READ showCodeDiffs WRITE setShowCodeDiffs NOTIFY prefsChanged)
+    // Freeform Constellation: {projectKey: {x, y}}, the card centre as a fraction (0..1) of the
+    // Constellation's width / height. Projects without an entry keep their auto-layout slot.
+    Q_PROPERTY(QVariantMap cardPositions READ cardPositions NOTIFY cardPositionsChanged)
+    // End-of-session reflection: {intent, corrections, rules: [..]} plus where it came from.
+    Q_PROPERTY(QVariantMap reflection READ reflection NOTIFY reflectionChanged)
+    Q_PROPERTY(bool reflectionBusy READ reflectionBusy NOTIFY reflectionChanged)
+    Q_PROPERTY(QString reflectionSource READ reflectionSource NOTIFY reflectionChanged)
+    // Saved taste rules (rating > 0), newest last; they ride along in the fast-model filter prompt.
+    Q_PROPERTY(QStringList tasteRules READ tasteRules NOTIFY tasteRulesChanged)
 
 public:
     enum class Mode { Live, Mock };
@@ -317,6 +354,25 @@ public:
     bool briefingBusy() const { return m_briefingReply != nullptr; }
     QString briefingSource() const { return m_briefingSource; }
     Q_INVOKABLE void requestBriefing();
+    bool showCodeDiffs() const { return m_showCodeDiffs; }
+    void setShowCodeDiffs(bool on);
+    QVariantMap cardPositions() const { return m_cardPositions; }
+    // x, y: the card centre as a fraction of the Constellation (clamped to 0..1). Persisted.
+    Q_INVOKABLE void setCardPosition(const QString &projectKey, double x, double y);
+    Q_INVOKABLE void resetCardPositions();
+    // Session reflection: local lines land at once; with an OpenAI-compatible endpoint and a
+    // router, one "reflection:1" stream to the fast model (qwen3.8-flash-next) rewrites them.
+    QVariantMap reflection() const;
+    bool reflectionBusy() const { return m_reflectionBusy; }
+    QString reflectionSource() const { return m_reflectionSource; }
+    Q_INVOKABLE void runSessionReflection();
+    // Appends {ts, rule, rating} to session_reviews.jsonl; rating > 0 keeps the rule in force,
+    // rating <= 0 retires it. True when the line was written (false with no reviews path).
+    Q_INVOKABLE bool saveTasteRule(const QString &rule, int rating = 1);
+    QStringList tasteRules() const { return m_tasteRules; }
+    static QString defaultReviewsPath();
+    QString reviewsPath() const { return m_reviewsPath; }
+    void setReviewsPath(const QString &path);  // loads saved rules from it; empty: memory only
     // Live only, with an OpenAI-compatible endpoint: qwen3.8-flash-next distills the project's
     // latest turn down to what the human cares about and updates its summary / stateLine.
     // Async, one request in flight; repeats for the same project + transcript mtime are dropped.
@@ -438,6 +494,9 @@ signals:
     void prefsChanged();
     void suggestionChanged();
     void briefingChanged();
+    void cardPositionsChanged();
+    void reflectionChanged();
+    void tasteRulesChanged();
     void phononTailChanged();
     void sessionStarted(const QString &projectKey);
     void quickTick();
@@ -591,6 +650,16 @@ private:
     QString compatEndpoint() const;             // "" when no OpenAI-compatible URL is configured
     QVariantList m_briefing;
     QString m_briefingSource;
+    bool m_showCodeDiffs = false;
+    QVariantMap m_cardPositions;
+    SessionReflection m_reflection;
+    QString m_reflectionSource;
+    QString m_reflectionRaw;  // the streamed model reply so far
+    bool m_reflectionBusy = false;
+    QStringList m_tasteRules;
+    QString m_reviewsPath;
+    void loadTasteRules();
+    QVariantList reflectionSessions() const;  // localReflection() input, redacted projects left out
     QSet<QString> m_pinnedMetrics;
     QString m_activeCategory;
     QString m_phononTail;

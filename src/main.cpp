@@ -7,6 +7,9 @@
 //   lapis_studio --bench-fps [--metal [DIR]]  frame-time profiler; --metal: QQuickRenderControl on Metal, 240 Hz
 //   lapis_studio --record-demo OUT   deterministic 44 s 1920x1080 60 fps demo (mock backend)
 //   lapis_studio --probe-chat MODEL [EFFORT [Q]]  two real asks through one persistent daemon, no window
+//   lapis_studio --snap-omnibar OUT.png  offscreen dark frame: Stage + hovered cell + floating ask card
+//   lapis_studio --snap-review OUT.png   offscreen dark frames: session review card, plus
+//                                        OUT-constellation.png (dragged card, Needs Me) and OUT-stage.png
 //   lapis_studio --harness codex     quick asks (Enter) go to a warm codex app-server instead of claude
 //
 // A PS4 DualShock 4 (GameController.framework) drives every lens in the interactive window only;
@@ -37,6 +40,8 @@ int main(int argc, char **argv)
     QString probeShots;
     QString smokeShots;
     QString demoOut;
+    QString snapOut;
+    QString reviewOut;
     QString quickHarness = QStringLiteral("claude");
     QString chatModel;
     QString chatEffort = QStringLiteral("low");
@@ -74,14 +79,27 @@ int main(int argc, char **argv)
                 chatEffort = QString::fromLocal8Bit(argv[++i]);
             if (i + 1 < argc && argv[i + 1][0] != '-')
                 chatQuestion = QString::fromLocal8Bit(argv[++i]);
+        } else if (std::strcmp(argv[i], "--snap-omnibar") == 0) {
+            if (i + 1 >= argc) {
+                std::fprintf(stderr, "--snap-omnibar needs an output .png path\n");
+                return 64;
+            }
+            snapOut = QString::fromLocal8Bit(argv[++i]);
+        } else if (std::strcmp(argv[i], "--snap-review") == 0) {
+            if (i + 1 >= argc) {
+                std::fprintf(stderr, "--snap-review needs an output .png path\n");
+                return 64;
+            }
+            reviewOut = QString::fromLocal8Bit(argv[++i]);
         } else if (std::strcmp(argv[i], "--harness") == 0 && i + 1 < argc) {
             quickHarness = QString::fromLocal8Bit(argv[++i]);
         } else if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
-            std::printf("usage: lapis_studio [--harness claude|codex] [--test | --smoke-offscreen [DIR] | --probe-live | --probe-chat MODEL [EFFORT] | --bench-fps [--metal [DIR]] | --record-demo OUT.mp4]\n");
+            std::printf("usage: lapis_studio [--harness claude|codex] [--test | --smoke-offscreen [DIR] | --probe-live | --probe-chat MODEL [EFFORT] | --bench-fps [--metal [DIR]] | --record-demo OUT.mp4 | --snap-omnibar OUT.png | --snap-review OUT.png]\n");
             return 0;
         }
     }
-    const bool offscreen = test || smoke || probe || bench || !demoOut.isEmpty() || !chatModel.isEmpty();
+    const bool offscreen = test || smoke || probe || bench || !demoOut.isEmpty() || !chatModel.isEmpty()
+                           || !snapOut.isEmpty() || !reviewOut.isEmpty();
     const bool metalBench = bench && metal;
     if (offscreen) {
         // Never open a visible window while building or testing on the host Mac.
@@ -126,11 +144,16 @@ int main(int argc, char **argv)
         return studio::probeChat(chatModel, chatEffort, chatQuestion);
     if (!demoOut.isEmpty())
         return studio::recordDemo(demoOut);
+    if (!snapOut.isEmpty())
+        return studio::snapOmnibar(snapOut);
+    if (!reviewOut.isEmpty())
+        return studio::snapReview(reviewOut);
 
     studio::Backend backend(studio::Backend::Mode::Live);
     backend.setQuickHarness(quickHarness);  // before the helpers warm up 0.4 s from now
     // Only the real window reads or writes prefs; every offscreen mode keeps them in memory.
     backend.setPrefsPath(studio::Backend::defaultPrefsPath());
+    backend.setReviewsPath(studio::Backend::defaultReviewsPath());  // saved taste rules feed the filter
     // The only place GameController.framework is ever touched: offscreen modes return above.
     backend.gamepad()->setEnabled(true);
     QQmlApplicationEngine engine;

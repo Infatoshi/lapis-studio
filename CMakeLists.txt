@@ -106,6 +106,7 @@ qt_add_qml_module(lapis_studio
     qml/ControllerMapOverlay.qml
     qml/OnboardingModal.qml
     qml/MorningBriefingOverlay.qml
+    qml/SessionReviewOverlay.qml
     qml/FloatingOmnibar.qml
 )
 

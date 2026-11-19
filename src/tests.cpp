@@ -51,6 +51,9 @@ void check(bool ok, const char *name, const QString &detail = QString())
 
 bool noFiles(const QString &) { return false; }
 
+// Defined with the omnibar helpers below; the Stage tests click the Code pill.
+void mouseClick(QQuickWindow *w, QPointF p, Qt::MouseButton b, Qt::KeyboardModifiers mods);
+
 QVariantMap firstOfKind(const QVariantList &arts, const QString &kind)
 {
     for (const QVariant &v : arts)
@@ -2002,11 +2005,22 @@ void uiTests()
     }
     check(forbiddenPixels(win->grabWindow()) == 0, "ui: filled ladder has zero blue/green pixels");
 
-    // Stage across chart -> diff -> table -> pdf.
+    // Stage across chart -> table -> pdf: visual first, the session's diff stays out of the deck.
     sendKey(win, Qt::Key_3, Qt::ControlModifier);
     settle(350);
-    const char *viewers[4] = {"chartView", "diffView", "tableView", "pdfView"};
-    for (int i = 0; i < 4; ++i) {
+    {
+        QStringList kinds;
+        for (const QVariant &v : app->property("artifacts").toList())
+            kinds << v.toMap().value("kind").toString();
+        const QVariantMap pm = backend.projects().value(backend.projectIndex("fp4-decode")).toMap();
+        check(!backend.showCodeDiffs() && kinds == QStringList({"chart", "table", "pdf"}) && pm.value("diffCount").toInt() == 1,
+              "visual-first: showCodeDiffs defaults off; the default deck is chart, table, pdf (diff hidden)", kinds.join(','));
+        QQuickItem *pill = firstItem(win, "codePill");
+        check(pill && pill->isVisible(), "visual-first: a Code pill sits in the Stage header when the project has diffs");
+        check(!firstItem(win, "diffView") || !firstItem(win, "diffView")->isVisible(), "visual-first: no diff on the default slide");
+    }
+    const char *viewers[3] = {"chartView", "tableView", "pdfView"};
+    for (int i = 0; i < 3; ++i) {
         if (i > 0) {
             sendKey(win, Qt::Key_Right);
             // Mid-slide: the outgoing pane leaves left while the incoming one arrives from the right.
@@ -2039,7 +2053,7 @@ void uiTests()
         const QImage shot = win->grabWindow();
         check(forbiddenPixels(shot) == 0, "ui: viewer has zero blue/green pixels",
               QStringLiteral("%1: %2").arg(viewers[i]).arg(forbiddenPixels(shot)));
-        if (i == 2) {
+        if (i == 1) {
             sendKey(win, Qt::Key_Down);
             sendKey(win, Qt::Key_Down);
             settle(300);
@@ -2101,8 +2115,26 @@ void uiTests()
         check(app->property("lens").toInt() == 2 && idx() == i0, "nav: back on the same Stage artifact");
     }
 
-    // Tab predictor on the Stage: rings the next artifact's pager dot ("View Diff" after a chart)
-    // and Tab steps there; once everything is seen it suggests a prompt instead.
+    // The Code pill: clicking it turns diffs on and lands on the first one (after the visuals).
+    {
+        auto idx = [&] { return app->property("artifactIndex").toInt(); };
+        QQuickItem *pill = firstItem(win, "codePill");
+        if (pill)
+            mouseClick(win, pill->mapToScene(QPointF(pill->width() / 2, pill->height() / 2)), Qt::LeftButton, {});
+        settle(450);
+        QStringList kinds;
+        for (const QVariant &v : app->property("artifacts").toList())
+            kinds << v.toMap().value("kind").toString();
+        check(backend.showCodeDiffs() && kinds == QStringList({"chart", "table", "pdf", "diff"}),
+              "visual-first: the Code pill appends the diff after the visuals", kinds.join(','));
+        check(idx() == 3 && firstItem(win, "diffView") && firstItem(win, "diffView")->isVisible(),
+              "visual-first: the Code pill lands on the diff", QString::number(idx()));
+        check(backend.contextSlice("fp4-decode", 3).contains("diff"), "visual-first: asks index the deck the user sees",
+              backend.contextSlice("fp4-decode", 3).left(80));
+    }
+
+    // Tab predictor on the Stage (diffs on): rings the next artifact's pager dot ("View Diff"
+    // after a chart) and Tab steps there; once everything is seen it suggests a prompt instead.
     {
         auto idx = [&] { return app->property("artifactIndex").toInt(); };
         QMetaObject::invokeMethod(app, "takeFocus");
@@ -2113,7 +2145,7 @@ void uiTests()
         const QVariantList arts = app->property("artifacts").toList();
         const QVariantMap p = app->property("predictedAction").toMap();
         check(arts.value(0).toMap().value("kind").toString() == "chart" && p.value("label").toString() == "View Diff"
-                  && p.value("targetId").toString() == "pager:1",
+                  && p.value("targetId").toString() == "pager:3",
               "predictor: a chart predicts its diff", p.value("label").toString() + " " + p.value("targetId").toString());
         QQuickItem *ring = firstItem(win, "predictorRingShape");
         check(ring && ring->isVisible() && qAbs(ring->width() - ring->height()) < 0.5 && ring->property("radius").toReal() > ring->width() / 2 - 0.5,
@@ -2122,7 +2154,7 @@ void uiTests()
         check(textOverlaps(win, &pairs) == 0, "predictor: Stage badge overlaps no text", pairs.join("; "));
         sendKey(win, Qt::Key_Tab);
         settle(400);
-        check(idx() == 1 && firstItem(win, "diffView") && firstItem(win, "diffView")->isVisible(),
+        check(idx() == 3 && firstItem(win, "diffView") && firstItem(win, "diffView")->isVisible(),
               "predictor: Tab executes View Diff", QString::number(idx()));
         for (int i = 0; i < 6 && app->property("predictedAction").toMap().value("actionKind").toString() == "artifact"; ++i) {
             sendKey(win, Qt::Key_Tab);
@@ -2773,6 +2805,8 @@ void gamepadUiTests()
     check(prop(app, "lens").toInt() == 0, "pad ui: ○ zooms back out");
 
     // A kickoff session (mock) yields chart, diff, table, pdf: ✕ on its Ladder enters the Stage.
+    // The pad walks every viewer, the diff included, so code diffs are on for this run.
+    backend.setShowCodeDiffs(true);
     backend.startSession(QStringLiteral("~/dev"), QStringLiteral("claude"),
                          backend.harnessModels().value("claude").toList().value(0).toString(),
                          QStringLiteral("profile fp4 kv-cache decode on sm120"));
@@ -3758,7 +3792,475 @@ void formFactorTests()
     }
 }
 
+// --- Phase 3: spatial cards, visual-first Stage, Needs Me, session review ----------------------
+
+QString firstSessionId(const Backend &b, const QString &key)
+{
+    const QVariantMap p = b.projects().value(b.projectIndex(key)).toMap();
+    return p.value("sessions").toList().value(0).toMap().value("id").toString();
+}
+
+// One island waiting on the human (phonon goes needs-ok over the board) and two user steers on
+// lapis, so the Needs Me pill counts something and the review has rules to offer.
+void seedPhase3Scene(Backend &b)
+{
+    b.applyBoard({BoardRow{firstSessionId(b, "phonon"), QStringLiteral("needs-ok"), QString()}});
+    Turn steer;
+    steer.role = QStringLiteral("user");
+    steer.text = QStringLiteral("No, don't lead with the diff. Show the frame-time chart first.");
+    b.mockAppendTurn("lapis", steer);
+    Turn reply;
+    reply.role = QStringLiteral("assistant");
+    reply.text = QStringLiteral("Moved the chart to the front; the diff now sits behind the Code pill.");
+    b.mockAppendTurn("lapis", reply);
+    steer.text = QStringLiteral("Actually, keep the cards calm: one line each, never a terminal log.");
+    b.mockAppendTurn("lapis", steer);
+}
+
+int needsMeCount(const Backend &b)
+{
+    int n = 0;
+    for (const QVariant &v : b.projects())
+        n += v.toMap().value("needsMe").toBool() ? 1 : 0;
+    return n;
+}
+
+void phase3UnitTests()
+{
+    // Visual-first deck: non-diffs keep their order and lead; diffs follow only on request.
+    {
+        auto art = [](const char *k) { return QVariant(QVariantMap{{"kind", QString::fromLatin1(k)}, {"title", QString::fromLatin1(k)}}); };
+        const QVariantList arts{art("diff"), art("chart"), art("summary"), art("diff"), art("table"), art("image"), art("pdf")};
+        auto kinds = [](const QVariantList &l) {
+            QStringList out;
+            for (const QVariant &v : l)
+                out << v.toMap().value("kind").toString();
+            return out.join(',');
+        };
+        check(kinds(stageArtifacts(arts, false)) == "chart,summary,table,image,pdf", "visual-first: diffs dropped by default",
+              kinds(stageArtifacts(arts, false)));
+        check(kinds(stageArtifacts(arts, true)) == "chart,summary,table,image,pdf,diff,diff",
+              "visual-first: Code on appends diffs after every visual", kinds(stageArtifacts(arts, true)));
+        Backend b(Backend::Mode::Mock);
+        check(!b.showCodeDiffs(), "visual-first: showCodeDiffs defaults to false");
+        bool anyDiff = false;
+        for (const QVariant &v : b.projects())
+            for (const QVariant &a : v.toMap().value("artifacts").toList())
+                anyDiff = anyDiff || a.toMap().value("kind").toString() == "diff";
+        check(!anyDiff, "visual-first: no mock project publishes a diff on its default deck");
+    }
+
+    // Needs Me: needs-ok / waiting / gate statuses or a blocker question.
+    {
+        check(projectNeedsMe("needs-ok", false) && projectNeedsMe("waiting", false) && projectNeedsMe("gate", false)
+                  && projectNeedsMe("idle", true) && !projectNeedsMe("working", false) && !projectNeedsMe("finished", false),
+              "needs me: needs-ok / waiting / gate / blocker, not working or finished");
+        Backend b(Backend::Mode::Mock);
+        const int before = needsMeCount(b);
+        b.applyBoard({BoardRow{firstSessionId(b, "phonon"), QStringLiteral("needs-ok"), QString()}});
+        const QVariantMap ph = b.projects().value(b.projectIndex("phonon")).toMap();
+        check(ph.value("needsMe").toBool() && needsMeCount(b) == before + 1, "needs me: a needs-ok board status flags the island",
+              QStringLiteral("%1 -> %2").arg(before).arg(needsMeCount(b)));
+    }
+
+    // Card positions and showCodeDiffs persist in studio_prefs.json.
+    {
+        QTemporaryDir tmp;
+        const QString path = tmp.path() + "/studio_prefs.json";
+        {
+            Backend w(Backend::Mode::Mock);
+            w.setPrefsPath(path);
+            w.setCardPosition("phonon", 0.31, 0.62);
+            w.setCardPosition("lapis", 1.7, -0.2);  // clamped into 0..1
+            w.setShowCodeDiffs(true);
+            check(w.savePrefs(), "cards: prefs save");
+        }
+        {
+            Backend r(Backend::Mode::Mock);
+            r.setPrefsPath(path);
+            const QVariantMap ph = r.cardPositions().value("phonon").toMap();
+            const QVariantMap la = r.cardPositions().value("lapis").toMap();
+            check(qAbs(ph.value("x").toDouble() - 0.31) < 1e-9 && qAbs(ph.value("y").toDouble() - 0.62) < 1e-9,
+                  "cards: a dragged position survives a restart", QStringLiteral("%1,%2").arg(ph.value("x").toDouble()).arg(ph.value("y").toDouble()));
+            check(la.value("x").toDouble() == 1.0 && la.value("y").toDouble() == 0.0, "cards: positions clamp to 0..1");
+            check(r.showCodeDiffs(), "visual-first: showCodeDiffs round-trips through studio_prefs.json");
+            QFile f(path);
+            const bool opened = f.open(QIODevice::ReadOnly);
+            const QJsonObject o = QJsonDocument::fromJson(opened ? f.readAll() : QByteArray()).object();
+            check(o.value("cardPositions").toObject().value("phonon").toObject().value("x").toDouble() == 0.31,
+                  "cards: stored as cardPositions {key: {x, y}}");
+            r.resetCardPositions();
+            check(r.cardPositions().isEmpty() && r.savePrefs(), "cards: reset clears every position");
+        }
+        {
+            Backend r(Backend::Mode::Mock);
+            r.setPrefsPath(path);
+            check(r.cardPositions().isEmpty(), "cards: the reset persists");
+        }
+    }
+
+    // Taste rules: JSONL round trip, newest rating wins, and they reach the filter prompt.
+    {
+        const QFileInfo realReviews(Backend::defaultReviewsPath());
+        const qint64 realBefore = realReviews.exists() ? realReviews.lastModified().toMSecsSinceEpoch() : -1;
+        {
+            Backend m(Backend::Mode::Mock);
+            check(m.reviewsPath().isEmpty() && !m.saveTasteRule("Lead with the chart.", 1) && m.tasteRules() == QStringList{"Lead with the chart."},
+                  "taste: mock with no reviews path keeps the rule in memory, writes nothing");
+        }
+        const QFileInfo realAfter(Backend::defaultReviewsPath());
+        check((realAfter.exists() ? realAfter.lastModified().toMSecsSinceEpoch() : -1) == realBefore,
+              "taste: tests never touch ~/.lapis-next/session_reviews.jsonl");
+
+        QTemporaryDir tmp;
+        const QString path = tmp.path() + "/sub/session_reviews.jsonl";
+        {
+            Backend w(Backend::Mode::Mock);
+            w.setReviewsPath(path);
+            check(w.saveTasteRule("Lead with the chart, never the diff.", 1), "taste: saveTasteRule writes a line");
+            check(w.saveTasteRule("Show terminal logs on cards.", 1) && w.saveTasteRule("show terminal logs on cards.", -1),
+                  "taste: a later rating <= 0 retires a rule");
+            check(w.tasteRules() == QStringList{"Lead with the chart, never the diff."}, "taste: in-memory rules follow ratings",
+                  w.tasteRules().join(" | "));
+        }
+        QFile f(path);
+        QStringList lines;
+        if (f.open(QIODevice::ReadOnly))
+            lines = QString::fromUtf8(f.readAll()).split('\n', Qt::SkipEmptyParts);
+        bool wellFormed = lines.size() == 3;
+        for (const QString &l : lines) {
+            const QJsonObject o = QJsonDocument::fromJson(l.toUtf8()).object();
+            wellFormed = wellFormed && !o.value("rule").toString().isEmpty() && o.value("rating").isDouble()
+                         && QDateTime::fromString(o.value("ts").toString(), Qt::ISODate).isValid();
+        }
+        check(wellFormed, "taste: three JSONL lines of {ts, rule, rating}", lines.join(" // "));
+        check((QFileInfo(path).permissions() & (QFileDevice::ReadGroup | QFileDevice::ReadOther)) == 0,
+              "taste: session_reviews.jsonl is owner-only");
+        Backend r(Backend::Mode::Mock);
+        r.setReviewsPath(path);
+        check(r.tasteRules() == QStringList{"Lead with the chart, never the diff."}, "taste: rules load on startup",
+              r.tasteRules().join(" | "));
+        const QByteArray prompt = buildFilterPrompt("qwen3.8-flash-next", "goal", {}, {}, "turn", r.tasteRules());
+        check(prompt.contains("standing taste rules") && prompt.contains("Lead with the chart, never the diff."),
+              "taste: saved rules ride in the fast-model filter prompt");
+        check(!buildFilterPrompt("m", "goal", {}, {}, "turn").contains("taste rules"), "taste: no rules, no section");
+    }
+
+    // Reflection: parsing, the local fallback, and one reflection:1 stream through LlmRouter.
+    {
+        const SessionReflection p = parseReflectionReply(
+            "**INTENT:** Wanted a calm canvas; got it once diffs moved behind a pill.\n"
+            "CORRECTIONS: twice steered away from diffs and logs\n"
+            "RULES:\n- Lead with results, never code.\n2. Keep cards to one line.\n- Ask before restarting the app.\n- A fourth one.");
+        check(p.intent.startsWith("Wanted a calm canvas") && p.corrections.startsWith("twice steered") && p.rules.size() == 3
+                  && p.rules.value(1) == "Keep cards to one line.",
+              "reflection: parses INTENT / CORRECTIONS / RULES (<= 3)", p.rules.join(" | "));
+        check(isSteerTurn("No, don't lead with the diff.") && isSteerTurn("Actually, use the other tile")
+                  && !isSteerTurn("Profile the decode kernel on sm120"),
+              "reflection: steers are corrections, not fresh requests");
+
+        Backend b(Backend::Mode::Mock);
+        seedPhase3Scene(b);
+        b.runSessionReflection();
+        const QVariantMap r = b.reflection();
+        const QStringList rules = r.value("rules").toStringList();
+        check(!b.reflectionBusy() && b.reflectionSource() == "local" && !r.value("intent").toString().isEmpty(),
+              "reflection: offline -> clean local lines at once", r.value("intent").toString());
+        check(rules.contains("Don't lead with the diff.") && rules.contains("Keep the cards calm: one line each, never a terminal log."),
+              "reflection: local rules come from the human's steers", rules.join(" | "));
+        check(r.value("corrections").toString().contains("lead with the diff"), "reflection: steers are quoted",
+              r.value("corrections").toString());
+        check(b.spawnCount() == 0, "reflection: no processes spawned");
+
+        FakeSse sse;
+        LlmRouter router;
+        if (sse.start()) {
+            b.setLlmRouter(&router);
+            b.setOpenaiCompatUrl(sse.url());
+            sse.answer = QStringLiteral("INTENT: Set out to calm the canvas; matched once diffs hid behind Code.\n"
+                                        "CORRECTIONS: Steered away from diffs first and from logs on cards.\n"
+                                        "RULES:\n- Lead with results; code only on request.\n- One calm line per card.");
+            b.runSessionReflection();
+            check(b.reflectionBusy() && b.reflectionSource() == "local", "reflection: local lines while the model streams");
+            waitUntil([&] { return !b.reflectionBusy(); }, 5000);
+            const QStringList mr = b.reflection().value("rules").toStringList();
+            check(b.reflectionSource() == "qwen3.8-flash-next" && mr == QStringList{"Lead with results; code only on request.", "One calm line per card."},
+                  "reflection: one reflection:1 stream to qwen3.8-flash-next rewrites the card",
+                  b.reflectionSource() + " " + mr.join(" | "));
+            const QByteArray body = sse.bodies.value(sse.bodies.size() - 1);
+            check(body.contains("qwen3.8-flash-next") && body.contains("Reflect on this session") && body.contains("lead with the diff"),
+                  "reflection: the request carries the session's turns");
+            b.setLlmRouter(nullptr);
+        } else {
+            check(false, "reflection: fake SSE endpoint listens");
+        }
+    }
+}
+
+void phase3UiTests()
+{
+    Backend backend(Backend::Mode::Mock);
+    QTemporaryDir tmp;
+    backend.setPrefsPath(tmp.path() + "/studio_prefs.json");
+    backend.completeOnboarding("controller");  // a fresh prefs file would raise the first-launch modal
+    backend.setReviewsPath(tmp.path() + "/session_reviews.jsonl");
+    QQmlApplicationEngine engine;
+    QQuickWindow *win = createStudioWindow(engine, &backend, false, QSize(1920, 1080));
+    check(win != nullptr, "p3 ui: QML loads");
+    if (!win)
+        return;
+    QObject *app = win->findChild<QObject *>("studioApp");
+    if (!app)
+        return;
+    settle(450);
+    seedPhase3Scene(backend);
+    settle(200);
+    auto islands = [&] {
+        QList<QQuickItem *> out;
+        for (QQuickItem *it : findItems(win->contentItem(), "island"))
+            if (it->isVisible() && it->property("draggable").toBool())  // not the zoom morph's copy
+                out << it;
+        return out;
+    };
+    auto pillText = [&](const char *name) {
+        QQuickItem *p = firstItem(win, name);
+        const auto t = p ? findItems(p, "barPillText") : QList<QQuickItem *>();
+        return t.isEmpty() ? QString() : t.first()->property("text").toString();
+    };
+
+    // Needs Me: the pill counts, Cmd+2 filters to it, Cmd+1 brings every island back.
+    const int needs = needsMeCount(backend);
+    check(needs >= 1 && pillText("filterNeedsMe") == QStringLiteral("Needs Me (%1)").arg(needs) && pillText("filterAll") == "All",
+          "needs me: top bar shows All · Needs Me (N)", pillText("filterNeedsMe"));
+    const int all = int(islands().size());
+    sendKey(win, Qt::Key_2, Qt::ControlModifier);
+    settle(300);
+    check(app->property("lens").toInt() == 0 && app->property("islandFilter").toString() == "needs" && islands().size() == needs,
+          "needs me: Cmd+2 on the Constellation shows only islands that need you",
+          QStringLiteral("%1 of %2").arg(islands().size()).arg(all));
+    bool allNeed = true;
+    for (QQuickItem *it : islands())
+        allNeed = allNeed && it->property("proj").toMap().value("needsMe").toBool();
+    check(allNeed, "needs me: every island left on screen needs the human");
+    {
+        const int sel = app->property("selectedIsland").toInt();
+        check(backend.projects().value(sel).toMap().value("needsMe").toBool(), "needs me: the selection moves onto a shown island");
+        const QImage shot = win->grabWindow();
+        QStringList pairs;
+        check(forbiddenPixels(shot) == 0 && textOverlaps(win, &pairs) == 0, "needs me: filtered view clean (palette, overlaps)",
+              pairs.join("; "));
+    }
+    sendKey(win, Qt::Key_1, Qt::ControlModifier);
+    settle(300);
+    check(app->property("islandFilter").toString() == "all" && islands().size() == all, "needs me: Cmd+1 shows All again",
+          QString::number(islands().size()));
+    if (QQuickItem *p = firstItem(win, "filterNeedsMe")) {
+        mouseClick(win, p->mapToScene(QPointF(p->width() / 2, p->height() / 2)), Qt::LeftButton, {});
+        settle(200);
+        check(app->property("islandFilter").toString() == "needs", "needs me: clicking the pill filters too");
+        sendKey(win, Qt::Key_1, Qt::ControlModifier);
+        settle(250);
+    }
+
+    // Freeform drag: transform-only while moving, committed once on release, persisted.
+    QList<QQuickItem *> isl = islands();
+    QQuickItem *card = isl.value(0);
+    check(card != nullptr, "cards: an island to drag");
+    if (!card)
+        return;
+    const QString key = card->property("proj").toMap().value("key").toString();
+    const QPointF xy0(card->x(), card->y());
+    const QPointF from = card->mapToScene(QPointF(card->width() / 2, card->height() / 2));
+    const QPointF delta(260, 90);
+    // Mid-drag: the card rides its Translate while x / y (the layout) stay put.
+    mouseMove(win, from);
+    mouseButton(win, QEvent::MouseButtonPress, from, Qt::LeftButton);
+    for (int i = 1; i <= 12; ++i) {
+        mouseMove(win, from + delta * (i / 24.0), Qt::LeftButton);
+        QCoreApplication::processEvents();
+    }
+    check(qAbs(card->x() - xy0.x()) < 0.01 && qAbs(card->property("dragDx").toReal() - delta.x() / 2) < 0.5
+              && !firstItem(win, "focusRing")->isVisible(),
+          "cards: mid-drag moves by transform only (no relayout, ring hidden)",
+          QStringLiteral("x %1 dragDx %2").arg(card->x()).arg(card->property("dragDx").toReal()));
+    for (int i = 13; i <= 24; ++i) {
+        mouseMove(win, from + delta * (i / 24.0), Qt::LeftButton);
+        QCoreApplication::processEvents();
+    }
+    mouseButton(win, QEvent::MouseButtonRelease, from + delta, Qt::LeftButton);
+    settle(120);
+    check(app->property("lens").toInt() == 0, "cards: a drag never opens the island");
+    check(backend.cardPositions().contains(key), "cards: release commits the position", key);
+    check(qAbs(card->x() - (xy0.x() + delta.x())) < 1 && qAbs(card->y() - (xy0.y() + delta.y())) < 1
+              && card->property("dragDx").toReal() == 0,
+          "cards: the island rests where it was dropped",
+          QStringLiteral("%1,%2 -> %3,%4").arg(xy0.x()).arg(xy0.y()).arg(card->x()).arg(card->y()));
+    QQuickItem *reset = firstItem(win, "resetLayoutPill");
+    check(reset && reset->isVisible(), "cards: a Reset layout pill appears once a card moved");
+    {
+        const QImage shot = win->grabWindow();
+        QStringList pairs;
+        check(forbiddenPixels(shot) == 0 && textOverlaps(win, &pairs) == 0, "cards: dragged layout clean (palette, overlaps)",
+              pairs.join("; "));
+    }
+    check(backend.savePrefs(), "cards: prefs flush");
+    {
+        Backend r(Backend::Mode::Mock);
+        r.setPrefsPath(backend.prefsPath());
+        check(r.cardPositions().value(key) == backend.cardPositions().value(key), "cards: the dragged position reloads");
+    }
+    // Background updates never shuffle cards: a fresh turn elsewhere leaves this card put.
+    {
+        Turn t;
+        t.role = QStringLiteral("assistant");
+        t.text = QStringLiteral("Loss settles at 2.39.");
+        backend.mockAppendTurn("yoctogpt", t);
+        settle(120);
+        check(qAbs(card->x() - (xy0.x() + delta.x())) < 1, "cards: background updates leave the dragged card put");
+    }
+    // Cmd+0 snaps back to the auto-layout.
+    sendKey(win, Qt::Key_0, Qt::ControlModifier);
+    settle(200);
+    check(backend.cardPositions().isEmpty() && qAbs(card->x() - xy0.x()) < 0.5 && qAbs(card->y() - xy0.y()) < 0.5
+              && !(reset && reset->isVisible()),
+          "cards: Cmd+0 snaps back to auto-layout", QStringLiteral("%1,%2").arg(card->x()).arg(card->y()));
+
+    // Session review: Cmd+Shift+R, local lines at once, Enter saves the selected rule.
+    QQuickItem *review = firstItem(win, "sessionReview");
+    sendKey(win, Qt::Key_R, Qt::ControlModifier | Qt::ShiftModifier);
+    settle(300);
+    check(review && review->property("open").toBool() && firstItem(win, "reviewCard")->isVisible(),
+          "review: Cmd+Shift+R opens the session review");
+    check(!firstItem(win, "reviewIntent")->property("text").toString().isEmpty() && visibleCount(win, "reviewRule") >= 1,
+          "review: intent and rules shown", QString::number(visibleCount(win, "reviewRule")));
+    {
+        const QImage shot = win->grabWindow();
+        // Overlaps inside the card only: the Constellation shows faintly through the 0.88 dim.
+        QStringList pairs;
+        QList<QPair<QRectF, QString>> boxes;
+        std::function<void(QQuickItem *)> walk = [&](QQuickItem *it) {
+            if (!it->isVisible() || it->opacity() < 0.01)
+                return;
+            if (it->inherits("QQuickText") && !it->property("text").toString().trimmed().isEmpty()) {
+                const QRectF r(it->mapToScene(QPointF(0, 0)),
+                               QSizeF(std::min(it->width(), it->property("contentWidth").toReal()), it->property("contentHeight").toReal()));
+                for (const auto &b : std::as_const(boxes))
+                    if (b.first.intersects(r))
+                        pairs << b.second + " x " + it->property("text").toString().left(24);
+                boxes << qMakePair(r, it->property("text").toString().left(24));
+            }
+            for (QQuickItem *c : it->childItems())
+                walk(c);
+        };
+        if (QQuickItem *rc = firstItem(win, "reviewCard"))
+            walk(rc);
+        check(forbiddenPixels(shot) == 0 && pairs.isEmpty() && boxes.size() >= 5, "review: card clean (palette, overlaps)",
+              pairs.join("; "));
+        QStringList texts;
+        visibleWords(win, &texts);
+        const QString joined = texts.join('\n');
+        check(!joined.contains("+++") && !joined.contains("@@") && !joined.contains("$ "), "review: no diffs or terminal logs");
+    }
+    const QString rule0 = review ? review->property("rules").toStringList().value(0) : QString();
+    sendKey(win, Qt::Key_Return);
+    settle(100);
+    QQuickItem *saveText = firstItem(win, "saveRuleText");
+    check(backend.tasteRules().contains(rule0) && QFileInfo::exists(backend.reviewsPath()) && saveText
+              && saveText->property("text").toString() == "Saved",
+          "review: Enter saves the rule to session_reviews.jsonl", rule0);
+    sendKey(win, Qt::Key_Escape);
+    settle(250);
+    check(review && !review->property("open").toBool(), "review: Esc closes it");
+    if (QQuickItem *p = firstItem(win, "reviewPill")) {
+        mouseClick(win, p->mapToScene(QPointF(p->width() / 2, p->height() / 2)), Qt::LeftButton, {});
+        settle(250);
+        check(review->property("open").toBool(), "review: the Review pill opens it too");
+        sendKey(win, Qt::Key_R, Qt::ControlModifier | Qt::ShiftModifier);
+        settle(250);
+        check(!review->property("open").toBool(), "review: Cmd+Shift+R toggles it closed");
+    }
+}
+
 }  // namespace
+
+// --snap-review OUT.png: the session review over the mock Constellation, plus OUT-constellation.png
+// (one card dragged, Needs Me pill counting) and OUT-stage.png (default visual-first slide).
+int snapReview(const QString &outPath)
+{
+    Backend backend(Backend::Mode::Mock);
+    QQmlApplicationEngine engine;
+    QQuickWindow *win = createStudioWindow(engine, &backend, false, QSize(1920, 1080));
+    if (!win) {
+        std::fprintf(stderr, "snap-review: QML failed to load\n");
+        return 2;
+    }
+    QObject *app = win->findChild<QObject *>("studioApp");
+    if (!app)
+        return 3;
+    QDir().mkpath(QFileInfo(outPath).absolutePath());
+    auto sibling = [&](const char *tag) {
+        QString p = outPath;
+        p.insert(outPath.endsWith(QLatin1String(".png"), Qt::CaseInsensitive) ? outPath.size() - 4 : outPath.size(),
+                 QLatin1Char('-') + QLatin1String(tag));
+        return p;
+    };
+    settle(450);
+    seedPhase3Scene(backend);
+    settle(300);
+
+    // Constellation: drag the island that needs the human into the open top-right corner, as a
+    // user arranging work around what is waiting on them.
+    for (QQuickItem *it : findItems(win->contentItem(), "island"))
+        if (it->isVisible() && it->property("draggable").toBool() && it->property("proj").toMap().value("key") == "phonon") {
+            const QPointF from = it->mapToScene(QPointF(it->width() / 2, it->height() / 2));
+            mouseDrag(win, from, QPointF(1580, 250) - from);
+            break;
+        }
+    mouseMove(win, QPointF(4, 1076));  // no hover lift in the frame
+    settle(900);
+    const QImage cons = win->grabWindow();
+    const bool consSaved = cons.save(sibling("constellation"));
+
+    // The review card over the Constellation.
+    sendKey(win, Qt::Key_R, Qt::ControlModifier | Qt::ShiftModifier);
+    settle(500);
+    const QImage img = win->grabWindow();
+    const bool saved = img.save(outPath);
+    sendKey(win, Qt::Key_Escape);
+    settle(300);
+
+    // Stage: the default visual-first slide of a session with a diff (the mock kickoff yields
+    // chart, diff, table, pdf); the diff stays behind the Code pill.
+    const QString stageKey = backend.startSession(QStringLiteral("~/dev/fp4-decode"), QStringLiteral("claude"),
+                                                  backend.harnessModels().value("claude").toList().value(0).toString(),
+                                                  QStringLiteral("profile fp4 kv-cache decode on sm120"));
+    settle(300);
+    for (int i = 0; i < 14; ++i)
+        backend.advance(0.5);
+    settle(300);
+    bool stageSaved = false;
+    int stagePixels = 0;
+    if (backend.projectIndex(stageKey) >= 0) {
+        QMetaObject::invokeMethod(app, "enterProject", Q_ARG(QVariant, QVariant(backend.projectIndex(stageKey))));
+        mouseMove(win, QPointF(4, 1076));
+        settle(900);
+        const QImage stage = win->grabWindow();
+        stageSaved = stage.save(sibling("stage"));
+        stagePixels = forbiddenPixels(stage);
+    }
+    std::printf("snap-review: %s %s (%d blue/green px)\n", saved ? "saved" : "FAILED", qPrintable(outPath), forbiddenPixels(img));
+    std::printf("snap-review: %s %s (%d blue/green px), needs me %d, %lld custom card positions\n",
+                consSaved ? "saved" : "FAILED", qPrintable(sibling("constellation")), forbiddenPixels(cons),
+                needsMeCount(backend), static_cast<long long>(backend.cardPositions().size()));
+    std::printf("snap-review: %s %s (%d blue/green px), project %s, deck %lld slides, %d diff hidden\n",
+                stageSaved ? "saved" : "FAILED", qPrintable(sibling("stage")), stagePixels, qPrintable(stageKey),
+                static_cast<long long>(app->property("artifacts").toList().size()),
+                backend.projects().value(backend.projectIndex(stageKey)).toMap().value("diffCount").toInt());
+    const QVariantMap r = backend.reflection();
+    std::printf("intent: %s\nsteers: %s\nrules: %s\n", qPrintable(r.value("intent").toString()),
+                qPrintable(r.value("corrections").toString()), qPrintable(r.value("rules").toStringList().join(" | ")));
+    return saved && consSaved ? 0 : 1;
+}
 
 int snapOmnibar(const QString &outPath)
 {
@@ -3846,6 +4348,8 @@ int runTests()
     openAiCompatUnitTests();
     llmRouterBackendTests();
     formFactorTests();
+    phase3UnitTests();
+    phase3UiTests();
     omnibarUiTests();
     uiTests();
     gamepadUiTests();

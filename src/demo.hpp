@@ -73,6 +73,9 @@ int runTests();
 // --snap-omnibar OUT.png: the mock Stage with a hovered table cell and the floating ask card
 // open over it, answered by a local fake SSE endpoint, rendered offscreen at 1920x1080.
 int snapOmnibar(const QString &outPath);
+// --snap-review OUT.png: the session review card over the mock Constellation; also writes
+// OUT-constellation.png (a dragged card, the Needs Me pill) and OUT-stage.png (visual-first slide).
+int snapReview(const QString &outPath);
 int benchFps();
 // --bench-fps --metal: QQuickRenderControl into an offscreen Metal texture at dpr 2, 240 Hz
 // budget. shotDir non-empty: also save one GPU frame (read back from the texture) there.

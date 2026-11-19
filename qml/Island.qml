@@ -11,7 +11,18 @@ Item {
     property real recede: 0        // 0..1 while the Constellation zooms into a sibling
     property bool morphing: false  // this island is the shared element: the zoom layer stands in for it
     property real pulse: -1        // the Constellation's shared wave clock (0..1, linear); -1 = off
+    property bool draggable: false // the Constellation is settled: press-and-move drags the card
     signal clicked()
+    // Pointer travel since the press, in the parent's coordinates. dragMoved fires per move
+    // while the card rides a Translate (no relayout); dragEnded fires once, on release.
+    signal dragMoved(real dx, real dy)
+    signal dragEnded(real dx, real dy)
+    signal dragCanceled()
+    property real dragDx: 0
+    property real dragDy: 0
+    readonly property bool dragging: mouse.moved
+    transform: Translate { x: root.dragDx; y: root.dragDy }
+    z: dragging ? 10 : 0
 
     readonly property int fresh: proj && proj.fresh ? proj.fresh : 0
     readonly property bool active: proj ? proj.active === true : false
@@ -31,7 +42,7 @@ Item {
     opacity: morphing ? 0 : born * (1 - recede)
 
     // Focus and hover lift on a spring, so arrow-key travel across islands feels physical.
-    readonly property real lift: mouse.pressed ? 0.97 : (selected ? 1.03 : (mouse.containsMouse ? 1.015 : 1))
+    readonly property real lift: dragging ? 1.04 : (mouse.pressed ? 0.97 : (selected ? 1.03 : (mouse.containsMouse ? 1.015 : 1)))
 
     Item {
         id: body
@@ -166,8 +177,39 @@ Item {
         id: mouse
         anchors.fill: parent
         hoverEnabled: true
-        cursorShape: Qt.PointingHandCursor
-        onClicked: root.clicked()
+        cursorShape: moved ? Qt.ClosedHandCursor : Qt.PointingHandCursor
+        preventStealing: true
+        property point pressAt
+        property bool moved: false
+        property bool wasDragged: false  // clicked fires after released: a drag never opens the card
+        function endDrag(commit) {
+            wasDragged = moved;
+            if (moved)
+                commit ? root.dragEnded(root.dragDx, root.dragDy) : root.dragCanceled();
+            moved = false;
+            root.dragDx = 0;
+            root.dragDy = 0;
+        }
+        onPressed: (m) => {
+            pressAt = mapToItem(root.parent, m.x, m.y);
+            moved = false;
+            wasDragged = false;
+        }
+        onPositionChanged: (m) => {
+            if (!pressed || !root.draggable)
+                return;
+            const p = mapToItem(root.parent, m.x, m.y);
+            const dx = p.x - pressAt.x, dy = p.y - pressAt.y;
+            if (!moved && Math.hypot(dx, dy) < 6)
+                return;  // a click with a shaky hand stays a click
+            moved = true;
+            root.dragDx = dx;
+            root.dragDy = dy;
+            root.dragMoved(dx, dy);
+        }
+        onReleased: endDrag(true)
+        onCanceled: endDrag(false)
+        onClicked: if (!wasDragged) root.clicked()
         // Hover-to-ask: the island reports itself as a session target (window coordinates).
         onContainsMouseChanged: root.reportHover()
     }
