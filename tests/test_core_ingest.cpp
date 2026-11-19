@@ -1,5 +1,5 @@
 // test_core_ingest: lapis_core (TargetRef, SpscRing, window geometry) and lapis_ingest (Phonon,
-// Slowmix, cross-session MemoryIndex).
+// Slowmix, Spotify, cross-session MemoryIndex).
 #include "core/ring_buffer.hpp"
 #include "core/types.hpp"
 #include "core/window_geometry.hpp"
@@ -7,6 +7,7 @@
 #include "ingest/memory.hpp"
 #include "ingest/phonon.hpp"
 #include "ingest/slowmix.hpp"
+#include "ingest/spotify.hpp"
 #include "llm/prefix.hpp"
 
 #include <QCoreApplication>
@@ -20,10 +21,14 @@
 #include <QJsonObject>
 #include <QLocalServer>
 #include <QLocalSocket>
+#include <QHash>
+#include <QTcpServer>
+#include <QTcpSocket>
 #include <QTemporaryDir>
 
 #include <algorithm>
 #include <chrono>
+#include <memory>
 
 #include <cstdio>
 #include <thread>
@@ -773,6 +778,220 @@ void windowStateTests()
           "window: clamp on a secondary display with a negative origin");
 }
 
+// A one-request-per-connection HTTP/1.1 stand-in for api.spotify.com.
+struct MockSpotifyApi {
+    struct Req {
+        QByteArray method, path, auth, body;
+    };
+    QTcpServer server;
+    QList<Req> requests;
+    // path (query stripped) -> {status, body}
+    QHash<QByteArray, QPair<int, QByteArray>> routes;
+
+    bool listen()
+    {
+        QObject::connect(&server, &QTcpServer::newConnection, &server, [this] {
+            while (QTcpSocket *s = server.nextPendingConnection()) {
+                auto buf = std::make_shared<QByteArray>();
+                QObject::connect(s, &QTcpSocket::disconnected, s, &QObject::deleteLater);
+                QObject::connect(s, &QTcpSocket::readyRead, s, [this, s, buf] {
+                    *buf += s->readAll();
+                    const qsizetype end = buf->indexOf("\r\n\r\n");
+                    if (end < 0)
+                        return;
+                    Req r;
+                    qsizetype length = 0;
+                    const QList<QByteArray> lines = buf->left(end).split('\n');
+                    const QList<QByteArray> first = lines.value(0).trimmed().split(' ');
+                    r.method = first.value(0);
+                    r.path = first.value(1);
+                    for (const QByteArray &l : lines.mid(1)) {
+                        const qsizetype colon = l.indexOf(':');
+                        const QByteArray key = l.left(colon).trimmed().toLower();
+                        const QByteArray val = l.mid(colon + 1).trimmed();
+                        if (key == "authorization")
+                            r.auth = val;
+                        else if (key == "content-length")
+                            length = val.toLongLong();
+                    }
+                    if (buf->size() < end + 4 + length)
+                        return;
+                    r.body = buf->mid(end + 4, length);
+                    buf->clear();
+                    requests << r;
+                    const QByteArray bare = r.path.split('?').value(0);
+                    const auto route = routes.value(bare, {404, QByteArray("{\"error\":{\"status\":404}}")});
+                    QByteArray resp = "HTTP/1.1 " + QByteArray::number(route.first) + " X\r\nConnection: close\r\n";
+                    if (route.first != 204)
+                        resp += "Content-Type: application/json\r\nContent-Length: " + QByteArray::number(route.second.size())
+                                + "\r\n\r\n" + route.second;
+                    else
+                        resp += "\r\n";
+                    s->write(resp);
+                    s->disconnectFromHost();
+                });
+            }
+        });
+        return server.listen(QHostAddress::LocalHost);
+    }
+    QString base() const { return QStringLiteral("http://127.0.0.1:%1").arg(server.serverPort()); }
+};
+
+void spotifyTests()
+{
+    const QDateTime now = QDateTime::fromString("2026-11-19T06:00:00Z", Qt::ISODate);
+
+    // user_client_token.json as spotify_player writes it (microsecond expires_at).
+    const SpotifyToken valid = parseSpotifyToken(
+        R"({"access_token":"tok-abc","expires_in":3600,"expires_at":"2026-11-19T07:42:30.199972Z","refresh_token":null})",
+        now);
+    check(valid.ok && !valid.expired && valid.usable() && valid.accessToken == "tok-abc",
+          "spotify token: valid file parses and is usable", valid.expiresAt.toString(Qt::ISODate));
+    const qint64 skewMs = QDateTime::fromString("2026-11-19T07:42:30Z", Qt::ISODate).msecsTo(valid.expiresAt);
+    check(skewMs >= 0 && skewMs < 1000,
+          "spotify token: expires_at keeps the second", valid.expiresAt.toString(Qt::ISODateWithMs));
+    const SpotifyToken expired =
+        parseSpotifyToken(R"({"access_token":"tok-abc","expires_at":"2026-11-19T05:59:59Z"})", now);
+    check(expired.ok && expired.expired && !expired.usable(), "spotify token: past expires_at is expired");
+    const SpotifyToken edge =
+        parseSpotifyToken(R"({"access_token":"tok-abc","expires_at":"2026-11-19T06:00:20Z"})", now);
+    check(edge.expired, "spotify token: within 30 s of expiry counts as expired");
+    const SpotifyToken epoch = parseSpotifyToken(
+        QByteArray(R"({"access_token":"t","expires_at":)") + QByteArray::number(now.toSecsSinceEpoch() + 600) + "}", now);
+    check(epoch.usable(), "spotify token: epoch-seconds expires_at");
+    check(parseSpotifyToken(R"({"access_token":"t"})", now).usable(), "spotify token: no expires_at is usable");
+    check(!parseSpotifyToken(R"({"access_token":""})", now).ok && !parseSpotifyToken("garbage", now).ok
+              && !parseSpotifyToken("", now).ok,
+          "spotify token: empty / garbage is not ok");
+
+    // GET /v1/me/player.
+    const SpotifyPlayback pb = parseSpotifyPlayback(
+        R"({"device":{"id":"d1","name":"MacBook","volume_percent":63},"is_playing":true,"progress_ms":1200,
+            "item":{"name":"Night Drive","uri":"spotify:track:4uLU6hMCjMI75M1A2tKUQC",
+                    "artists":[{"name":"Lapis Trio"},{"name":"Guest"}]}})");
+    check(pb.ok && pb.playing && pb.track == "Night Drive" && pb.artist == "Lapis Trio" && pb.volume == 63,
+          "spotify api: /me/player parses track, first artist, volume");
+    const SpotifyPlayback paused = parseSpotifyPlayback(R"({"is_playing":false,"item":null,"device":{}})");
+    check(paused.ok && !paused.playing && paused.track.isEmpty() && paused.volume == -1,
+          "spotify api: paused with no item and no volume");
+    check(!parseSpotifyPlayback("").ok && !parseSpotifyPlayback("null").ok, "spotify api: 204 empty body is not ok");
+
+    // GET /v1/search?type=track&limit=1.
+    const QByteArray search =
+        R"({"tracks":{"href":"x","items":[{"id":"4uLU6hMCjMI75M1A2tKUQC","name":"Night Drive",
+            "uri":"spotify:track:4uLU6hMCjMI75M1A2tKUQC"}],"total":1}})";
+    check(parseSpotifyFirstTrackUri(search) == "spotify:track:4uLU6hMCjMI75M1A2tKUQC",
+          "spotify api: /search first track URI", parseSpotifyFirstTrackUri(search));
+    check(parseSpotifyFirstTrackUri(R"({"tracks":{"items":[{"uri":"spotify:track:abc123"}]}})") == "spotify:track:abc123",
+          "spotify api: /search falls back to uri");
+    check(parseSpotifyFirstTrackUri(R"({"tracks":{"items":[]}})").isEmpty(), "spotify api: /search no match");
+    check(parseSpotifyFirstTrackUri(R"({"tracks":{"items":[{"id":"abc\" & do shell script \"x"}]}})").isEmpty(),
+          "spotify api: a non-base62 id never becomes a URI (AppleScript injection)");
+
+    // osascript status lines.
+    const SpotifyPlayback as = parseSpotifyAppleScriptStatus("playing\nNight Drive\nLapis Trio\n55\n");
+    check(as.ok && as.playing && as.track == "Night Drive" && as.artist == "Lapis Trio" && as.volume == 55,
+          "spotify app: playing status parses");
+    const SpotifyPlayback asPaused = parseSpotifyAppleScriptStatus("paused\r\nSong, With Comma\nA & B\n100\r\n");
+    check(asPaused.ok && !asPaused.playing && asPaused.track == "Song, With Comma" && asPaused.artist == "A & B"
+              && asPaused.volume == 100,
+          "spotify app: paused status with CRLF");
+    const SpotifyPlayback asStopped = parseSpotifyAppleScriptStatus("stopped\n\n\n0\n");
+    check(asStopped.ok && !asStopped.playing && asStopped.track.isEmpty() && asStopped.volume == 0,
+          "spotify app: stopped status");
+    check(!parseSpotifyAppleScriptStatus("not running\n").ok && !parseSpotifyAppleScriptStatus("").ok
+              && !parseSpotifyAppleScriptStatus("execution error: x").ok,
+          "spotify app: not running / error is not ok");
+
+    QTemporaryDir td;
+    const QString tokenPath = td.path() + "/user_client_token.json";
+    const QString farFuture = QDateTime::currentDateTimeUtc().addSecs(3600).toString(Qt::ISODate);
+    writeFile(tokenPath, QByteArray(R"({"access_token":"tok-test","expires_at":")") + farFuture.toUtf8() + "\"}");
+    const QString fakeApp = td.path() + "/Spotify.app";
+    QDir().mkpath(fakeApp);
+
+    // Pure dry run: never a request or a process, state moves optimistically.
+    {
+        SpotifyController c;
+        c.setTokenPath(tokenPath);
+        c.setAppPath(fakeApp);
+        c.refresh();
+        c.nextTrack();
+        c.togglePlay();
+        c.setVolume(140);
+        c.searchAndPlay("night drive");
+        check(c.requestCount() == 0 && c.spawnCount() == 0, "spotify dry run: no network, no process");
+        check(c.playing() && c.volume() == 100 && c.track() == "night drive" && c.available(),
+              "spotify dry run: optimistic state");
+        check(c.commandLog().contains("api POST /v1/me/player/next")
+                  && c.commandLog().contains("api PUT /v1/me/player/volume?volume_percent=100")
+                  && c.commandLog().contains("api GET /v1/search?type=track&limit=1&q=night%20drive"),
+              "spotify dry run: logs the Web API routes", c.commandLog().join(" | "));
+    }
+
+    MockSpotifyApi api;
+    check(api.listen(), "spotify mock: listens", api.server.errorString());
+    api.routes["/v1/me/player"] = {200, R"({"is_playing":true,"device":{"volume_percent":42},
+        "item":{"name":"Night Drive","artists":[{"name":"Lapis Trio"}]}})"};
+    api.routes["/v1/search"] = {200, search};
+    api.routes["/v1/me/player/next"] = {204, {}};
+    // /v1/me/player/play falls through to 404 NO_ACTIVE_DEVICE.
+
+    {
+        SpotifyController c;
+        c.setTokenPath(tokenPath);
+        c.setAppPath(fakeApp);
+        c.setApiBase(api.base());
+        c.refresh();
+        check(pumpUntil([&] { return c.track() == "Night Drive"; }), "spotify web api: refresh reads /me/player");
+        check(c.playing() && c.artist() == "Lapis Trio" && c.volume() == 42 && c.error().isEmpty(),
+              "spotify web api: refresh state", c.error());
+        check(!api.requests.isEmpty() && api.requests.first().method == "GET"
+                  && api.requests.first().auth == "Bearer tok-test",
+              "spotify web api: bearer token from user_client_token.json");
+
+        const int before = api.requests.size();
+        c.nextTrack();
+        check(pumpUntil([&] { return api.requests.size() > before && !c.busy(); }), "spotify web api: next sent");
+        check(api.requests.last().method == "POST" && api.requests.last().path == "/v1/me/player/next"
+                  && !c.commandLog().contains("osascript next track"),
+              "spotify web api: 204 next is a success, no AppleScript");
+
+        c.searchAndPlay("night drive");
+        check(pumpUntil([&] { return c.commandLog().contains("osascript play track spotify:track:4uLU6hMCjMI75M1A2tKUQC"); }),
+              "spotify web api: 404 play falls back to Spotify.app play track", c.commandLog().join(" | "));
+        bool sawSearch = false, sawPlay = false;
+        for (const auto &r : api.requests) {
+            sawSearch |= r.method == "GET" && r.path == "/v1/search?type=track&limit=1&q=night%20drive";
+            sawPlay |= r.method == "PUT" && r.path == "/v1/me/player/play"
+                       && r.body == R"({"uris":["spotify:track:4uLU6hMCjMI75M1A2tKUQC"]})";
+        }
+        check(sawSearch && sawPlay, "spotify web api: search then play with uris body");
+        check(c.spawnCount() == 0, "spotify web api: dry-run fallback never spawns osascript");
+
+        api.routes["/v1/me/player"] = {204, {}};
+        c.refresh();
+        check(pumpUntil([&] { return c.commandLog().contains("osascript status"); }),
+              "spotify web api: 204 /me/player falls back to Spotify.app status");
+    }
+
+    // Expired token: straight to Spotify.app, no request.
+    {
+        writeFile(tokenPath, R"({"access_token":"tok-old","expires_at":"2020-01-01T00:00:00Z"})");
+        SpotifyController c;
+        c.setTokenPath(tokenPath);
+        c.setAppPath(fakeApp);
+        c.setApiBase(api.base());
+        const int before = api.requests.size();
+        c.pause();
+        c.refresh();
+        check(api.requests.size() == before && c.requestCount() == 0, "spotify expired token: no Web API request");
+        check(c.commandLog().contains("osascript pause") && c.commandLog().contains("osascript status")
+                  && c.spawnCount() == 0,
+              "spotify expired token: AppleScript fallback (dry)", c.commandLog().join(" | "));
+    }
+}
+
 }  // namespace
 
 int main(int argc, char **argv)
@@ -785,6 +1004,7 @@ int main(int argc, char **argv)
     memoryTests();
     ambientTests();
     windowStateTests();
+    spotifyTests();
     std::printf("test_core_ingest: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }
