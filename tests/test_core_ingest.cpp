@@ -3,16 +3,20 @@
 #include "core/ring_buffer.hpp"
 #include "core/types.hpp"
 #include "core/window_geometry.hpp"
+#include "ingest/ambient.hpp"
 #include "ingest/memory.hpp"
 #include "ingest/phonon.hpp"
 #include "ingest/slowmix.hpp"
+#include "llm/prefix.hpp"
 
 #include <QCoreApplication>
 #include <QDateTime>
 #include <QDir>
 #include <QElapsedTimer>
 #include <QFile>
+#include <QJsonArray>
 #include <QJsonDocument>
+#include <QJsonObject>
 #include <QTemporaryDir>
 
 #include <algorithm>
@@ -368,6 +372,73 @@ QVector<MemoryTurn> syntheticTurns(qint64 now, int n = 500)
     return out;
 }
 
+void ambientTests()
+{
+    // extractNewUserUtterances: only new "You:" turns, never "Call:" or already-seen lines.
+    const QString t1 = QStringLiteral("0:01 You: hey\n0:04 Call: hi there\n0:09 You: open lapis");
+    check(extractNewUserUtterances(QString(), t1) == QStringList{"hey", "open lapis"},
+          "ambient: first tail -> every You: line, no Call:", extractNewUserUtterances(QString(), t1).join('|'));
+    check(extractNewUserUtterances(t1, t1).isEmpty(), "ambient: unchanged tail -> nothing new");
+    const QString t2 = t1 + QStringLiteral("\n0:12 Call: sure\n0:15 You: play some music\n0:18 You: and pause it");
+    check(extractNewUserUtterances(t1, t2) == QStringList{"play some music", "and pause it"},
+          "ambient: appended lines -> only the new You: lines", extractNewUserUtterances(t1, t2).join('|'));
+    // Sliding window (tail capped at N lines): the head scrolls off, the overlap is still found.
+    const QString t3 = QStringLiteral("0:09 You: open lapis\n0:12 Call: sure\n0:15 You: play some music\n"
+                                      "0:18 You: and pause it\n0:21 Call: ok\n0:24 You: go home");
+    check(extractNewUserUtterances(t2, t3) == QStringList{"go home"}, "ambient: sliding window diff",
+          extractNewUserUtterances(t2, t3).join('|'));
+    // A repeated phrase earlier in the window is not mistaken for already processed.
+    const QString r1 = QStringLiteral("0:01 You: next\n0:02 Call: ok");
+    const QString r2 = r1 + QStringLiteral("\n0:03 You: next");
+    check(extractNewUserUtterances(r1, r2) == QStringList{"next"}, "ambient: repeated phrase with new timestamp is new");
+    check(extractNewUserUtterances(t1, QStringLiteral("0:01 Call: only them\n0:02 Call: still them")).isEmpty(),
+          "ambient: Call:-only tail -> nothing");
+    check(extractNewUserUtterances(QString(), QStringLiteral("You: untimed\n1:02:03 You: hour stamp\n0:05 You:   \n"))
+              == QStringList{"untimed", "hour stamp"},
+          "ambient: untimed and h:mm:ss turns parsed, empty turns skipped");
+    check(extractNewUserUtterances(QStringLiteral("0:01 You: old meeting"), QStringLiteral("0:01 You: new meeting"))
+              == QStringList{"new meeting"},
+          "ambient: no overlap (new meeting) -> all lines new");
+
+    // buildAmbientIntentRequest: no-think, 160 tokens, Tier 0 + Tier 1 byte-identical to ask/warm.
+    TieredPrompt p;
+    p.model = QStringLiteral("qwen3.8-flash-next");
+    p.systemPrompt = kCompatSystemPrompt;
+    p.extraSystemContext = QStringLiteral("Projects: lapis, phonon.");
+    p.trunk = QStringLiteral("Project: lapis (~/dev/lapis).");
+    p.question = QStringLiteral("q");
+    const QJsonArray ask = QJsonDocument::fromJson(buildTieredChatRequest(p)).object().value("messages").toArray();
+    const QJsonArray warm = QJsonDocument::fromJson(buildTieredWarmRequest(p)).object().value("messages").toArray();
+
+    const QJsonObject amb = QJsonDocument::fromJson(buildAmbientIntentRequest(
+        p.model, p.systemPrompt, p.extraSystemContext, p.trunk, QStringLiteral("Stage: lapis; music paused"),
+        QStringLiteral("chart \"decode tok/s\""), QStringLiteral("open the review and play nights"))).object();
+    const QJsonArray am = amb.value("messages").toArray();
+    check(amb.value("chat_template_kwargs").toObject().contains("enable_thinking")
+              && !amb.value("chat_template_kwargs").toObject().value("enable_thinking").toBool(true),
+          "ambient: enable_thinking false");
+    check(amb.value("max_tokens").toInt() == 160 && amb.value("stream").toBool() && amb.value("model") == p.model
+              && !amb.contains("reasoning_effort"),
+          "ambient: max_tokens 160, streamed, same model");
+    auto compactObj = [](const QJsonValue &v) { return QJsonDocument(v.toObject()).toJson(QJsonDocument::Compact); };
+    check(am.size() == 3 && warm.size() == 2 && compactObj(am[0]) == compactObj(ask[0])
+              && compactObj(am[1]) == compactObj(ask[1]) && compactObj(am[0]) == compactObj(warm[0])
+              && compactObj(am[1]) == compactObj(warm[1]),
+          "ambient: Tier 0 + Tier 1 byte-identical with ask and warm");
+    QByteArray wBytes = QJsonDocument(warm).toJson(QJsonDocument::Compact);
+    wBytes.chop(1);
+    check(QJsonDocument(am).toJson(QJsonDocument::Compact).startsWith(wBytes),
+          "ambient: warm messages are a raw byte prefix of the ambient messages");
+    const QString leaf = am[2].toObject().value("content").toString();
+    check(am[2].toObject().value("role") == "user" && leaf.contains("[[IGNORE]]")
+              && leaf.contains("[[ACTION:focus_project:<name>]]") && leaf.contains("[[ACTION:spawn_agent:<task>]]")
+              && leaf.contains("[[ACTION:filter_needs_me]]") && leaf.contains("1-2")
+              && leaf.contains("Stage: lapis; music paused") && leaf.contains("decode tok/s")
+              && leaf.endsWith("Spoken: open the review and play nights"),
+          "ambient: leaf carries instructions, vocabulary, live state, hover slice and spoken text", leaf);
+    check(kAmbientActionVocabulary.size() == 11, "ambient: 11-action vocabulary");
+}
+
 void memoryTests()
 {
     const qint64 now = QDateTime::currentMSecsSinceEpoch();
@@ -562,6 +633,7 @@ int main(int argc, char **argv)
     phononTests();
     slowmixTests();
     memoryTests();
+    ambientTests();
     windowStateTests();
     std::printf("test_core_ingest: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

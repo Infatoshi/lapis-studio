@@ -17,7 +17,7 @@ function(lapis_warnings target)
   target_compile_options(${target} PRIVATE -Wall -Wextra)
 endfunction()
 
-# --- Layered static libraries (one-way dependencies: core <- ingest, core <- llm) ----------
+# --- Layered static libraries (one-way: core <- llm <- ingest) ----------
 
 # Value types and the lock-free SPSC ring. QtCore only.
 add_library(lapis_core STATIC
@@ -34,9 +34,11 @@ add_library(lapis_ingest STATIC
   src/ingest/phonon.hpp src/ingest/phonon.cpp
   src/ingest/slowmix.hpp src/ingest/slowmix.cpp
   src/ingest/memory.hpp src/ingest/memory.cpp
+  src/ingest/ambient.hpp src/ingest/ambient.cpp
   src/transcript.hpp src/transcript.cpp
 )
-target_link_libraries(lapis_ingest PUBLIC lapis_core Qt6::Core Qt6::Concurrent)
+# ambient.cpp reuses lapis_llm's Tier 0/1 builders so its prefix stays byte-identical (llm never links ingest).
+target_link_libraries(lapis_ingest PUBLIC lapis_core lapis_llm Qt6::Core Qt6::Concurrent)
 lapis_warnings(lapis_ingest)
 
 # APC-aligned prompt builder, SSE parser and the libcurl-multi LlmRouter.
