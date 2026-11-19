@@ -5,20 +5,24 @@
 // where speed is slowed | normal | nightcore | fast | 1.10x, reverb is off | hall | heavy, and
 // track is the file relative to ~/clips (absolute when outside it).
 //
-// SlowmixController drives `slowmix --stdio` (load / play / pause / speed / reverb / bass / loop /
-// status / quit, one command per line). It never spawns unless setSpawnAllowed(true), which only
-// main()'s live window calls; every offscreen and test mode runs it as a dry run that updates the
-// same properties without touching audio.
+// SlowmixController talks to a persistent `slowmix --socket <path>` daemon over a local socket
+// (load / play / pause / speed / reverb / bass / loop / status, one command per line). The daemon
+// outlives the app: the controller attaches to a running one and syncs the UI from its status,
+// spawns one detached on first play when none is running, and on destruction only closes its
+// connection, so music keeps playing across app restarts. It never connects or spawns unless
+// setSpawnAllowed(true), which only main()'s live window calls; every offscreen and test mode
+// runs it as a dry run that updates the same properties without touching audio.
 #pragma once
 
 #include <QHash>
+#include <QJsonObject>
 #include <QObject>
 #include <QPointer>
 #include <QString>
 #include <QTimer>
 #include <QVariantList>
 
-class QProcess;
+class QLocalSocket;
 
 namespace studio {
 
@@ -82,16 +86,22 @@ public:
     // $LAPIS_SLOWMIX_BIN, else ~/slowmix/target/release/slowmix.
     static QString defaultBinary();
     static QString defaultClipsDir();  // ~/clips
+    // $LAPIS_SLOWMIX_SOCK, else ~/.lapis-next/slowmix.sock.
+    static QString defaultSocketPath();
 
+    // true probes the socket: a running daemon is attached and the UI syncs to its status.
+    // false closes the connection (the daemon keeps playing).
     void setSpawnAllowed(bool on);
     bool spawnAllowed() const { return m_spawnAllowed; }
     void setBinary(const QString &path);
+    void setSocketPath(const QString &path);  // closes any current connection
+    QString socketPath() const { return m_sockPath; }
     void setLibrary(const QString &clipsDir, const QString &playsPath);
     QString clipsDir() const { return m_clipsDir; }
     QString playsPath() const { return m_playsPath; }
 
     bool available() const;
-    bool running() const;
+    bool running() const;  // connected to the daemon
     bool playing() const { return m_playing; }
     QString currentTrack() const { return m_currentTrack; }
     QString currentPath() const { return m_currentPath; }
@@ -103,7 +113,7 @@ public:
     double duration() const { return m_dur; }
     bool showArchive() const { return m_showArchive; }
     QVariantList tracks() const { return m_tracks; }
-    int spawnCount() const { return m_spawnCount; }  // tests: stays 0 in dry runs
+    int spawnCount() const { return m_spawnCount; }  // daemons started; stays 0 in dry runs
 
     Q_INVOKABLE void selectTrack(const QString &path);  // applies its favorite preset, then plays
     Q_INVOKABLE void togglePlay();
@@ -121,17 +131,22 @@ signals:
     void tracksChanged();
 
 private:
-    // False in dry runs or when the binary is missing; *spawned is true when a child just started.
-    bool ensureProcess(bool *spawned = nullptr);
+    // Connects to the daemon, spawning it detached when none answers. False in dry runs or when
+    // nothing could be reached; *spawned is true when a fresh daemon just started.
+    bool ensureConnected(bool *spawned = nullptr);
+    bool connectSocket(int timeoutMs);
     void send(const QByteArray &line);
     void readStatus();
-    void stopProcess();
+    void applyStatus(const QJsonObject &o);  // full sync from a daemon we just attached to
+    void closeSocket();
 
     bool m_spawnAllowed = false;
     QString m_bin;
     QString m_clipsDir;
     QString m_playsPath;
-    QPointer<QProcess> m_proc;
+    QString m_sockPath;
+    QPointer<QLocalSocket> m_sock;
+    bool m_syncPending = false;  // next unskipped status reply carries the daemon's whole state
     QTimer m_poll;
     QByteArray m_buf;
     int m_spawnCount = 0;

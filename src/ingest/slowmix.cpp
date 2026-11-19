@@ -6,12 +6,18 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QJsonDocument>
+#include <QElapsedTimer>
 #include <QJsonObject>
+#include <QLocalSocket>
 #include <QProcess>
 #include <QRegularExpression>
 #include <QSet>
+#include <QThread>
 
 #include <algorithm>
+
+#include <cerrno>
+#include <signal.h>
 
 namespace studio {
 
@@ -218,19 +224,38 @@ QList<SlowmixTrack> curateSlowmixTracks(const QString &clipsDir, const QString &
 SlowmixController::SlowmixController(QObject *parent)
     : QObject(parent)
     , m_bin(defaultBinary())
+    , m_sockPath(defaultSocketPath())
 {
     m_poll.setInterval(1000);
     connect(&m_poll, &QTimer::timeout, this, [this] {
         if (running()) {
             ++m_statusInFlight;
-            m_proc->write("status\n");
+            m_sock->write("status\n");
         }
     });
 }
 
 SlowmixController::~SlowmixController()
 {
-    stopProcess();
+    // Never `quit` the daemon: the music outlives this process.
+    closeSocket();
+}
+
+QString SlowmixController::defaultSocketPath()
+{
+    const QString env = qEnvironmentVariable("LAPIS_SLOWMIX_SOCK");
+    if (!env.isEmpty())
+        return env;
+    return QDir::homePath() + QStringLiteral("/.lapis-next/slowmix.sock");
+}
+
+void SlowmixController::setSocketPath(const QString &path)
+{
+    if (path == m_sockPath)
+        return;
+    closeSocket();
+    m_sockPath = path;
+    emit availableChanged();
 }
 
 QString SlowmixController::defaultBinary()
@@ -251,8 +276,16 @@ void SlowmixController::setSpawnAllowed(bool on)
     if (m_spawnAllowed == on)
         return;
     m_spawnAllowed = on;
-    if (!on)
-        stopProcess();
+    if (!on) {
+        closeSocket();
+    } else if (connectSocket(250)) {
+        // A daemon from an earlier session is still playing: show what it plays.
+        m_syncPending = true;
+        ++m_statusInFlight;
+        m_sock->write("status\n");
+        m_poll.start();
+        emit stateChanged();
+    }
     emit availableChanged();
 }
 
@@ -272,60 +305,99 @@ void SlowmixController::setLibrary(const QString &clipsDir, const QString &plays
 
 bool SlowmixController::available() const
 {
-    // A dry run (tests, offscreen snaps) always "plays"; live needs the built binary.
-    return !m_spawnAllowed || QFileInfo(m_bin).isExecutable();
+    // A dry run (tests, offscreen snaps) always "plays"; live needs a daemon or the built binary.
+    return !m_spawnAllowed || running() || QFileInfo(m_bin).isExecutable();
 }
 
 bool SlowmixController::running() const
 {
-    return m_proc && m_proc->state() == QProcess::Running;
+    return m_sock && m_sock->state() == QLocalSocket::ConnectedState;
 }
 
-bool SlowmixController::ensureProcess(bool *spawned)
+bool SlowmixController::connectSocket(int timeoutMs)
+{
+    if (running())
+        return true;
+    closeSocket();
+    if (m_sockPath.isEmpty())
+        return false;
+    auto *s = new QLocalSocket(this);
+    s->connectToServer(m_sockPath);
+    if (!s->waitForConnected(timeoutMs)) {
+        delete s;
+        return false;
+    }
+    m_sock = s;
+    m_buf.clear();
+    connect(s, &QLocalSocket::readyRead, this, &SlowmixController::readStatus);
+    connect(s, &QLocalSocket::disconnected, this, [this, s] {
+        if (s != m_sock)
+            return;
+        closeSocket();
+        // The connection dropped. If the daemon still answers, reattach and resync; if it is
+        // gone, so is the music.
+        QTimer::singleShot(0, this, [this] {
+            if (m_spawnAllowed && connectSocket(100)) {
+                m_syncPending = true;
+                ++m_statusInFlight;
+                m_sock->write("status\n");
+            } else if (m_playing) {
+                m_playing = false;
+            }
+            emit stateChanged();
+            emit availableChanged();
+        });
+    });
+    m_poll.start();
+    return true;
+}
+
+bool SlowmixController::ensureConnected(bool *spawned)
 {
     if (spawned)
         *spawned = false;
     if (running())
         return true;
-    if (!m_spawnAllowed || !QFileInfo(m_bin).isExecutable())
+    if (!m_spawnAllowed)
         return false;
-    if (m_proc)
-        m_proc->deleteLater();
-    auto *p = new QProcess(this);
-    p->setProgram(m_bin);
-    p->setArguments({QStringLiteral("--stdio")});
-    p->setWorkingDirectory(QDir::homePath());
-    p->setStandardErrorFile(QProcess::nullDevice());
-    connect(p, &QProcess::readyReadStandardOutput, this, &SlowmixController::readStatus);
-    connect(p, &QProcess::finished, this, [this, p] {
-        if (p != m_proc)
-            return;
-        m_poll.stop();
-        m_statusInFlight = 0;
-        m_skipReplies = 0;
-        if (m_playing) {
-            m_playing = false;
-            emit stateChanged();
-        }
-    });
-    p->start();
-    if (!p->waitForStarted(2000)) {
-        p->deleteLater();
+    if (connectSocket(250))
+        return true;  // a daemon is already up (started by an earlier session)
+    if (!QFileInfo(m_bin).isExecutable())
         return false;
-    }
-    m_proc = p;
-    m_buf.clear();
+    QDir().mkpath(QFileInfo(m_sockPath).absolutePath());
+    QProcess p;
+    p.setProgram(m_bin);
+    p.setArguments({QStringLiteral("--socket"), m_sockPath});
+    p.setWorkingDirectory(QDir::homePath());
+    p.setStandardInputFile(QProcess::nullDevice());
+    p.setStandardOutputFile(QProcess::nullDevice());
+    p.setStandardErrorFile(QProcess::nullDevice());
+    // Own session: Ctrl+C on the app's terminal or its process group never reaches the music.
+    p.setUnixProcessParameters(QProcess::UnixProcessFlag::CreateNewSession
+                               | QProcess::UnixProcessFlag::ResetSignalHandlers);
+    qint64 pid = 0;
+    if (!p.startDetached(&pid))
+        return false;
     ++m_spawnCount;
-    if (spawned)
-        *spawned = true;
-    // A fresh child starts at slowmix defaults; push what the UI shows.
-    send(QByteArray("speed ") + QByteArray::number(m_speed, 'f', 2));
-    send(QByteArray("reverb ") + m_reverb.toUtf8());
-    send(QByteArray("bass ") + QByteArray::number(m_bass, 'f', 1));
-    send(QByteArray("loop ") + (m_looping ? "1" : "0"));
-    m_poll.start();
-    emit stateChanged();
-    return true;
+    QElapsedTimer t;
+    t.start();
+    while (t.elapsed() < 3000) {
+        if (connectSocket(100)) {
+            if (spawned)
+                *spawned = true;
+            // A fresh daemon starts at slowmix defaults; push what the UI shows.
+            send(QByteArray("speed ") + QByteArray::number(m_speed, 'f', 2));
+            send(QByteArray("reverb ") + m_reverb.toUtf8());
+            send(QByteArray("bass ") + QByteArray::number(m_bass, 'f', 1));
+            send(QByteArray("loop ") + (m_looping ? "1" : "0"));
+            emit availableChanged();
+            return true;
+        }
+        if (pid > 0 && ::kill(pid_t(pid), 0) != 0 && errno == ESRCH)
+            break;  // the daemon exited before listening (bad binary, unusable socket path)
+        QThread::msleep(20);
+    }
+    return false;
 }
 
 void SlowmixController::send(const QByteArray &line)
@@ -334,14 +406,46 @@ void SlowmixController::send(const QByteArray &line)
         return;
     // A status reply already in flight predates this command; don't let it undo the UI.
     m_skipReplies = m_statusInFlight;
-    m_proc->write(line + '\n');
+    m_sock->write(line + '\n');
+}
+
+void SlowmixController::applyStatus(const QJsonObject &o)
+{
+    m_playing = o.value("playing").toBool();
+    m_looping = o.value("loop").toBool(m_looping);
+    const double speed = o.value("speed").toDouble(0);
+    if (speed > 0)
+        m_speed = speed;
+    const QString reverb = o.value("reverb").toString().toLower();
+    if (reverb == QLatin1String("off") || reverb == QLatin1String("hall") || reverb == QLatin1String("heavy"))
+        m_reverb = reverb;
+    m_bass = o.value("bass").toDouble(m_bass);
+    QString path = o.value("path").toString();
+    const QString track = o.value("track").toString();
+    if (path.isEmpty() && !track.isEmpty()) {
+        // Older daemons report only the track, relative to ~/clips like the log.
+        path = QDir::isAbsolutePath(track)
+                   ? track
+                   : QDir(m_clipsDir.isEmpty() ? defaultClipsDir() : m_clipsDir).filePath(track);
+    }
+    if (path.isEmpty())
+        return;  // nothing loaded yet
+    m_currentPath = path;
+    m_currentTrack.clear();
+    for (const QVariant &v : std::as_const(m_tracks))
+        if (v.toMap().value("path").toString() == path) {
+            m_currentTrack = v.toMap().value("name").toString();
+            break;
+        }
+    if (m_currentTrack.isEmpty())
+        m_currentTrack = cleanName(QFileInfo(path).fileName());
 }
 
 void SlowmixController::readStatus()
 {
-    if (!m_proc)
+    if (!m_sock)
         return;
-    m_buf += m_proc->readAllStandardOutput();
+    m_buf += m_sock->readAll();
     int nl;
     while ((nl = m_buf.indexOf('\n')) >= 0) {
         const QByteArray line = m_buf.left(nl).trimmed();
@@ -359,6 +463,12 @@ void SlowmixController::readStatus()
         }
         if (m_skipReplies > 0) {
             --m_skipReplies;
+            continue;  // a pending sync waits for the first reply that postdates every command
+        }
+        if (m_syncPending) {
+            m_syncPending = false;
+            applyStatus(o);
+            emit stateChanged();
             continue;
         }
         const bool playing = o.value("playing").toBool();
@@ -371,27 +481,22 @@ void SlowmixController::readStatus()
     }
 }
 
-void SlowmixController::stopProcess()
+void SlowmixController::closeSocket()
 {
     m_poll.stop();
-    if (!m_proc)
+    m_statusInFlight = 0;
+    m_skipReplies = 0;
+    m_syncPending = false;
+    if (!m_sock)
         return;
-    QProcess *p = m_proc;
-    m_proc.clear();
-    p->disconnect(this);
-    if (p->state() != QProcess::NotRunning) {
-        // quit flushes listening time to ~/clips/.plays.tsv; EOF does too if quit is missed.
-        p->write("quit\n");
-        p->closeWriteChannel();
-        if (!p->waitForFinished(1500)) {
-            p->terminate();
-            if (!p->waitForFinished(500)) {
-                p->kill();
-                p->waitForFinished(500);
-            }
-        }
-    }
-    delete p;
+    QLocalSocket *s = m_sock;
+    m_sock.clear();
+    s->disconnect(this);
+    // Hand over queued commands, then hang up. Never `quit`: the daemon keeps playing.
+    if (s->state() == QLocalSocket::ConnectedState && s->bytesToWrite() > 0)
+        s->waitForBytesWritten(200);
+    s->abort();
+    s->deleteLater();  // may be inside this socket's own disconnected() signal
 }
 
 void SlowmixController::selectTrack(const QString &path)
@@ -414,8 +519,8 @@ void SlowmixController::selectTrack(const QString &path)
     m_pos = 0;
     m_dur = 0;
     bool spawned = false;
-    if (ensureProcess(&spawned) && !spawned) {
-        // ensureProcess already pushed speed / reverb / bass / loop to a new child.
+    if (ensureConnected(&spawned) && !spawned) {
+        // ensureConnected already pushed speed / reverb / bass / loop to a new daemon.
         send(QByteArray("speed ") + QByteArray::number(m_speed, 'f', 2));
         send(QByteArray("reverb ") + m_reverb.toUtf8());
     }
@@ -436,7 +541,7 @@ void SlowmixController::togglePlay()
     }
     m_playing = !m_playing;
     bool spawned = false;
-    if (ensureProcess(&spawned)) {
+    if (ensureConnected(&spawned)) {
         if (spawned)
             send(QByteArray("load ") + m_currentPath.toUtf8() + (m_playing ? "" : " paused"));
         else
