@@ -24,6 +24,7 @@
 #include <QPointer>
 #include <QProcess>
 #include <QSet>
+#include <QThreadPool>
 #include <QTimer>
 #include <QVariantList>
 #include <QVariantMap>
@@ -199,7 +200,8 @@ ProjectId sessionProjectId(const SessionInfo &s, const Extracted &ex, const QStr
 // spawn_agent:<task>, set_volume:<pct>, open_spotify, spotify_play[:<song>], spotify_pause,
 // spotify_next, spotify_prev, spotify_volume:<pct>, focus_project:<name>, open_stage:<name>,
 // open_ladder:<name>, go_home, sort_map:category|recent|activity,
-// move_cluster:<cluster>:left|right|top|bottom. A model reply may carry several; all run in one turn.
+// move_cluster:<cluster>:left|right|top|bottom, cua_click:<target>, cua_type:<target>|<text>,
+// cua_scroll:<target>|<deltaY>. A model reply may carry several; all run in one turn.
 struct StudioCommand {
     QString action;
     QString arg;
@@ -214,6 +216,17 @@ StudioCommand parseStudioCommand(const QString &text);
 // Strips every leading [[ACTION:...]] tag from *answer (and the whitespace after it) and returns
 // the known actions in order. Unknown action names are dropped (still stripped).
 QList<StudioCommand> extractActionTags(QString *answer);
+// A visible computer-use action from a cua_click / cua_type / cua_scroll tag. cua_type's arg is
+// "<target>|<text>" (split at the first '|'); cua_scroll's is "<target>|<deltaY>" (split at the
+// last '|'; deltaY is an integer line count, positive scrolls up, or "up" / "down" for +-5).
+struct CuaCommand {
+    QString kind;  // "click", "type", "scroll"
+    QString target;
+    QString text;
+    int deltaY = 0;
+    bool valid = false;
+};
+CuaCommand parseCuaAction(const QString &action, const QString &arg);
 // The Constellation cluster a project sits in: "Work" (the infinity category), "Apps" (apps),
 // "Quick Qs" (a ~tab: island, a scratch-dir session, or the quick Qs category), else "Projects".
 QString mapClusterFor(const QString &key, const QString &category, const QString &dir);
@@ -638,8 +651,21 @@ signals:
     void streamFinished(const QString &streamId, const QString &error);
     // A Studio UI action for the QML side to carry out (see StudioCommand).
     void uiActionRequested(const QString &action, const QString &arg);
+    // A cua_* action finished on the worker (Live) or was recorded (Mock).
+    void cuaActionFinished(const QString &action, const QString &target, bool ok, const QString &tier,
+                           const QString &detail);
+
+public:
+    // Mock mode: every cua_* action recorded instead of run ("cua_click:Send"); Live: finished ones.
+    QStringList cuaLog() const { return m_cuaLog; }
+    int cuaPending() const { return m_cuaPending; }
 
 private:
+    // Live: runs a CuaExecutor on m_cuaPool (one action at a time, never the GUI thread).
+    QString startCuaAction(const QString &action, const CuaCommand &c);
+    QThreadPool *m_cuaPool = nullptr;
+    QStringList m_cuaLog;
+    int m_cuaPending = 0;
     // tryHandleStudioCommand for a known project (spawn_agent runs in its folder).
     bool handleStudioCommand(const QString &text, const QString &projectKey, QString *reply);
     QString spawnAgent(const QString &projectKey, const QString &task, bool steerLive);

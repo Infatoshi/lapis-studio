@@ -1,5 +1,6 @@
 #include "mac/cua.hpp"
 #include "mac/cua_reticle.hpp"
+#include "mac/cua_executor.hpp"
 #include <QCoreApplication>
 #include <QElapsedTimer>
 #include <QEventLoop>
@@ -157,6 +158,227 @@ void reticleOffscreenTests() {
     check(!r.state().visible && clear, "reticle: hide clears the overlay");
     check(r.render(0).isNull() && r.render(std::numeric_limits<double>::quiet_NaN()).isNull(), "reticle: invalid render scale");
 }
+// A CuaHooks whose every side effect appends to `calls` and touches nothing real.
+struct MockRig {
+    QStringList calls;
+    QVector<DisplayInfo> displays{{7, "primary", {0, 0, 1440, 900}, 2, true}, {9, "side", {1440, 0, 1920, 1080}, 1, false}};
+    QVector<AxNode> nodes;
+    QByteArray jpeg = "not-a-real-jpeg";
+    GroundResult ground;
+    uint32_t windowId = 4242;
+    uint32_t capturedDisplay = 0, capturedExclude = 0;
+    int capturedWidth = 0;
+    QString groundInstruction;
+    bool groundRefine = false;
+    QPointF clickPt, movePt, pulsePt, scrollPt;
+    QRectF highlightRect;
+    bool clickDouble = false;
+    int scrollDy = 0;
+    QString typed;
+    CuaHooks hooks() {
+        CuaHooks h;
+        h.listDisplays = [this] { calls << "listDisplays"; return displays; };
+        h.inspectDisplay = [this](uint32_t id) { calls << QString("inspectDisplay:%1").arg(id); return nodes; };
+        h.captureDisplayJpeg = [this](uint32_t id, int w, uint32_t ex, QString *err) {
+            calls << "capture";
+            capturedDisplay = id; capturedWidth = w; capturedExclude = ex;
+            if (jpeg.isEmpty() && err) *err = "denied";
+            return jpeg;
+        };
+        h.groundPixel = [this](const QByteArray &, const QString &instr, bool refine) {
+            calls << "ground"; groundInstruction = instr; groundRefine = refine; return ground;
+        };
+        h.clickAt = [this](QPointF p, bool dbl) { calls << "click"; clickPt = p; clickDouble = dbl; return ActionResult{true, "ok"}; };
+        h.scrollAt = [this](QPointF p, int dy) { calls << "scroll"; scrollPt = p; scrollDy = dy; return ActionResult{true, "ok"}; };
+        h.typeText = [this](const QString &t) { calls << "type"; typed = t; return ActionResult{true, "ok"}; };
+        h.axPress = [this](int, const QString &, const QRectF &) { calls << "axPress"; return ActionResult{true, "ok"}; };
+        h.reticleMove = [this](QPointF p, const QString &) { calls << "reticleMove"; movePt = p; };
+        h.reticleHighlight = [this](QRectF r, const QString &) { calls << "reticleHighlight"; highlightRect = r; };
+        h.reticlePulse = [this](QPointF p, const QString &) { calls << "reticlePulse"; pulsePt = p; };
+        h.reticleHide = [this] { calls << "reticleHide"; };
+        h.reticleWindowId = [this] { return windowId; };
+        h.pause = [](int) {};
+        return h;
+    }
+    // The calls that matter for ordering (drops the read-only listing / inspection steps).
+    QStringList effects() const {
+        QStringList out;
+        for (const QString &c : calls) if (c != "listDisplays" && !c.startsWith("inspectDisplay")) out << c;
+        return out;
+    }
+};
+AxNode axNode(int id, const QString &role, const QString &title, QRectF rect, const QString &value = {}) {
+    return AxNode{id, role, title, value, "Example", 100 + id, rect, {"AXPress"}};
+}
+void executorTests() {
+    // Matching.
+    const QRectF r(100, 200, 80, 30);
+    check(axMatchScore(axNode(1, "AXButton", "Send", r), "send") > axMatchScore(axNode(2, "AXStaticText", "Send", r), "send"),
+        "exec: clickable role outranks static text on the same title");
+    check(axMatchScore(axNode(1, "AXButton", "Send", {}), "send") == 0, "exec: empty rect never matches");
+    check(axMatchScore(axNode(1, "AXButton", "Send", r), "") == 0, "exec: empty target never matches");
+    check(axMatchScore(axNode(1, "AXTextField", "", r, "Search docs"), "search") > 0, "exec: value substring matches");
+    check(bestAxMatch({axNode(1, "AXButton", "OK", r), axNode(2, "AXButton", "OK", r.translated(300, 0))}, "ok") == -1,
+        "exec: tie between two distinct rects is ambiguous");
+    check(bestAxMatch({axNode(1, "AXButton", "OK", r), axNode(2, "AXButton", "OK", r)}, "OK") == 0,
+        "exec: same-rect duplicates are one target");
+
+    // L1 hit: best role wins, highlight -> pulse -> click, no capture or grounding.
+    {
+        MockRig m;
+        const QRectF text(10, 10, 60, 20), button(400, 300, 120, 40), hidden(0, 0, 0, 0);
+        m.nodes = {axNode(1, "AXStaticText", "Send", text), axNode(2, "AXButton", "Send", button),
+                   axNode(3, "AXButton", "Send", hidden), axNode(4, "AXGroup", "Unrelated", button)};
+        CuaExecutor ex(m.hooks());
+        const auto res = ex.clickTarget("send");
+        check(res.ok && res.tier == "L1_AX", "exec L1: ok via AX");
+        check(close(res.globalPt, button.center()) && close(m.clickPt, button.center()), "exec L1: clicks the AXButton centre");
+        check(m.highlightRect == button && close(m.pulsePt, button.center()), "exec L1: ring on the button, pulse at its centre");
+        check(m.effects() == QStringList({"reticleHighlight", "reticlePulse", "click"}), "exec L1: highlight -> pulse -> click only");
+        check(!m.calls.contains("capture") && !m.calls.contains("ground"), "exec L1: no capture, no grounding");
+        check(m.calls.contains("inspectDisplay:7"), "exec L1: inspects the primary display");
+        check(!m.clickDouble, "exec L1: single click by default");
+        MockRig d;
+        d.nodes = {axNode(2, "AXButton", "Open", button)};
+        CuaExecutor exd(d.hooks());
+        exd.setPreferAxPress(true);
+        check(exd.clickTarget("Open").ok && d.calls.contains("axPress") && !d.calls.contains("click"), "exec L1: AXPress when preferred");
+        d.calls.clear();
+        exd.clickTarget("Open", true);
+        check(d.calls.contains("click") && d.clickDouble, "exec L1: double click always posts a visible click");
+    }
+
+    // L3 fallback: capture excludes the reticle, point_1000 maps onto a 2x Retina display.
+    {
+        MockRig m;
+        m.nodes = {axNode(1, "AXGroup", "Toolbar", {0, 0, 1440, 40})};
+        m.ground.ok = true; m.ground.hasPoint1000 = true; m.ground.point1000 = {250, 500};
+        CuaExecutor ex(m.hooks());
+        const auto res = ex.clickTarget("the gear icon", false, true);
+        check(res.ok && res.tier == "L3_VLM", "exec L3: ok via VLM");
+        check(m.capturedDisplay == 7 && m.capturedWidth == 1280 && m.capturedExclude == 4242,
+            "exec L3: captures the primary display at 1280 px, excluding the reticle window");
+        check(m.groundInstruction == "the gear icon" && m.groundRefine, "exec L3: instruction and refine_crop forwarded");
+        // 1440x900 pt at 2x = 2880x1800 px, captured at 1280x800: 250/1000 -> 360 pt, 500/1000 -> 450 pt.
+        check(close(res.globalPt, {360, 450}) && close(m.clickPt, {360, 450}), "exec L3: point_1000 -> Quartz global points");
+        check(m.effects() == QStringList({"capture", "ground", "reticleMove", "reticlePulse", "click"}),
+            "exec L3: capture -> ground -> move -> pulse -> click");
+        check(close(m.movePt, {360, 450}) && close(m.pulsePt, {360, 450}), "exec L3: reticle lands on the click point");
+        check(expectedCaptureSize(m.displays[0], 1280) == QSizeF(1280, 800), "exec L3: expected capture size 1280x800");
+    }
+    {
+        // point_px on the capture with a grounder-reported image size.
+        MockRig m;
+        m.displays = {{3, "primary", {0, 0, 1512, 982}, 2, true}};
+        m.ground.ok = true; m.ground.hasPointPx = true; m.ground.pointPx = {640, 100}; m.ground.imageSize = {1280, 831};
+        CuaExecutor ex(m.hooks());
+        const auto res = ex.clickTarget("Canvas brush");
+        check(res.ok && std::abs(res.globalPt.x() - 756) < 1e-6 && std::abs(res.globalPt.y() - 100 * 982.0 / 831) < 1e-6,
+            "exec L3: point_px uses the reported image size");
+    }
+    {
+        // An off-display VLM point never clicks.
+        MockRig m;
+        m.ground.ok = true; m.ground.hasPointPx = true; m.ground.pointPx = {5000, 5000}; m.ground.imageSize = {1280, 800};
+        CuaExecutor ex(m.hooks());
+        const auto res = ex.clickTarget("ghost");
+        check(!res.ok && res.tier == "ERR" && !m.calls.contains("click"), "exec L3: off-display point is rejected");
+    }
+    {
+        // Grounder offline: clean failure, no click, no pulse, reticle hidden.
+        MockRig m;
+        m.ground.ok = false; m.ground.detail = "Grounder offline (Couldn't connect to server)";
+        CuaExecutor ex(m.hooks());
+        const auto res = ex.clickTarget("unlabeled icon");
+        check(!res.ok && res.tier == "ERR" && res.detail.contains("offline"), "exec L3 offline: ok=false with the reason");
+        check(!m.calls.contains("click") && !m.calls.contains("reticlePulse") && !m.calls.contains("axPress"),
+            "exec L3 offline: no click posted");
+        check(m.calls.contains("reticleHide"), "exec L3 offline: reticle hidden");
+        MockRig c;
+        c.jpeg.clear();
+        CuaExecutor exc(c.hooks());
+        const auto rc = exc.clickTarget("anything");
+        check(!rc.ok && rc.detail.contains("denied") && !c.calls.contains("ground") && !c.calls.contains("click"),
+            "exec L3: capture failure skips grounding and clicking");
+        check(!exc.clickTarget("   ").ok, "exec: blank target rejected");
+        // The real HTTP hook against a closed port fails fast and cleanly.
+        qputenv("LAPIS_CUA_GROUNDER_URL", "http://127.0.0.1:9/ground");
+        QElapsedTimer t; t.start();
+        const GroundResult g = httpGroundPixel("x", "button", false);
+        check(!g.ok && !g.detail.isEmpty() && t.elapsed() < 4500, "exec: real grounder hook offline -> ok=false within 4 s");
+        check(grounderUrl() == "http://127.0.0.1:9/ground", "exec: LAPIS_CUA_GROUNDER_URL override");
+        qunsetenv("LAPIS_CUA_GROUNDER_URL");
+        check(grounderUrl() == "http://127.0.0.1:18120/ground", "exec: default grounder URL");
+    }
+
+    // Grounder JSON.
+    {
+        const auto a = parseGroundReply(R"({"point_1000":[120,880],"image_size":[1280,800]})");
+        check(a.ok && a.hasPoint1000 && close(a.point1000, {120, 880}) && a.imageSize == QSizeF(1280, 800), "ground json: array point + size");
+        const auto b = parseGroundReply(R"({"point_px":{"x":10,"y":20},"image_size":{"width":640,"height":400}})");
+        check(b.ok && !b.hasPoint1000 && close(b.pointPx, {10, 20}) && b.imageSize == QSizeF(640, 400), "ground json: object point + size");
+        check(!parseGroundReply(R"({"ok":false,"error":"no match"})").ok && parseGroundReply(R"({"ok":false,"error":"no match"})").detail == "no match",
+            "ground json: explicit failure");
+        check(!parseGroundReply("garbage").ok && !parseGroundReply(R"({"point_1000":[1200,5]})").ok, "ground json: junk and out-of-range rejected");
+        const auto req = QJsonDocument::fromJson(buildGroundRequest("abc", "Send", true)).object();
+        check(req.value("image_b64").toString() == "YWJj" && req.value("instruction").toString() == "Send"
+                  && req.value("refine_crop").toBool(),
+            "ground json: request carries image_b64, instruction, refine_crop");
+    }
+
+    // typeIntoTarget: click visibly, then type; nothing typed when the click fails.
+    {
+        MockRig m;
+        m.nodes = {axNode(1, "AXTextField", "Search", {50, 60, 300, 28})};
+        CuaExecutor ex(m.hooks());
+        const auto res = ex.typeIntoTarget("search", "hello world");
+        check(res.ok && res.tier == "L1_AX" && m.typed == "hello world", "exec type: ok, text typed");
+        check(m.effects() == QStringList({"reticleHighlight", "reticlePulse", "click", "type"}), "exec type: highlight -> pulse -> click -> type");
+        MockRig f;
+        f.ground.ok = false;
+        CuaExecutor exf(f.hooks());
+        check(!exf.typeIntoTarget("missing", "secret").ok && !f.calls.contains("type"), "exec type: no typing after a failed click");
+    }
+
+    // scrollTarget: glide to the target, then scroll there; centre fallback when it is not found.
+    {
+        MockRig m;
+        const QRectF list(200, 100, 400, 600);
+        m.nodes = {axNode(1, "AXButton", "Results", list)};
+        CuaExecutor ex(m.hooks());
+        const auto res = ex.scrollTarget("results", -5);
+        check(res.ok && res.tier == "L1_AX" && close(m.scrollPt, list.center()) && m.scrollDy == -5, "exec scroll: scrolls the AX target");
+        check(m.effects() == QStringList({"reticleHighlight", "reticleMove", "scroll"}), "exec scroll: highlight -> move -> scroll");
+        MockRig c;
+        c.ground.ok = false;
+        CuaExecutor exc(c.hooks());
+        const auto rc = exc.scrollTarget("nowhere", 3);
+        check(rc.ok && rc.tier == "CENTER" && close(c.scrollPt, {720, 450}), "exec scroll: unknown target scrolls the display centre");
+        check(c.effects().mid(c.effects().indexOf("reticleMove")) == QStringList({"reticleMove", "scroll"}), "exec scroll: centre glide before scroll");
+        MockRig e;
+        CuaExecutor exe(e.hooks());
+        const auto re = exe.scrollTarget("", 2);
+        check(re.ok && !e.calls.contains("capture") && e.effects() == QStringList({"reticleMove", "scroll"}), "exec scroll: empty target skips grounding");
+        check(!exe.scrollTarget("x", 0).ok, "exec scroll: zero delta rejected");
+    }
+
+    // runOnMainThread: direct on the main thread, marshalled from a worker.
+    {
+        QThread *mainThread = QThread::currentThread();
+        QThread *ranOn = nullptr;
+        runOnMainThread([&] { ranOn = QThread::currentThread(); });
+        check(ranOn == mainThread, "exec: main-thread call runs inline");
+        ranOn = nullptr;
+        QEventLoop loop;
+        auto *worker = QThread::create([&] { runOnMainThread([&] { ranOn = QThread::currentThread(); }); });
+        QObject::connect(worker, &QThread::finished, &loop, &QEventLoop::quit);
+        worker->start();
+        loop.exec();
+        worker->wait();
+        delete worker;
+        check(ranOn == mainThread, "exec: worker call is marshalled onto the main thread");
+    }
+}
 void liveTests() {
     const auto displays = listDisplays();
     check(!displays.isEmpty(), "live display enumeration");
@@ -231,7 +453,7 @@ void captureSmokeTest() {
 int main(int argc, char **argv) {
     QCoreApplication app(argc, argv);
     geometryTests(); leaseTests(); formattingTests(); cancellationTests(); liveTests();
-    reticleGeometryTests(); reticleOffscreenTests();
+    reticleGeometryTests(); reticleOffscreenTests(); executorTests();
     if (app.arguments().contains("--capture-smoke")) captureSmokeTest();
     std::printf("test_cua: %d passed, %d failed\n", passed, failed);
     return failed ? 1 : 0;

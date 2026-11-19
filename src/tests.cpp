@@ -5018,6 +5018,58 @@ void studioControlTests()
         const QList<StudioCommand> t2 = extractActionTags(&b);
         check(t2.size() == 1 && t2[0].arg == "night drive" && b.isEmpty(), "studio cmd: tag with an argument");
     }
+    // --- Visible computer use: cua_click / cua_type / cua_scroll tags (mock backend never actuates) ---
+    {
+        QString a = QStringLiteral("[[ACTION:cua_click:Send button]] [[ACTION:cua_type:Search field|hello: world]] "
+                                   "[[ACTION:cua_scroll:results list|-5]] Done.");
+        const QList<StudioCommand> tags = extractActionTags(&a);
+        check(tags.size() == 3 && tags[0].action == "cua_click" && tags[0].arg == "Send button"
+                  && tags[1].action == "cua_type" && tags[1].arg == "Search field|hello: world"
+                  && tags[2].action == "cua_scroll" && tags[2].arg == "results list|-5" && a == "Done.",
+              "cua: [[ACTION:cua_click/cua_type/cua_scroll]] tags are known actions", a);
+        const ParsedModelOutput p = parseStudioModelOutput(QStringLiteral("Sure. [[ACTION:cua_type:To: field|a|b]]"));
+        check(p.actions.size() == 1 && p.actions[0].name == "cua_type" && p.actions[0].arg == "To: field|a|b"
+                  && p.cleanText == "Sure.",
+              "cua: compound parser keeps ':' and '|' inside the arg");
+
+        const CuaCommand click = parseCuaAction("cua_click", "  Send   button ");
+        check(click.valid && click.kind == "click" && click.target == "Send button", "cua: click target simplified");
+        check(!parseCuaAction("cua_click", "  ").valid, "cua: empty click target rejected");
+        const CuaCommand type = parseCuaAction("cua_type", "To: field|a|b ");
+        check(type.valid && type.kind == "type" && type.target == "To: field" && type.text == "a|b ",
+              "cua: type splits at the first '|', text verbatim", type.target + " / " + type.text);
+        check(!parseCuaAction("cua_type", "no separator").valid && !parseCuaAction("cua_type", "field|").valid,
+              "cua: type without a target|text pair rejected");
+        const CuaCommand sc = parseCuaAction("cua_scroll", "a|b list|-7");
+        check(sc.valid && sc.kind == "scroll" && sc.target == "a|b list" && sc.deltaY == -7,
+              "cua: scroll splits at the last '|'");
+        check(parseCuaAction("cua_scroll", "page|down").deltaY == -5 && parseCuaAction("cua_scroll", "up").deltaY == 5
+                  && parseCuaAction("cua_scroll", "up").target.isEmpty(),
+              "cua: scroll up/down words, bare amount scrolls the display");
+        check(!parseCuaAction("cua_scroll", "list|0").valid && !parseCuaAction("cua_scroll", "list|lots").valid
+                  && parseCuaAction("cua_scroll", "list|9999").deltaY == 100,
+              "cua: scroll rejects zero / junk and clamps huge deltas");
+
+        Backend b(Backend::Mode::Mock);
+        QStringList finished;
+        QObject::connect(&b, &Backend::cuaActionFinished, [&](const QString &act, const QString &target, bool ok,
+                                                            const QString &tier, const QString &) {
+            finished << QStringLiteral("%1:%2:%3:%4").arg(act, target, ok ? "1" : "0", tier);
+        });
+        const QString r1 = b.dispatchStudioAction("cua_click", "Send button");
+        const QString r2 = b.dispatchStudioAction("cua_type", "Search|lapis");
+        const QString r3 = b.dispatchStudioAction("cua_scroll", "results|-3");
+        check(r1.contains("Clicking Send button") && r1.contains("not run") && r2.contains("Typing into Search")
+                  && r3.contains("Scrolling results"),
+              "cua: mock dispatch confirms without running", r1 + " | " + r2 + " | " + r3);
+        check(b.cuaLog() == QStringList({"cua_click:Send button", "cua_type:Search|lapis", "cua_scroll:results|-3"}),
+              "cua: mock backend records every action", b.cuaLog().join(" | "));
+        check(finished.size() == 3 && finished[0] == "cua_click:Send button:1:MOCK" && b.cuaPending() == 0,
+              "cua: mock emits cuaActionFinished with tier MOCK, nothing pending", finished.join(" | "));
+        check(b.dispatchStudioAction("cua_type", "no bar").isEmpty() && b.cuaLog().size() == 3,
+              "cua: an invalid cua arg is not dispatched");
+        check(kCompatSystemPrompt.contains("cua_click:<on-screen target>"), "cua: the system prompt teaches the cua tags");
+    }
     check(kCompatSystemPrompt.contains("[[ACTION:") && kCompatSystemPrompt.contains("1-3 crisp sentences"),
           "studio cmd: the system prompt teaches [[ACTION:..]] and short answers");
 

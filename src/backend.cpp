@@ -2,6 +2,7 @@
 
 #include "fixtures.hpp"
 #include "ingest/ambient.hpp"
+#include "mac/cua_executor.hpp"
 #include "pdfrender.hpp"
 
 #include <QDateTime>
@@ -1179,6 +1180,15 @@ Backend::Backend(Mode mode, QObject *parent, bool warmHelpers)
 
 Backend::~Backend()
 {
+    if (m_cuaPool) {
+        // A running action may be blocked on a reticle call queued to this (main) thread: cancel
+        // its input, keep serving the event loop until it returns, then drop the latch.
+        studio::cua::cancelFlag.store(true);
+        m_cuaPool->clear();
+        while (!m_cuaPool->waitForDone(10))
+            QCoreApplication::processEvents(QEventLoop::AllEvents, 10);
+        studio::cua::cancelFlag.store(false);
+    }
     if (m_prefsSave.isActive())
         savePrefs();
     if (m_router)
@@ -4398,7 +4408,42 @@ QStringList studioActionNames()
             QStringLiteral("spotify_pause"),  QStringLiteral("spotify_next"),  QStringLiteral("spotify_prev"),
             QStringLiteral("spotify_volume"), QStringLiteral("focus_project"), QStringLiteral("open_stage"),
             QStringLiteral("open_ladder"),    QStringLiteral("go_home"),       QStringLiteral("sort_map"),
-            QStringLiteral("move_cluster")};
+            QStringLiteral("move_cluster"),   QStringLiteral("cua_click"),     QStringLiteral("cua_type"),
+            QStringLiteral("cua_scroll")};
+}
+
+CuaCommand parseCuaAction(const QString &action, const QString &arg)
+{
+    CuaCommand c;
+    const QString a = action.trimmed().toLower();
+    if (a == QLatin1String("cua_click")) {
+        c.kind = QStringLiteral("click");
+        c.target = arg.simplified();
+        c.valid = !c.target.isEmpty();
+    } else if (a == QLatin1String("cua_type")) {
+        c.kind = QStringLiteral("type");
+        const qsizetype bar = arg.indexOf(QLatin1Char('|'));
+        if (bar < 0)
+            return c;
+        c.target = arg.left(bar).simplified();
+        c.text = arg.mid(bar + 1);  // typed verbatim, spaces included
+        c.valid = !c.target.isEmpty() && !c.text.isEmpty();
+    } else if (a == QLatin1String("cua_scroll")) {
+        c.kind = QStringLiteral("scroll");
+        const qsizetype bar = arg.lastIndexOf(QLatin1Char('|'));
+        const QString amount = (bar < 0 ? arg : arg.mid(bar + 1)).trimmed().toLower();
+        c.target = bar < 0 ? QString() : arg.left(bar).simplified();
+        bool ok = false;
+        const int n = amount.toInt(&ok);
+        if (ok)
+            c.deltaY = std::clamp(n, -100, 100);
+        else if (amount == QLatin1String("up"))
+            c.deltaY = 5;
+        else if (amount == QLatin1String("down"))
+            c.deltaY = -5;
+        c.valid = c.deltaY != 0;
+    }
+    return c;
 }
 
 QStringList defaultClusterOrder()
@@ -4975,11 +5020,60 @@ QString Backend::dispatchStudioAction(const QString &action, const QString &arg)
         reply = on ? QStringLiteral("Code diffs are on.") : QStringLiteral("Code diffs are hidden.");
     } else if (a == QLatin1String("spawn_agent")) {
         return spawnAgent(m_commandProject.isEmpty() ? m_focusedProject : m_commandProject, arg, false);
+    } else if (a.startsWith(QLatin1String("cua_"))) {
+        const CuaCommand c = parseCuaAction(a, arg);
+        if (!c.valid)
+            return {};
+        reply = startCuaAction(a, c);
+        emitArg = c.target;
     } else {
         return {};
     }
     emit uiActionRequested(a, emitArg);
     return reply;
+}
+
+QString Backend::startCuaAction(const QString &action, const CuaCommand &c)
+{
+    const QString verb = c.kind == QLatin1String("type")     ? QStringLiteral("Typing into %1").arg(c.target)
+                         : c.kind == QLatin1String("scroll") ? (c.target.isEmpty() ? QStringLiteral("Scrolling")
+                                                                                    : QStringLiteral("Scrolling %1").arg(c.target))
+                                                             : QStringLiteral("Clicking %1").arg(c.target);
+    const QString logLine = action + QLatin1Char(':') + c.target
+                            + (c.kind == QLatin1String("type")     ? QLatin1Char('|') + c.text
+                               : c.kind == QLatin1String("scroll") ? QLatin1Char('|') + QString::number(c.deltaY)
+                                                                   : QString());
+    if (m_mode != Mode::Live) {
+        // --test and every mock backend: record only, never capture, click or type.
+        m_cuaLog << logLine;
+        emit cuaActionFinished(action, c.target, true, QStringLiteral("MOCK"), QStringLiteral("recorded, not run"));
+        return verb + QStringLiteral(" (recorded, not run).");
+    }
+    if (!m_cuaPool) {
+        m_cuaPool = new QThreadPool(this);
+        m_cuaPool->setMaxThreadCount(1);  // one visible action at a time, in order
+    }
+    ++m_cuaPending;
+    QPointer<Backend> self(this);
+    m_cuaPool->start([self, action, c, logLine] {
+        studio::cua::CuaExecutor ex;
+        const studio::cua::CuaExecResult r = c.kind == QLatin1String("type")     ? ex.typeIntoTarget(c.target, c.text)
+                                             : c.kind == QLatin1String("scroll") ? ex.scrollTarget(c.target, c.deltaY)
+                                                                                 : ex.clickTarget(c.target);
+        QMetaObject::invokeMethod(
+            QCoreApplication::instance(),
+            [self, action, target = c.target, logLine, r] {
+                if (!self)
+                    return;
+                self->m_cuaPending = std::max(0, self->m_cuaPending - 1);
+                self->m_cuaLog << QStringLiteral("%1 -> %2 %3").arg(logLine, r.ok ? r.tier : QStringLiteral("ERR"), r.detail);
+                while (self->m_cuaLog.size() > 50)
+                    self->m_cuaLog.removeFirst();
+                emit self->cuaActionFinished(action, target, r.ok, r.tier, r.detail);
+            },
+            Qt::QueuedConnection);
+    });
+    return verb + QStringLiteral("...");
 }
 
 QString Backend::spawnAgent(const QString &projectKey, const QString &task, bool steerLive)
