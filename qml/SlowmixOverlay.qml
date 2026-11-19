@@ -5,12 +5,16 @@ import QtQuick
 // Play / Pause, Loop, Speed, Reverb, Bass. Picking a track applies its learned favorite speed and
 // reverb. Esc closes the card; the music keeps playing.
 //   ↑↓ (j/k, w/s) pick   ⏎ play it   space play / pause   ←→ speed   esc close
+// DualShock 4 (L1+R1 anywhere opens it; StudioApp routes the pad here while it is open):
+//   ↕ pick  ✕ play  □ pause  ◄► / L1 / R1 speed  △ reverb  L2 loop  R2 bass  ○ close
 FocusScope {
     id: root
     objectName: "slowmixOverlay"
     property QtObject backend
     property bool open: false
     property int row: 0
+    // Controller mode: the footer speaks DualShock glyphs (StudioApp binds these).
+    property bool padHints: false
     signal closed()
 
     readonly property QtObject player: backend ? backend.slowmix : null
@@ -64,6 +68,28 @@ FocusScope {
             if (dist < best) { best = dist; i = k; }
         }
         player.setSpeed(speeds[Math.max(0, Math.min(speeds.length - 1, i + d))]);
+    }
+    function togglePlay() { if (player) player.togglePlay(); }
+    function toggleLoop() { if (player) player.setLooping(!player.looping); }
+    // Off -> Hall -> Heavy -> Off.
+    function cycleReverb() {
+        if (!player)
+            return;
+        let i = 0;
+        for (let k = 0; k < reverbs.length; ++k)
+            if (reverbs[k][0] === player.reverb) { i = k; break; }
+        player.setReverb(reverbs[(i + 1) % reverbs.length][0]);
+    }
+    // Flat -> Warm -> Punch -> Flat.
+    function cycleBass() {
+        if (!player)
+            return;
+        let i = 0, best = 1e9;
+        for (let k = 0; k < basses.length; ++k) {
+            const dist = Math.abs(basses[k][0] - player.bass);
+            if (dist < best) { best = dist; i = k; }
+        }
+        player.setBass(basses[(i + 1) % basses.length][0]);
     }
     function speedLabel(s) {
         if (Math.abs(s - 1.0) < 0.001) return "1.0x";
@@ -391,7 +417,8 @@ FocusScope {
                 Text {
                     objectName: "slowmixHints"
                     anchors.verticalCenter: parent.verticalCenter
-                    text: "⏎ play    space pause    ←→ speed    esc close"
+                    text: root.padHints ? "✕ play · □ pause · ◄► speed · △ reverb · ○ close"
+                                        : "⏎ play    space pause    ←→ speed    esc close"
                     color: Theme.faint
                     font.family: Theme.mono
                     font.pixelSize: 13

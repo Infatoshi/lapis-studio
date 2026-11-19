@@ -191,6 +191,29 @@ bool isGenericTabTitle(const QString &title);
 // lapis-peers board snippet, else "tab <shortId>".
 ProjectId sessionProjectId(const SessionInfo &s, const Extracted &ex, const QString &boardSnippet = QString());
 
+// A Studio UI action, either from the fast natural-language matcher or a model's
+// "[[ACTION:name]]" / "[[ACTION:name:arg]]" tag. Actions: open_music, close_music,
+// play_track:<query>, pause_music, resume_music, toggle_music, open_review, filter_needs_me,
+// filter_all, reset_layout, open_settings, open_briefing, set_theme:blue|gold, show_diffs:1|0,
+// spawn_agent:<task>.
+struct StudioCommand {
+    QString action;
+    QString arg;
+    bool steer = false;  // spawn_agent phrased "tell the agent to ...": steer the live peer first
+    bool isEmpty() const { return action.isEmpty(); }
+};
+QStringList studioActionNames();
+// Plain-English UI commands ("can you open the slowmix tab", "play syntheticgod", "switch to
+// lapis blue"); an empty command when the text is a question for the model. Case-insensitive,
+// tolerant of voice-typed filler ("can you", "please", "inside of this").
+StudioCommand parseStudioCommand(const QString &text);
+// Strips every leading [[ACTION:...]] tag from *answer (and the whitespace after it) and returns
+// the known actions in order. Unknown action names are dropped (still stripped).
+QList<StudioCommand> extractActionTags(QString *answer);
+// The track (index into SlowmixController::tracks maps) a spoken query names best, -1 for none.
+// Matches on the name and file name with spaces, underscores and punctuation ignored.
+int matchSlowmixTrack(const QVariantList &tracks, const QString &query);
+
 // One agent row of `lapis-peers board --json`: its status and latest reply snippet ("" when the
 // board withholds it, as for infinity).
 struct BoardRow {
@@ -427,7 +450,7 @@ public:
     void setLlmRouter(LlmRouter *router);
     // Tier 1 trunk (stable project context, no on-screen artifact) and the on-screen slice.
     QString contextTrunk(const QString &projectKey) const;
-    QString contextSlice(const QString &projectKey, int artifactIndex) const;
+    Q_INVOKABLE QString contextSlice(const QString &projectKey, int artifactIndex) const;
     // Island metrics stay hidden unless pinned for that project.
     Q_INVOKABLE void toggleMetricPin(const QString &projectKey);
     // What the latest ask was routed to (tests): model, effort and channel key.
@@ -463,6 +486,23 @@ public:
     Q_INVOKABLE QString startSession(const QString &folder, const QString &harness, const QString &model,
                                      const QString &goal);
     Q_INVOKABLE void ask(const QString &projectKey, int artifactIndex, const QString &question);
+    // Natural-language Studio UI control. True when the text was a UI command: the action ran
+    // (backend-owned state) and uiActionRequested fired for the QML side. ask() and every
+    // conversation stream call it first, so "open music" never reaches a model.
+    Q_INVOKABLE bool tryHandleStudioCommand(const QString &text);
+    // Runs one action (fast matcher or a model's [[ACTION:..]] tag) and returns its 1-line
+    // confirmation ("Opened Music (Slowmix)."); "" when the action is unknown or cannot run.
+    Q_INVOKABLE QString dispatchStudioAction(const QString &action, const QString &arg = QString());
+    // What is on screen, pushed by StudioApp: {view, highlighted, overlays: [..]}. Rides in the
+    // Tier 3 leaf as "Studio live state:" (with every card and the playing track).
+    Q_INVOKABLE void setUiState(const QVariantMap &state);
+    QString studioLiveState() const;
+    // Every Studio exchange, newest last, across models and surfaces (last 10 pairs). It is the
+    // Tier 2 of every OpenAI-compatible ask and rides in the CLI channels' prompt too.
+    QVector<ChatTurn> sharedHistory() const { return m_sharedHistory; }
+    static QString defaultHistoryPath();  // ~/.lapis-next/studio_history.jsonl
+    QString historyPath() const { return m_historyPath; }
+    void setHistoryPath(const QString &path) { m_historyPath = path; }  // empty: no log
     Q_INVOKABLE void think(const QString &projectKey, int artifactIndex, const QString &question);
     Q_INVOKABLE void steer(const QString &projectKey, const QString &text);
     Q_INVOKABLE void editAssumption(const QString &projectKey, int index, const QString &text);
@@ -526,8 +566,23 @@ signals:
     void quickTick();
     void streamDelta(const QString &streamId, const QString &textDelta, const QString &thinkingDelta);
     void streamFinished(const QString &streamId, const QString &error);
+    // A Studio UI action for the QML side to carry out (see StudioCommand).
+    void uiActionRequested(const QString &action, const QString &arg);
 
 private:
+    // tryHandleStudioCommand for a known project (spawn_agent runs in its folder).
+    bool handleStudioCommand(const QString &text, const QString &projectKey, QString *reply);
+    QString spawnAgent(const QString &projectKey, const QString &task, bool steerLive);
+    void noteExchange(const QString &projectKey, const QString &model, const QString &prompt,
+                      const QString &answer);
+    // Model tags in a finished answer: dispatched, stripped from *answer (filled with the
+    // confirmation when the tag was all the model said).
+    void runAnswerTags(QString *answer);
+    QString recentConversationBlock() const;  // the shared ring as plain text (CLI prompts)
+    QVector<ChatTurn> m_sharedHistory;
+    QString m_historyPath;
+    QVariantMap m_uiState;
+    QString m_commandProject;  // project of the ask being handled (spawn_agent's folder)
     struct Ladder {
         QString goal;
         QVariantList assumptions;  // [{text, pinned}]
@@ -600,7 +655,7 @@ private:
     void spawnChannel(Channel *c);
     void onChannelOutput(const QString &key);
     void flushCodex(Channel *c);
-    void finishQuick();
+    void finishQuick(bool ok = true);  // ok: a real answer (tags run, the exchange is shared + logged)
     void evictChannels();
     void ensureTraceHelper();
     void onTraceOutput();
@@ -649,12 +704,14 @@ private:
     QString m_openaiCompatUrl;
     QString m_openaiCompatModel = QStringLiteral("qwen3.8-flash-next");
     QString m_openaiCompatKey;
+    bool m_compatUrlCleared = false;  // setOpenaiCompatUrl("") ran: savePrefs drops the file's URL
     QNetworkAccessManager m_nam;  // suggestion, filter and briefing (one request each at most)
     std::unique_ptr<LlmRouter> m_ownedRouter;
     QPointer<LlmRouter> m_router;
     struct StreamAsk {
         QString question;
         QString answer;
+        QString projectKey;
     };
     QHash<QString, StreamAsk> m_streamAsks;               // in-flight askStream ids
     QHash<QString, QVector<ChatTurn>> m_streamHistory;    // Tier 2 per conversation stream

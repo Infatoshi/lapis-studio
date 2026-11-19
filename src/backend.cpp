@@ -112,6 +112,16 @@ QString oneLine(QString s, int maxWords)
     return clampWords(keep.join(QLatin1Char(' ')), maxWords);
 }
 
+// A quick answer as the answer strip renders it: markdown kept (line breaks, code fences),
+// tool noise gone, capped so a runaway reply never floods the strip.
+QString answerBody(const QString &s)
+{
+    QString out = stripToolNoise(s).trimmed();
+    if (out.size() > 6000)
+        out = out.left(6000) + QStringLiteral("…");
+    return out;
+}
+
 // --- transcript discovery (worker thread, live mode only) -----------------------
 
 QString findTranscript(const SessionInfo &s)
@@ -1476,6 +1486,7 @@ void Backend::loadPrefs()
     m_chatEffort = clampEffort(m_chatModel, o.value(QLatin1String("defaultEffort")).toString(m_chatEffort));
     m_modelSuggestions = o.value(QLatin1String("modelSuggestions")).toBool(false);
     m_openaiCompatUrl = o.value(QLatin1String("openaiCompatUrl")).toString().trimmed();
+    m_compatUrlCleared = false;
     const QString compatModel = o.value(QLatin1String("openaiCompatModel")).toString().trimmed();
     if (!compatModel.isEmpty())
         m_openaiCompatModel = compatModel;
@@ -1558,6 +1569,7 @@ void Backend::setOpenaiCompatUrl(const QString &url)
     if (trimmed == m_openaiCompatUrl)
         return;
     m_openaiCompatUrl = trimmed;
+    m_compatUrlCleared = trimmed.isEmpty();  // an explicit clear is the only way the file loses it
     emit prefsChanged();
     m_prefsSave.start();
 }
@@ -1577,6 +1589,11 @@ bool Backend::savePrefs()
     m_prefsSave.stop();
     if (m_prefsPath.isEmpty())
         return false;
+    // Only the live window may write the real ~/.lapis-next/studio_prefs.json. Mock backends
+    // (--test, --snap-*, the demo) write only to a test's explicit temp path, never the real one.
+    if (m_mode != Mode::Live
+        && QFileInfo(m_prefsPath).absoluteFilePath() == QFileInfo(defaultPrefsPath()).absoluteFilePath())
+        return false;
     const QFileInfo fi(m_prefsPath);
     if (!QFileInfo::exists(fi.absolutePath())) {
         if (!QDir().mkpath(fi.absolutePath()))
@@ -1584,7 +1601,19 @@ bool Backend::savePrefs()
         QFile::setPermissions(fi.absolutePath(),
                               QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner);
     }
+    // Merge over what is on disk: keys this build does not know (or another writer added since
+    // we loaded) survive. The endpoint keys survive unless they were cleared here on purpose.
     QJsonObject o;
+    {
+        QFile old(m_prefsPath);
+        if (old.open(QIODevice::ReadOnly))
+            o = QJsonDocument::fromJson(old.read(256 * 1024)).object();
+    }
+    static const char *const kOwnedOptional[] = {"windowState", "cardPositions", "gamepadBindings", "openaiCompatModel"};
+    for (const char *k : kOwnedOptional)
+        o.remove(QLatin1String(k));
+    if (m_compatUrlCleared)
+        o.remove(QStringLiteral("openaiCompatUrl"));
     o.insert(QStringLiteral("uiScale"), m_uiScale);
     o.insert(QStringLiteral("navMode"), m_navMode);
     o.insert(QStringLiteral("theme"), m_theme);
@@ -2039,6 +2068,7 @@ void Backend::advance(double dt)
             m_quickPhase.clear();
             m_quickSeconds = d;
             m_mockQuick.t = -1;
+            noteExchange(m_commandProject, m_quickModel, m_quickQuestion, m_quickAnswer);
             emit quickChanged();
         } else if (shown != m_quickAnswer || thought != m_quickThinking) {
             if (thought != m_quickThinking)
@@ -2196,6 +2226,24 @@ void Backend::ask(const QString &projectKey, int artifactIndex, const QString &q
     const QString q = question.trimmed();
     if (q.isEmpty())
         return;
+    m_commandProject = projectKey;
+    QString commandReply;
+    if (handleStudioCommand(q, projectKey, &commandReply)) {
+        // A UI command: it already ran; the answer strip shows its one-line confirmation.
+        m_quickQuestion = q;
+        m_quickAnswer = m_quickAnswerRaw = commandReply;
+        m_quickThinking.clear();
+        m_quickThinkRaw.clear();
+        m_quickPhase.clear();
+        m_quickBusy = false;
+        m_quickSeconds = m_quickElapsed = 0;
+        m_quickThinkTokens = -1;
+        m_quickModel = QStringLiteral("studio");
+        m_mockQuick.t = -1;
+        emit quickChanged();
+        emit quickTick();
+        return;
+    }
     m_quickQuestion = q;
     m_quickAnswer.clear();
     m_quickThinking.clear();
@@ -2227,7 +2275,16 @@ void Backend::ask(const QString &projectKey, int artifactIndex, const QString &q
                                          : canned.value(m_mockQuickCount++ % canned.size())};
         return;
     }
-    const QString prompt = contextFor(projectKey, artifactIndex) + QStringLiteral("\n\nQuestion: ") + q;
+    // CLI channels (claude / codex / agy) get the same shared conversation and live screen state
+    // the OpenAI-compatible tiers carry, so a model switch never loses the thread.
+    QString prompt = contextFor(projectKey, artifactIndex);
+    const QString live = studioLiveState();
+    if (!live.isEmpty())
+        prompt += QStringLiteral("\n\nStudio live state:\n") + live;
+    const QString recent = recentConversationBlock();
+    if (!recent.isEmpty())
+        prompt += QStringLiteral("\n\n") + recent;
+    prompt += QStringLiteral("\n\nQuestion: ") + q;
     m_quickClock.start();
     m_quickTicker.start();
     if (providerFor(m_chatModel) == QLatin1String("openai-compat")) {
@@ -2408,8 +2465,12 @@ void Backend::flushCodex(Channel *c)
     }
 }
 
-void Backend::finishQuick()
+void Backend::finishQuick(bool ok)
 {
+    if (ok && m_quickBusy) {
+        runAnswerTags(&m_quickAnswer);  // a model's [[ACTION:..]] runs, and never shows as text
+        noteExchange(m_commandProject, m_quickModel, m_quickQuestion, m_quickAnswer);
+    }
     m_quickBusy = false;
     m_quickPhase.clear();
     m_quickSeconds = m_quickClock.isValid() ? m_quickClock.elapsed() / 1000.0 : 0;
@@ -2426,7 +2487,7 @@ void Backend::askOpenAiCompat(const QString &projectKey, int artifactIndex, cons
         base = qEnvironmentVariable("LAPIS_OPENAI_COMPAT_URL").trimmed();
     if (base.isEmpty()) {
         m_quickAnswer = QStringLiteral("Set openaiCompatUrl in studio_prefs.json or LAPIS_OPENAI_COMPAT_URL");
-        finishQuick();
+        finishQuick(false);
         return;
     }
     while (base.endsWith(QLatin1Char('/')))
@@ -2446,13 +2507,13 @@ void Backend::askOpenAiCompat(const QString &projectKey, int artifactIndex, cons
     LlmRouter *router = llmRouter();
     if (!router) {
         m_quickAnswer = QStringLiteral("openai-compat: no router");
-        finishQuick();
+        finishQuick(false);
         return;
     }
 
     // Tier 0 system + Tier 1 trunk are byte-identical to what warmProjectPrefix() prefilled when
     // the island opened; the on-screen slice, recent actions, Phonon tail and question ride last.
-    const TieredPrompt p = tieredPrompt(projectKey, contextSlice(projectKey, artifactIndex), question);
+    const TieredPrompt p = tieredPrompt(projectKey, contextSlice(projectKey, artifactIndex), question, m_sharedHistory);
     LlmStreamRequest req;
     req.streamId = QString::fromLatin1(kQuickStreamId);
     req.endpoint = endpoint;
@@ -2550,7 +2611,7 @@ void Backend::onRouterFinished(const QString &streamId, const QString &error)
         if (!error.isEmpty())
             m_quickAnswer = QStringLiteral("openai-compat: ") + oneLine(error, 12);
         if (m_quickBusy)
-            finishQuick();
+            finishQuick(error.isEmpty());
         return;
     }
     auto it = m_streamAsks.find(streamId);
@@ -2559,10 +2620,16 @@ void Backend::onRouterFinished(const QString &streamId, const QString &error)
     const StreamAsk done = it.value();
     m_streamAsks.erase(it);
     if (error.isEmpty() && !done.answer.trimmed().isEmpty()) {
+        QString answer = done.answer;
+        const QString keep = m_commandProject;
+        m_commandProject = done.projectKey;
+        runAnswerTags(&answer);  // the card strips the tag itself; the action runs here once
+        m_commandProject = keep;
         QVector<ChatTurn> &h = m_streamHistory[streamId];
-        h << ChatTurn{QStringLiteral("user"), done.question} << ChatTurn{QStringLiteral("assistant"), done.answer};
+        h << ChatTurn{QStringLiteral("user"), done.question} << ChatTurn{QStringLiteral("assistant"), answer};
         while (h.size() > kMaxStreamHistory)
             h.remove(0, 2);  // drop the oldest exchange (re-prefills Tier 2 once)
+        noteExchange(done.projectKey, compatModel(), done.question, answer);
     }
     emit streamFinished(streamId, error);
 }
@@ -2594,6 +2661,13 @@ void Backend::startConversation(const QString &streamId, const QString &projectK
     const QString q = question.trimmed();
     if (streamId.isEmpty() || streamId == QLatin1String(kQuickStreamId) || q.isEmpty())
         return;
+    QString commandReply;
+    if (handleStudioCommand(q, projectKey, &commandReply)) {
+        // A UI command: done already; its confirmation is the whole answer, in any mode.
+        emit streamDelta(streamId, commandReply, QString());
+        emit streamFinished(streamId, QString());
+        return;
+    }
     LlmRouter *router = llmRouter();
     if (!router) {
         emit streamFinished(streamId, QStringLiteral("no LLM router (mock mode)"));
@@ -2604,8 +2678,9 @@ void Backend::startConversation(const QString &streamId, const QString &projectK
         emit streamFinished(streamId, QStringLiteral("Set openaiCompatUrl in studio_prefs.json or LAPIS_OPENAI_COMPAT_URL"));
         return;
     }
-    const TieredPrompt p = tieredPrompt(projectKey, slice, q, m_streamHistory.value(streamId));
-    m_streamAsks.insert(streamId, StreamAsk{q, QString()});
+    // Tier 2 is the shared ring: every Studio exchange, whichever model or card answered it.
+    const TieredPrompt p = tieredPrompt(projectKey, slice, q, m_sharedHistory);
+    m_streamAsks.insert(streamId, StreamAsk{q, QString(), projectKey});
     LlmStreamRequest req;
     req.streamId = streamId;
     req.endpoint = endpoint;
@@ -2624,6 +2699,7 @@ TieredPrompt Backend::tieredPrompt(const QString &projectKey, const QString &sli
     p.trunk = contextTrunk(projectKey);    // Tier 1: byte-identical to warmProjectPrefix()
     p.history = history;                   // Tier 2
     p.targetSlice = slice;                 // Tier 3 from here on
+    p.liveState = studioLiveState();       // what is on screen right now ("" headless)
     p.recentActions = m_recentActions;
     p.phononTail = m_phononTail;
     p.memory = memoryContext(projectKey, question);  // recall rides in Tier 3 only: the prefix stays hot
@@ -2689,7 +2765,7 @@ void Backend::appendAnswer(const QString &delta)
 {
     // Concatenate raw deltas, then clamp: trimming each delta first glued "No, " + "1001" into "No,1001".
     m_quickAnswerRaw += delta;
-    noteAnswer(oneLine(stripToolNoise(m_quickAnswerRaw), 40));
+    noteAnswer(answerBody(m_quickAnswerRaw));
 }
 
 void Backend::onChannelOutput(const QString &key)
@@ -2763,7 +2839,7 @@ void Backend::onChannelOutput(const QString &key)
                 if (current) {
                     const QString resp = o.value(QLatin1String("result")).toObject().value(QLatin1String("response")).toString();
                     if (!resp.isEmpty())
-                        noteAnswer(oneLine(stripToolNoise(resp), 40));
+                        noteAnswer(answerBody(resp));
                     const StreamProgress sp = agyProgress(o);
                     if (sp.thinkingTokens >= 0)
                         m_quickThinkTokens = sp.thinkingTokens;
@@ -2788,7 +2864,7 @@ void Backend::onChannelOutput(const QString &key)
                 if (v.toObject().value(QLatin1String("type")).toString() == QLatin1String("text"))
                     text += v.toObject().value(QLatin1String("text")).toString();
             if (!text.isEmpty()) {
-                noteAnswer(oneLine(stripToolNoise(text), 40));
+                noteAnswer(answerBody(text));
                 changed = true;
             }
         } else if (type == QLatin1String("result")) {
@@ -2796,7 +2872,7 @@ void Backend::onChannelOutput(const QString &key)
             if (current) {
                 const QString r = o.value(QLatin1String("result")).toString();
                 if (!r.isEmpty())
-                    noteAnswer(oneLine(stripToolNoise(r), 40));
+                    noteAnswer(answerBody(r));
                 done = true;
             }
         }
@@ -3108,6 +3184,7 @@ QString Backend::startSession(const QString &folder, const QString &harness, con
         m_kickoff = MockScript{key, 0.0};
         publish();
         emit sessionStarted(key);
+        emit uiActionRequested(QStringLiteral("agent_spawned"), s.id.left(8));
         return key;
     }
 
@@ -3127,6 +3204,8 @@ QString Backend::startSession(const QString &folder, const QString &harness, con
                 setToast(QStringLiteral("new failed: ") + oneLine(QString::fromUtf8(proc->readAllStandardError()) + out, 8));
                 return;
             }
+            setToast(QStringLiteral("Agent %1 opened").arg(m.captured(1)));
+            emit uiActionRequested(QStringLiteral("agent_spawned"), m.captured(1));
             if (!g.isEmpty())
                 QTimer::singleShot(1500, this, [this, id = m.captured(1), g] { sendWithRetry(id, g, 0); });
             m_rescanDebounce.start();
@@ -3894,6 +3973,568 @@ bool Backend::saveTasteRule(const QString &rule, int rating)
                         {QStringLiteral("source"), m_reflectionSource.isEmpty() ? QStringLiteral("manual") : m_reflectionSource}};
     const QByteArray line = QJsonDocument(o).toJson(QJsonDocument::Compact) + '\n';
     return f.write(line) == line.size();
+}
+
+// --- Studio UI commands (natural language + model [[ACTION:..]] tags) ------------------------
+
+namespace {
+
+// Lower case, punctuation as spaces, single-spaced: "Can you open the Slowmix tab?" ->
+// "can you open the slowmix tab".
+QString cmdNorm(const QString &s)
+{
+    QString out;
+    out.reserve(s.size());
+    for (const QChar c : s.toLower())
+        out += c.isLetterOrNumber() ? c : QLatin1Char(' ');
+    return out.simplified();
+}
+
+QString squashAlnum(const QString &s)
+{
+    QString out;
+    for (const QChar c : s.toLower())
+        if (c.isLetterOrNumber())
+            out += c;
+    return out;
+}
+
+// Words a voice-typed command may trail with that never change its meaning.
+bool onlyFiller(const QString &rest)
+{
+    static const QSet<QString> filler{
+        QStringLiteral("inside"), QStringLiteral("of"), QStringLiteral("this"), QStringLiteral("here"),
+        QStringLiteral("for"), QStringLiteral("me"), QStringLiteral("now"), QStringLiteral("please"),
+        QStringLiteral("app"), QStringLiteral("studio"), QStringLiteral("lapis"), QStringLiteral("up"),
+        QStringLiteral("in"), QStringLiteral("the"), QStringLiteral("tab"), QStringLiteral("overlay"),
+        QStringLiteral("panel"), QStringLiteral("card"), QStringLiteral("window"), QStringLiteral("view"),
+        QStringLiteral("screen"), QStringLiteral("right"), QStringLiteral("quickly"), QStringLiteral("thanks"),
+        QStringLiteral("thank"), QStringLiteral("you"), QStringLiteral("again"), QStringLiteral("page"),
+        QStringLiteral("menu"), QStringLiteral("pls"), QStringLiteral("real"), QStringLiteral("quick"),
+        QStringLiteral("player"), QStringLiteral("again")};
+    for (const QString &w : rest.split(QLatin1Char(' '), Qt::SkipEmptyParts))
+        if (!filler.contains(w))
+            return false;
+    return true;
+}
+
+// Leading politeness and wake words: "hey lapis can you please open music" -> "open music".
+QString stripLead(QString n)
+{
+    static const QRegularExpression lead(QStringLiteral(
+        "^(?:hey|ok|okay|yo|so|lapis|studio|please|pls|can you|could you|would you|will you|can u|could u|"
+        "would you mind|i want to|i d like to|i would like to|i want you to|let s|lets|go ahead and|just|now|and)\\s+"));
+    for (int i = 0; i < 8; ++i) {
+        const auto m = lead.match(n);
+        if (!m.hasMatch())
+            break;
+        n = n.mid(m.capturedLength());
+    }
+    return n;
+}
+
+// "^(?:VERBS)\s+(?:the |my )?(?:OBJECTS)" with only filler after it.
+bool verbObject(const QString &n, const QString &verbs, const QString &objects)
+{
+    const QRegularExpression re(QStringLiteral("^(?:%1)\\s+(?:the\\s+|my\\s+)?(?:%2)\\b(.*)$").arg(verbs, objects));
+    const auto m = re.match(n);
+    return m.hasMatch() && onlyFiller(m.captured(1));
+}
+
+const QString kOpenVerbs = QStringLiteral(
+    "open|show|show me|bring up|pull up|launch|go to|switch to|take me to|display|pop up|pop open|start");
+const QString kCloseVerbs = QStringLiteral("close|hide|dismiss|exit|leave|get rid of");
+const QString kMusicWords = QStringLiteral(
+    "music player|slowmix player|music|slowmix|slow mix|slowmix music|songs|song list|player");
+
+}  // namespace
+
+QStringList studioActionNames()
+{
+    return {QStringLiteral("open_music"),     QStringLiteral("close_music"),   QStringLiteral("play_track"),
+            QStringLiteral("pause_music"),    QStringLiteral("resume_music"),  QStringLiteral("toggle_music"),
+            QStringLiteral("open_review"),    QStringLiteral("filter_needs_me"), QStringLiteral("filter_all"),
+            QStringLiteral("reset_layout"),   QStringLiteral("open_settings"), QStringLiteral("open_briefing"),
+            QStringLiteral("set_theme"),      QStringLiteral("show_diffs"),    QStringLiteral("spawn_agent")};
+}
+
+StudioCommand parseStudioCommand(const QString &text)
+{
+    const QString n = stripLead(cmdNorm(text));
+    if (n.isEmpty() || n.split(QLatin1Char(' ')).size() > 40)
+        return {};
+    auto cmd = [](const char *a, const QString &arg = QString()) { return StudioCommand{QString::fromLatin1(a), arg}; };
+
+    // Agent dispatch first: its task text is free-form and may mention anything below.
+    {
+        static const QRegularExpression origLead(
+            QStringLiteral("^(?:hey|ok|okay|yo|so|lapis|studio|please|pls|can you|could you|would you|will you|"
+                           "can u|i want to|i'?d like to|i would like to|i want you to|let'?s|go ahead and|just|now)[,\\s]+"),
+            QRegularExpression::CaseInsensitiveOption);
+        QString o = text.simplified();
+        for (int i = 0; i < 8; ++i) {
+            const auto m = origLead.match(o);
+            if (!m.hasMatch())
+                break;
+            o = o.mid(m.capturedLength());
+        }
+        while (!o.isEmpty() && QStringLiteral("?.!").contains(o.back()))
+            o.chop(1);
+        static const QRegularExpression spawnRe(
+            QStringLiteral("^(?:fire off|spin up|spawn|launch|start|kick off|send|dispatch|get|open|put)\\s+"
+                           "(?:a\\s+|an\\s+|another\\s+|the\\s+|my\\s+)?(?:new\\s+)?(?:coding\\s+)?"
+                           "(?:agent|session|claude|codex|peer|worker)\\s+"
+                           "(?:to\\s+|that\\s+will\\s+|and\\s+(?:have\\s+it\\s+)?|on\\s+|for\\s+|working\\s+on\\s+)(.+)$"),
+            QRegularExpression::CaseInsensitiveOption);
+        static const QRegularExpression tellRe(
+            QStringLiteral("^(?:tell|ask|have|get)\\s+(?:the\\s+|my\\s+|an\\s+|a\\s+|this\\s+)?"
+                           "(?:agent|session|claude|codex|peer|worker)\\s+(?:to\\s+)?(.+)$"),
+            QRegularExpression::CaseInsensitiveOption);
+        auto m = spawnRe.match(o);
+        if (m.hasMatch())
+            return StudioCommand{QStringLiteral("spawn_agent"), m.captured(1).trimmed()};
+        m = tellRe.match(o);
+        if (m.hasMatch()) {
+            StudioCommand c{QStringLiteral("spawn_agent"), m.captured(1).trimmed()};
+            c.steer = true;
+            return c;
+        }
+    }
+
+    // Theme: "switch to lapis blue", "use the gold theme", "blue mode".
+    {
+        static const QRegularExpression themeRe(QStringLiteral(
+            "^(?:(?:switch|change|set|use|go|make it|turn it|flip|put it)\\s+(?:back\\s+)?(?:to\\s+|the\\s+theme\\s+to\\s+|"
+            "theme\\s+to\\s+|it\\s+to\\s+|on\\s+)?(?:the\\s+)?)?(lapis blue|blue|gold|golden|amber)"
+            "(?:\\s+(?:theme|mode|accent|color|colour|look))?(.*)$"));
+        const auto m = themeRe.match(n);
+        if (m.hasMatch() && onlyFiller(m.captured(2))) {
+            const bool explicitVerb = !n.startsWith(m.captured(1));
+            const bool themeWord = n.contains(QLatin1String("theme")) || n.contains(QLatin1String("mode"))
+                                   || n.contains(QLatin1String("accent")) || n.contains(QLatin1String("lapis blue"));
+            if (explicitVerb || themeWord)
+                return cmd("set_theme", m.captured(1) == QLatin1String("gold") || m.captured(1) == QLatin1String("golden")
+                                                || m.captured(1) == QLatin1String("amber")
+                                            ? QStringLiteral("gold")
+                                            : QStringLiteral("blue"));
+        }
+    }
+
+    // Code diffs on the Stage.
+    {
+        static const QRegularExpression diffRe(QStringLiteral(
+            "^(show|hide|turn on|turn off|enable|disable|display)\\s+(?:the\\s+|me\\s+the\\s+|me\\s+)?(?:code\\s+)?"
+            "(?:diffs?|code changes|code)\\b(.*)$"));
+        auto m = diffRe.match(n);
+        if (m.hasMatch() && onlyFiller(m.captured(2))) {
+            const QString v = m.captured(1);
+            const bool on = v == QLatin1String("show") || v == QLatin1String("turn on") || v == QLatin1String("enable")
+                            || v == QLatin1String("display");
+            return cmd("show_diffs", on ? QStringLiteral("1") : QStringLiteral("0"));
+        }
+        static const QRegularExpression diffOnOff(
+            QStringLiteral("^turn\\s+(?:the\\s+)?(?:code\\s+)?diffs?\\s+(on|off)\\b(.*)$"));
+        m = diffOnOff.match(n);
+        if (m.hasMatch() && onlyFiller(m.captured(2)))
+            return cmd("show_diffs", m.captured(1) == QLatin1String("on") ? QStringLiteral("1") : QStringLiteral("0"));
+    }
+
+    // Music overlay and playback.
+    if (verbObject(n, kOpenVerbs, kMusicWords))
+        return cmd("open_music");
+    if (verbObject(n, kCloseVerbs, kMusicWords))
+        return cmd("close_music");
+    {
+        static const QRegularExpression pauseRe(QStringLiteral(
+            "^(?:pause|stop|mute|halt|silence)(?:\\s+(?:the\\s+|my\\s+)?(?:music|song|track|playback|slowmix|it|audio|player))?(.*)$"));
+        const auto m = pauseRe.match(n);
+        if (m.hasMatch() && onlyFiller(m.captured(1)))
+            return cmd("pause_music");
+        static const QRegularExpression resumeRe(QStringLiteral(
+            "^(?:resume|unpause|un pause|continue|keep playing|unmute)(?:\\s+(?:the\\s+|my\\s+)?(?:music|song|track|playback|slowmix|it|audio|player|playing))?(.*)$"));
+        const auto r = resumeRe.match(n);
+        if (r.hasMatch() && onlyFiller(r.captured(1)))
+            return cmd("resume_music");
+        static const QRegularExpression toggleRe(QStringLiteral(
+            "^(?:toggle|play pause|play or pause)(?:\\s+(?:the\\s+)?(?:music|playback|slowmix|song|track))?(.*)$"));
+        const auto t = toggleRe.match(n);
+        if (t.hasMatch() && onlyFiller(t.captured(1)))
+            return cmd("toggle_music");
+        static const QRegularExpression playRe(QStringLiteral(
+            "^(?:play|put on|queue up|queue|start playing|listen to|throw on)(?:\\s+(.*))?$"));
+        const auto p = playRe.match(n);
+        if (p.hasMatch()) {
+            QString what = p.captured(1).trimmed();
+            static const QRegularExpression lead(QStringLiteral("^(?:the|my|some|a|song|track|tune)\\s+"));
+            static const QRegularExpression tail(QStringLiteral(
+                "\\s+(?:on slowmix|in slowmix|on the music|please|for me|now|again|song|track)$"));
+            for (int i = 0; i < 4; ++i) {
+                what = what.remove(lead).remove(tail).trimmed();
+            }
+            static const QSet<QString> generic{QStringLiteral("music"), QStringLiteral("something"), QStringLiteral("song"),
+                                               QStringLiteral("slowmix"), QStringLiteral("it"), QStringLiteral("songs"),
+                                               QStringLiteral("tunes"), QStringLiteral("anything"), QStringLiteral("")};
+            if (generic.contains(what))
+                return cmd("resume_music");
+            return cmd("play_track", what);
+        }
+    }
+
+    if (verbObject(n, kOpenVerbs, QStringLiteral("session review|end of session review|review|reflection|session reflection")))
+        return cmd("open_review");
+    if (verbObject(n, kOpenVerbs, QStringLiteral("settings|preferences|prefs|controller settings|controller map")))
+        return cmd("open_settings");
+    if (verbObject(n, kOpenVerbs, QStringLiteral("morning briefing|briefing|brief|daily briefing")))
+        return cmd("open_briefing");
+    {
+        static const QRegularExpression needsRe(QStringLiteral(
+            "^(?:show|filter|filter to|show only|only show|just show|switch to|go to|open)\\s+(?:me\\s+)?(?:only\\s+)?(?:the\\s+)?"
+            "(?:what\\s+|cards\\s+that\\s+|projects\\s+that\\s+|sessions\\s+that\\s+|ones\\s+that\\s+|agents\\s+that\\s+)?"
+            "(?:needs? me|need my attention|needs my attention|waiting on me|blocked on me)(.*)$"));
+        const auto m = needsRe.match(n);
+        if (m.hasMatch() && onlyFiller(m.captured(1).replace(QLatin1String("filter"), QString())
+                                           .replace(QLatin1String("cards"), QString())))
+            return cmd("filter_needs_me");
+        static const QRegularExpression allRe(QStringLiteral(
+            "^(?:show|show me|see|go back to)\\s+(?:all|every|everything)\\s*(?:of\\s+)?(?:the\\s+|my\\s+)?(cards|projects|islands|sessions|agents)?(.*)$"));
+        const auto a = allRe.match(n);
+        if (a.hasMatch() && onlyFiller(a.captured(2)))
+            return cmd("filter_all");
+        static const QRegularExpression clearRe(QStringLiteral("^(?:clear|remove|reset|drop)\\s+(?:the\\s+)?filters?(.*)$"));
+        const auto c = clearRe.match(n);
+        if (c.hasMatch() && onlyFiller(c.captured(1)))
+            return cmd("filter_all");
+    }
+    {
+        static const QRegularExpression layoutRe(QStringLiteral(
+            "^(?:reset|restore|tidy|tidy up|rearrange|re arrange|clean up|snap back)\\s+(?:the\\s+|my\\s+)?(?:card\\s+|cards\\s+)?"
+            "(?:layout|cards|positions|card positions|constellation)(.*)$"));
+        const auto m = layoutRe.match(n);
+        if (m.hasMatch() && onlyFiller(m.captured(1)))
+            return cmd("reset_layout");
+    }
+    return {};
+}
+
+QList<StudioCommand> extractActionTags(QString *answer)
+{
+    QList<StudioCommand> out;
+    if (!answer)
+        return out;
+    static const QRegularExpression tag(QStringLiteral("^\\s*\\[\\[ACTION:([A-Za-z_]+)(?::([^\\]]*))?\\]\\]\\s*"));
+    const QStringList known = studioActionNames();
+    for (int i = 0; i < 6; ++i) {
+        const auto m = tag.match(*answer);
+        if (!m.hasMatch())
+            break;
+        const QString name = m.captured(1).toLower();
+        if (known.contains(name))
+            out << StudioCommand{name, m.captured(2).trimmed()};
+        answer->remove(0, m.capturedLength());
+    }
+    return out;
+}
+
+int matchSlowmixTrack(const QVariantList &tracks, const QString &query)
+{
+    static const QSet<QString> stop{QStringLiteral("the"), QStringLiteral("song"), QStringLiteral("track"),
+                                    QStringLiteral("a"),   QStringLiteral("by"),   QStringLiteral("please"),
+                                    QStringLiteral("for"), QStringLiteral("me"),   QStringLiteral("on"),
+                                    QStringLiteral("slowmix"), QStringLiteral("music"), QStringLiteral("again")};
+    QStringList words;
+    for (const QString &w : cmdNorm(query).split(QLatin1Char(' '), Qt::SkipEmptyParts))
+        if (!stop.contains(w))
+            words << w;
+    const QString q = words.join(QString());
+    if (q.size() < 2)
+        return -1;
+    int best = -1, bestScore = 0;
+    for (int i = 0; i < tracks.size(); ++i) {
+        const QVariantMap t = tracks[i].toMap();
+        const QString name = squashAlnum(t.value(QStringLiteral("name")).toString());
+        const QString file = squashAlnum(QFileInfo(t.value(QStringLiteral("fileName")).toString()).completeBaseName());
+        int score = 0;
+        for (const QString &cand : {name, file}) {
+            if (cand.isEmpty())
+                continue;
+            if (cand == q)
+                score = std::max(score, 100);
+            else if (cand.startsWith(q))
+                score = std::max(score, 90);
+            else if (cand.contains(q))
+                score = std::max(score, 80);
+            else if (words.size() > 1) {
+                bool all = true;
+                for (const QString &w : words)
+                    all = all && cand.contains(squashAlnum(w));
+                if (all)
+                    score = std::max(score, 60);
+            }
+        }
+        if (score > bestScore) {  // ties keep the earlier (more-played) track
+            bestScore = score;
+            best = i;
+        }
+    }
+    return best;
+}
+
+QString Backend::defaultHistoryPath()
+{
+    return home() + QStringLiteral("/.lapis-next/studio_history.jsonl");
+}
+
+bool Backend::tryHandleStudioCommand(const QString &text)
+{
+    QString reply;
+    return handleStudioCommand(text, m_focusedProject, &reply);
+}
+
+bool Backend::handleStudioCommand(const QString &text, const QString &projectKey, QString *reply)
+{
+    const StudioCommand c = parseStudioCommand(text);
+    if (c.isEmpty())
+        return false;
+    const QString keep = m_commandProject;
+    m_commandProject = projectKey;
+    const QString r = c.action == QLatin1String("spawn_agent") ? spawnAgent(projectKey, c.arg, c.steer)
+                                                               : dispatchStudioAction(c.action, c.arg);
+    m_commandProject = keep;
+    if (r.isEmpty())
+        return false;  // e.g. "play <something that is not a song>": the model answers it
+    if (reply)
+        *reply = r;
+    noteExchange(projectKey, QStringLiteral("studio"), text.trimmed(), r);
+    return true;
+}
+
+QString Backend::dispatchStudioAction(const QString &action, const QString &arg)
+{
+    const QString a = action.trimmed().toLower();
+    auto speedLabel = [](double s) {
+        return std::abs(s - std::round(s)) < 0.001 ? QString::number(s, 'f', 1) + QLatin1Char('x')
+                                                   : QString::number(s, 'g', 3) + QLatin1Char('x');
+    };
+    QString reply;
+    QString emitArg = arg;
+    if (a == QLatin1String("open_music")) {
+        reply = QStringLiteral("Opened Music (Slowmix).");
+    } else if (a == QLatin1String("close_music")) {
+        reply = QStringLiteral("Closed Music; playback keeps going.");
+    } else if (a == QLatin1String("play_track")) {
+        m_slowmix.refresh();
+        QVariantList pool = m_slowmix.tracks();
+        int i = matchSlowmixTrack(pool, arg);
+        if (i < 0) {
+            // Not in the 30-day rotation: look through every song in the clips folder.
+            pool.clear();
+            for (const SlowmixTrack &t : curateSlowmixTracks(m_slowmix.clipsDir(), m_slowmix.playsPath(), true))
+                pool << QVariantMap{{QStringLiteral("name"), t.name},
+                                    {QStringLiteral("fileName"), t.fileName},
+                                    {QStringLiteral("path"), t.path}};
+            i = matchSlowmixTrack(pool, arg);
+        }
+        if (i < 0)
+            return {};
+        const QVariantMap t = pool[i].toMap();
+        m_slowmix.selectTrack(t.value(QStringLiteral("path")).toString());
+        emitArg = m_slowmix.currentTrack();
+        reply = QStringLiteral("Playing %1 (%2 %3).").arg(m_slowmix.currentTrack(), speedLabel(m_slowmix.speed()),
+                                                           m_slowmix.reverb());
+    } else if (a == QLatin1String("pause_music")) {
+        if (m_slowmix.playing())
+            m_slowmix.togglePlay();
+        reply = m_slowmix.currentTrack().isEmpty() ? QStringLiteral("Nothing is playing.")
+                                                   : QStringLiteral("Paused %1.").arg(m_slowmix.currentTrack());
+    } else if (a == QLatin1String("resume_music") || a == QLatin1String("toggle_music")) {
+        if (a == QLatin1String("toggle_music") && m_slowmix.playing()) {
+            m_slowmix.togglePlay();
+            reply = QStringLiteral("Paused %1.").arg(m_slowmix.currentTrack());
+        } else if (!m_slowmix.playing()) {
+            if (m_slowmix.currentPath().isEmpty()) {
+                m_slowmix.refresh();
+                const QVariantList tracks = m_slowmix.tracks();
+                if (tracks.isEmpty())
+                    return QStringLiteral("No songs in the clips folder.");
+                m_slowmix.selectTrack(tracks.first().toMap().value(QStringLiteral("path")).toString());
+            } else {
+                m_slowmix.togglePlay();
+            }
+        }
+        if (reply.isEmpty())
+            reply = QStringLiteral("Playing %1.").arg(m_slowmix.currentTrack());
+    } else if (a == QLatin1String("open_review")) {
+        reply = QStringLiteral("Opened Session Review.");
+    } else if (a == QLatin1String("filter_needs_me")) {
+        reply = QStringLiteral("Showing only the cards that need you.");
+    } else if (a == QLatin1String("filter_all")) {
+        reply = QStringLiteral("Showing all cards.");
+    } else if (a == QLatin1String("reset_layout")) {
+        resetCardPositions();
+        reply = QStringLiteral("Reset the card layout.");
+    } else if (a == QLatin1String("open_settings")) {
+        reply = QStringLiteral("Opened Settings.");
+    } else if (a == QLatin1String("open_briefing")) {
+        reply = QStringLiteral("Opened the Morning Briefing.");
+    } else if (a == QLatin1String("set_theme")) {
+        const QString v = arg.trimmed().toLower();
+        const bool gold = v == QLatin1String("gold") || v == QLatin1String("golden") || v == QLatin1String("amber");
+        setTheme(gold ? QStringLiteral("gold") : QStringLiteral("lapis"));
+        emitArg = gold ? QStringLiteral("gold") : QStringLiteral("blue");
+        reply = gold ? QStringLiteral("Switched to the Gold theme.") : QStringLiteral("Switched to Lapis Blue.");
+    } else if (a == QLatin1String("show_diffs")) {
+        const QString v = arg.trimmed().toLower();
+        const bool on = !(v == QLatin1String("0") || v == QLatin1String("off") || v == QLatin1String("false"));
+        setShowCodeDiffs(on);
+        emitArg = on ? QStringLiteral("1") : QStringLiteral("0");
+        reply = on ? QStringLiteral("Code diffs are on.") : QStringLiteral("Code diffs are hidden.");
+    } else if (a == QLatin1String("spawn_agent")) {
+        return spawnAgent(m_commandProject.isEmpty() ? m_focusedProject : m_commandProject, arg, false);
+    } else {
+        return {};
+    }
+    emit uiActionRequested(a, emitArg);
+    return reply;
+}
+
+QString Backend::spawnAgent(const QString &projectKey, const QString &task, bool steerLive)
+{
+    const QString t = task.simplified();
+    if (t.isEmpty())
+        return QStringLiteral("Say what the agent should do.");
+    Project *p = find(projectKey);
+    if (!p)
+        return QStringLiteral("Open a project first, so the agent knows which folder to work in.");
+    if (steerLive && !p->sessions.isEmpty()) {
+        steer(p->key, t);
+        emit uiActionRequested(QStringLiteral("spawn_agent"), t);
+        return QStringLiteral("Sent to the %1 agent: %2").arg(p->name, clampWords(t, 14));
+    }
+    const QString dir = QDir::cleanPath(expandHome(p->dir));
+    if (p->dir.trimmed().isEmpty() || isScratchDir(dir))
+        return QStringLiteral("%1 has no project folder (scratch or /tmp); open a real project to spawn an agent.").arg(p->name);
+    emit uiActionRequested(QStringLiteral("spawn_agent"), t);
+    startSession(dir, QStringLiteral("claude"), QStringLiteral("claude-opus-5-5"), t);
+    return QStringLiteral("Spawning an Opus 5.5 agent in %1: %2").arg(tildePath(dir), clampWords(t, 14));
+}
+
+void Backend::runAnswerTags(QString *answer)
+{
+    if (!answer || !answer->trimmed().startsWith(QLatin1String("[[ACTION:")))
+        return;
+    const QList<StudioCommand> tags = extractActionTags(answer);
+    QStringList replies;
+    for (const StudioCommand &c : tags) {
+        const QString r = c.action == QLatin1String("spawn_agent")
+                              ? spawnAgent(m_commandProject.isEmpty() ? m_focusedProject : m_commandProject, c.arg, false)
+                              : dispatchStudioAction(c.action, c.arg);
+        if (!r.isEmpty())
+            replies << r;
+    }
+    if (answer->trimmed().isEmpty())
+        *answer = replies.join(QLatin1Char(' '));
+}
+
+void Backend::noteExchange(const QString &projectKey, const QString &model, const QString &prompt, const QString &answer)
+{
+    const QString q = prompt.trimmed(), a = answer.trimmed();
+    if (q.isEmpty() || a.isEmpty())
+        return;
+    m_sharedHistory << ChatTurn{QStringLiteral("user"), q} << ChatTurn{QStringLiteral("assistant"), a};
+    while (m_sharedHistory.size() > 20)
+        m_sharedHistory.remove(0, 2);  // the last 10 exchanges, across every model
+    if (m_historyPath.isEmpty())
+        return;
+    // The real log is the live window's alone; a mock backend writes only a test's temp path.
+    if (m_mode != Mode::Live
+        && QFileInfo(m_historyPath).absoluteFilePath() == QFileInfo(defaultHistoryPath()).absoluteFilePath())
+        return;
+    const QFileInfo fi(m_historyPath);
+    if (!QFileInfo::exists(fi.absolutePath())) {
+        if (!QDir().mkpath(fi.absolutePath()))
+            return;
+        QFile::setPermissions(fi.absolutePath(), QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner);
+    }
+    QFile f(m_historyPath);
+    if (!f.open(QIODevice::WriteOnly | QIODevice::Append))
+        return;
+    f.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner);
+    const QJsonObject o{{QStringLiteral("ts"), QDateTime::currentDateTimeUtc().toString(Qt::ISODate)},
+                        {QStringLiteral("project"), projectKey},
+                        {QStringLiteral("model"), model},
+                        {QStringLiteral("prompt"), q},
+                        {QStringLiteral("answer"), a}};
+    f.write(QJsonDocument(o).toJson(QJsonDocument::Compact) + '\n');
+}
+
+QString Backend::recentConversationBlock() const
+{
+    if (m_sharedHistory.isEmpty())
+        return {};
+    QString out = QStringLiteral("Recent Studio conversation (every model, oldest first):");
+    for (const ChatTurn &t : m_sharedHistory) {
+        QString c = t.content.simplified();
+        if (c.size() > 600)
+            c = c.left(600) + QStringLiteral("…");
+        out += (t.role == QLatin1String("user") ? QStringLiteral("\nUser: ") : QStringLiteral("\nAssistant: ")) + c;
+    }
+    return out;
+}
+
+void Backend::setUiState(const QVariantMap &state)
+{
+    m_uiState = state;
+}
+
+QString Backend::studioLiveState() const
+{
+    if (m_uiState.isEmpty())
+        return {};
+    QStringList lines;
+    const QString view = m_uiState.value(QStringLiteral("view")).toString();
+    const QString project = m_uiState.value(QStringLiteral("project")).toString();
+    QString viewLine = QStringLiteral("View: ") + (view.isEmpty() ? QStringLiteral("Constellation") : view);
+    if (!project.isEmpty() && view != QLatin1String("Constellation"))
+        viewLine += QStringLiteral(" of ") + project;
+    const QString artifact = m_uiState.value(QStringLiteral("artifact")).toString();
+    if (!artifact.isEmpty())
+        viewLine += QStringLiteral(", showing ") + artifact;
+    const QString filter = m_uiState.value(QStringLiteral("filter")).toString();
+    if (filter == QLatin1String("needs"))
+        viewLine += QStringLiteral(" (Needs Me filter on)");
+    lines << viewLine;
+    QString hl = m_uiState.value(QStringLiteral("highlighted")).toString();
+    if (hl.isEmpty() && m_targets && m_targets->hasActiveTarget())
+        hl = m_targets->active().label;
+    lines << QStringLiteral("Highlighted: ") + (hl.isEmpty() ? QStringLiteral("nothing") : hl);
+    const QStringList overlays = m_uiState.value(QStringLiteral("overlays")).toStringList();
+    lines << QStringLiteral("Open overlays: ") + (overlays.isEmpty() ? QStringLiteral("none") : overlays.join(QStringLiteral(", ")));
+    if (m_slowmix.currentTrack().isEmpty())
+        lines << QStringLiteral("Music: idle");
+    else
+        lines << QStringLiteral("Music: %1 %2 (%3x, %4 reverb)")
+                     .arg(m_slowmix.playing() ? QStringLiteral("playing") : QStringLiteral("paused"), m_slowmix.currentTrack(),
+                          QString::number(m_slowmix.speed(), 'g', 3), m_slowmix.reverb());
+    lines << QStringLiteral("Cards (%1):").arg(m_projectList.size());
+    int n = 0;
+    for (const QVariant &v : m_projectList) {
+        if (++n > 14) {
+            lines << QStringLiteral("- … %1 more").arg(m_projectList.size() - 14);
+            break;
+        }
+        const QVariantMap p = v.toMap();
+        QString state = p.value(QStringLiteral("stateLine")).toString();
+        if (state.isEmpty())
+            state = p.value(QStringLiteral("lastLine")).toString();
+        lines << QStringLiteral("- %1 [%2%3]: %4")
+                     .arg(p.value(QStringLiteral("name")).toString(), p.value(QStringLiteral("status")).toString(),
+                          p.value(QStringLiteral("needsMe")).toBool() ? QStringLiteral(", needs you") : QString(),
+                          clampWords(state.simplified(), 16));
+    }
+    QString out = lines.join(QLatin1Char('\n'));
+    if (out.size() > 2600)
+        out = out.left(2600) + QStringLiteral("…");
+    return out;
 }
 
 }  // namespace studio

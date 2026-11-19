@@ -48,6 +48,7 @@ const ActionMeta kActions[] = {
     {"zoom_reset", "Reset Zoom (1.00x)", "Reset UI / detail zoom back to 1.00x"},
     {"toggle_settings", "Settings & Controls", "Open Settings / Controller Mapping"},
     {"toggle_new_session", "New Session", "Open New Session dialog"},
+    {"toggle_music", "Music (Slowmix)", "Open or close the Slowmix music overlay"},
     {"none", "Unbound", "No action"},
 };
 }  // namespace
@@ -133,6 +134,8 @@ void GamepadState::emitMappedAction(const QString &inputId, bool down, QList<Gam
         out.append(GamepadAction::make(GamepadAction::ToggleSettings));
     else if (act == QLatin1String("toggle_new_session"))
         out.append(GamepadAction::make(GamepadAction::ToggleNewSession));
+    else if (act == QLatin1String("toggle_music"))
+        out.append(GamepadAction::make(GamepadAction::ToggleMusic));
 }
 
 void GamepadState::reset()
@@ -259,8 +262,19 @@ QList<GamepadAction> GamepadState::process(const GamepadSnapshot &s, qint64 nowM
     handleDigital("b", s.b, p.b);
     handleDigital("x", s.x, p.x);
     handleDigital("y", s.y, p.y);
-    handleDigital("l1", s.l1, p.l1);
-    handleDigital("r1", s.r1, p.r1);
+    // L1 + R1 together (the second shoulder lands while the first is held): Music, anywhere.
+    // The chord's own presses and releases never fire the single-shoulder actions.
+    if (s.l1 && s.r1 && (pressed(s.l1, p.l1) || pressed(s.r1, p.r1)) && !m_chord) {
+        m_chord = true;
+        out.append(GamepadAction::make(GamepadAction::ToggleMusic));
+    }
+    if (m_chord) {
+        if (!s.l1 && !s.r1)
+            m_chord = false;
+    } else {
+        handleDigital("l1", s.l1, p.l1);
+        handleDigital("r1", s.r1, p.r1);
+    }
     handleDigital("l3", s.l3, p.l3);
     handleDigital("r3", s.r3, p.r3);
     handleDigital("menu", s.menu, p.menu);
@@ -332,6 +346,14 @@ void Gamepad::setCaptureMode(bool on)
         return;
     m_state.setCaptureMode(on);
     emit captureModeChanged();
+}
+
+void Gamepad::setMusicMode(bool on)
+{
+    if (m_musicMode == on)
+        return;
+    m_musicMode = on;
+    emit musicModeChanged();
 }
 
 void Gamepad::setBindingsMap(const QHash<QString, QString> &map)
@@ -418,12 +440,18 @@ void Gamepad::processSnapshot(const Snapshot &s, qint64 nowMs)
         case GamepadAction::ToggleSettings: emit toggleSettings(); break;
         case GamepadAction::ToggleNewSession: emit toggleNewSession(); break;
         case GamepadAction::ToggleBriefing: emit toggleBriefing(); break;
+        case GamepadAction::ToggleMusic: emit toggleMusic(); break;
         case GamepadAction::Scroll: emit scrollDelta(a.value); break;
         case GamepadAction::TouchpadPan: emit touchpadPan(double(a.dx), double(a.dy)); break;
         case GamepadAction::HorizontalInspect: emit horizontalInspect(a.dx); break;
         case GamepadAction::Send: emit sendPressed(); break;
         case GamepadAction::VoiceHold: {
             const bool active = a.value > 0.5;
+            // Music owns the pad: L2 is a plain press (loop toggle), never the Phonon voice key.
+            if (m_musicMode && !m_voiceActive) {
+                emit voiceHold(active);
+                break;
+            }
             if (m_voiceActive != active) {
                 m_voiceActive = active;
                 if (m_enabled)

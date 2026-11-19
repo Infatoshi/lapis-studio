@@ -32,6 +32,7 @@ struct TieredPrompt {
     QVector<ChatTurn> history;    // Tier 2
     // Tier 3 (volatile)
     QString targetSlice;
+    QString liveState;            // "Studio live state:" (view, cards, highlight, overlays, music)
     QStringList recentActions;
     QString phononTail;
     QString memory;               // cross-session recall ("Relevant past conversations:")

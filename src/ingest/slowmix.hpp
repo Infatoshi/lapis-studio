@@ -88,6 +88,7 @@ public:
     void setBinary(const QString &path);
     void setLibrary(const QString &clipsDir, const QString &playsPath);
     QString clipsDir() const { return m_clipsDir; }
+    QString playsPath() const { return m_playsPath; }
 
     bool available() const;
     bool running() const;

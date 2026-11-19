@@ -180,6 +180,7 @@ int main(int argc, char **argv)
     // Only the real window reads or writes prefs; every offscreen mode keeps them in memory.
     backend.setPrefsPath(studio::Backend::defaultPrefsPath());
     backend.setReviewsPath(studio::Backend::defaultReviewsPath());  // saved taste rules feed the filter
+    backend.setHistoryPath(studio::Backend::defaultHistoryPath());  // every Studio prompt + reply, jsonl
     // The only place GameController.framework is ever touched: offscreen modes return above.
     backend.gamepad()->setEnabled(true);
     // Likewise the only place `slowmix --stdio` may ever be spawned (lazily, on first play).

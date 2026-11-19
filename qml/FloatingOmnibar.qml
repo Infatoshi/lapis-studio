@@ -16,6 +16,7 @@ Item {
     property int artifactIndex: -1
     property bool mouseMode: false
     property bool suppressed: false  // a modal overlay is up
+    onSuppressedChanged: if (suppressed && open) close()  // a modal over it takes the pad and keys
 
     property bool open: false
     property int cardSeq: 0
@@ -66,22 +67,38 @@ Item {
             error = "";
             busy = false;
         }
-        let ax, ay;
-        if (t) {
-            ax = t.x;
-            ay = t.y + t.h + 10;
-        } else if (px !== undefined && px >= 0) {
-            ax = px;
-            ay = py + 10;
-        } else {
-            ax = (width - card.width) / 2;
-            ay = height * 0.22;
-        }
         open = true;
-        card.x = clampX(ax);
-        card.y = clampY(ay);
+        const at = anchorFor(t, px, py);
+        card.x = clampX(at.x);
+        card.y = clampY(at.y);
         input.forceActiveFocus();
     }
+    // Right beside the highlighted target: its right side when the card fits there, else its
+    // left, else under it, else over it, else tucked inside its bottom-right corner (a target as
+    // big as the window). No target: the point that was clicked, else centred near the bottom.
+    function anchorFor(t, px, py) {
+        const gap = 14;
+        const cw = card.width, ch = Math.max(card.height, 160);
+        if (t && t.w > 0 && t.h > 0) {
+            const top = Math.max(margin, Math.min(height - ch - margin, t.y));
+            if (t.x + t.w + gap + cw <= width - margin)
+                return { x: t.x + t.w + gap, y: top };
+            if (t.x - gap - cw >= margin)
+                return { x: t.x - gap - cw, y: top };
+            if (t.y + t.h + gap + ch <= height - margin)
+                return { x: t.x, y: t.y + t.h + gap };
+            if (t.y - gap - ch >= margin)
+                return { x: t.x, y: t.y - gap - ch };
+            return { x: t.x + t.w - cw - 24, y: t.y + t.h - ch - 24 };
+        }
+        if (px !== undefined && px >= 0)
+            return { x: px, y: py + 10 };
+        return { x: (width - cw) / 2, y: height - ch - 56 };
+    }
+    // Send what is typed (✕ / R2 on the pad, Enter on the keyboard).
+    function submit() { ask(input.text); }
+    // A model's leading [[ACTION:..]] tag ran in the backend; it never shows as text.
+    function displayAnswer(a) { return String(a).replace(/^\s*(\[\[ACTION:[^\]]*\]\]\s*)+/, ""); }
     function toggle() {
         if (open)
             close();
@@ -641,7 +658,8 @@ Item {
                 id: answerText
                 objectName: "omnibarAnswer"
                 width: answerFlick.width
-                text: ab.backend ? ab.backend.markdownHtml(ab.answer, Theme.px(15)) : ab.answer
+                text: ab.backend ? ab.backend.markdownHtml(root.displayAnswer(ab.answer), Theme.px(15))
+                                 : root.displayAnswer(ab.answer)
                 textFormat: ab.backend ? Text.RichText : Text.PlainText
                 wrapMode: Text.Wrap
                 color: Theme.ink

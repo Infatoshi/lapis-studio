@@ -53,6 +53,7 @@ struct GamepadAction {
         ToggleSettings,
         ToggleNewSession,
         ToggleBriefing,
+        ToggleMusic,
         Scroll,
         TouchpadPan,
         HorizontalInspect,
@@ -112,6 +113,7 @@ private:
     qint64 m_lastScrollMs = 0;
     int m_rNavDx = 0;
     qint64 m_nextRNavMs = 0;
+    bool m_chord = false;  // L1 + R1 held together: one ToggleMusic, no single-shoulder actions
 };
 
 class Gamepad : public QObject {
@@ -123,6 +125,9 @@ class Gamepad : public QObject {
     Q_PROPERTY(bool voiceActive READ voiceActive NOTIFY voiceActiveChanged)
     Q_PROPERTY(QVariantList bindingSlots READ bindingSlots NOTIFY bindingsChanged)
     Q_PROPERTY(QVariantList availableActions READ availableActions CONSTANT)
+    // True while the Music overlay owns the pad (StudioApp binds it): L2 then toggles loop
+    // instead of holding the Phonon voice key.
+    Q_PROPERTY(bool musicMode READ musicMode WRITE setMusicMode NOTIFY musicModeChanged)
 
 public:
     using Snapshot = GamepadSnapshot;
@@ -135,6 +140,8 @@ public:
     bool enabled() const { return m_enabled; }
     bool captureMode() const { return m_state.captureMode(); }
     bool voiceActive() const { return m_voiceActive; }
+    bool musicMode() const { return m_musicMode; }
+    void setMusicMode(bool on);
     // Interactive live window only: starts watching GCController connect / disconnect.
     void setEnabled(bool on);
     void setCaptureMode(bool on);
@@ -164,6 +171,7 @@ signals:
     void captureModeChanged();
     void voiceActiveChanged();
     void bindingsChanged();
+    void musicModeChanged();
     void nav(int dx, int dy);
     void confirm();
     void back();
@@ -176,6 +184,7 @@ signals:
     void toggleSettings();
     void toggleNewSession();
     void toggleBriefing();
+    void toggleMusic();
     void scrollDelta(double dy);
     void touchpadPan(double dx, double dy);
     void horizontalInspect(int dir);
@@ -190,6 +199,7 @@ private:
     bool m_connected = false;
     bool m_enabled = false;
     bool m_voiceActive = false;
+    bool m_musicMode = false;
     QString m_name;
     std::unique_ptr<Platform> m_platform;
     friend struct Platform;

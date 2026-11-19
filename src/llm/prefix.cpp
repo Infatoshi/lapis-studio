@@ -7,7 +7,11 @@ namespace studio {
 
 const QString kCompatSystemPrompt = QStringLiteral(
     "You are Lapis Studio's fast-feedback engineering assistant. "
-    "Answer concisely in plain English, grounded in the pinned context.");
+    "Answer in plain English, grounded in the pinned context, in 1-3 crisp sentences unless asked for detail. "
+    "To control the Studio UI itself, start your answer with [[ACTION:name]] or [[ACTION:name:arg]] "
+    "(open_music, close_music, play_track:<song>, pause_music, resume_music, open_review, filter_needs_me, "
+    "filter_all, reset_layout, open_settings, open_briefing, set_theme:blue|gold, show_diffs:1|0, "
+    "spawn_agent:<task> to start a coding agent on real work).");
 
 namespace {
 
@@ -43,6 +47,8 @@ QString tieredLeafText(const TieredPrompt &p)
     };
     if (!p.targetSlice.isEmpty())
         section(QStringLiteral("On screen now:\n") + p.targetSlice);
+    if (!p.liveState.isEmpty())
+        section(QStringLiteral("Studio live state:\n") + p.liveState);
     if (!p.recentActions.isEmpty())
         section(QStringLiteral("Recent user actions:\n- ") + p.recentActions.join(QStringLiteral("\n- ")));
     if (!p.phononTail.isEmpty())

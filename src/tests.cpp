@@ -30,6 +30,7 @@
 #include <QQuickItem>
 #include <QQuickWindow>
 
+#include <algorithm>
 #include <csignal>
 #include <cstdio>
 #include <limits>
@@ -2779,6 +2780,15 @@ void gamepadUiTests()
     pad->processSnapshot(S(), t += 20);
     check(!pad->voiceActive(), "pad ui: L2 release clears voiceActive");
     settle(30);
+    // L2 opened the ask card (Phonon types into it) beside the island the cursor is on.
+    QObject *omni = win->findChild<QObject *>("floatingOmnibar");
+    {
+        const QVariantMap chip = omni ? prop(omni, "chips").toList().value(0).toMap() : QVariantMap();
+        check(omni && prop(omni, "open").toBool() && chip.value("kind") == "island",
+              "pad ui: L2 opens the ask card with the highlighted island as its target", chip.value("label").toString());
+    }
+    tap([](S &s) { s.b = true; });
+    check(omni && !prop(omni, "open").toBool(), "pad ui: ○ closes the ask card");
 
     // Share / touchpad: the new-session dialog; stick changes folder / harness; ○ closes.
     tap([](S &s) { s.touchpad = true; });
@@ -2898,9 +2908,24 @@ void gamepadUiTests()
     settle(300);
     check(!prop(app, "proseOpen").toBool() && prop(app, "lens").toInt() == 2, "pad ui: ○ closes the write-up first");
 
-    // ✕ in the Stage focuses the composer; □ there toggles the model picker; stick drives it.
+    // ✕ in the Stage (Prompt) opens the ask card beside the artifact, its chip attached; ○ closes
+    // it. The docked composer stays collapsed until summoned; □ there toggles the model picker.
+    check(!prop(app, "composerShown").toBool(), "pad ui: the docked composer is collapsed on the Stage");
     tap([](S &s) { s.a = true; });
-    check(prop(composer, "inputFocused").toBool(), "pad ui: ✕ in the Stage focuses the composer");
+    {
+        const QVariantMap chip = omni ? prop(omni, "chips").toList().value(0).toMap() : QVariantMap();
+        QQuickItem *card = firstItem(win, "omnibarCard");
+        const QRectF cr = card ? QRectF(card->mapToScene(QPointF(0, 0)), card->size()) : QRectF();
+        check(omni && prop(omni, "open").toBool() && chip.value("kind") == "artifact" && cr.width() > 0
+                  && QRectF(0, 0, 1920, 1080).contains(cr),
+              "pad ui: ✕ in the Stage opens the ask card at the highlighted artifact", chip.value("label").toString());
+    }
+    tap([](S &s) { s.b = true; });
+    check(omni && !prop(omni, "open").toBool() && prop(app, "lens").toInt() == 2, "pad ui: ○ closes the ask card, Stage stays");
+    QMetaObject::invokeMethod(composer, "focusInput", Q_ARG(QVariant, QVariant(QString())));
+    settle(60);
+    check(prop(composer, "inputFocused").toBool() && prop(app, "composerShown").toBool(),
+          "pad ui: the composer slides in when summoned");
     tap([](S &s) { s.x = true; });
     check(prop(composer, "pickerOpen").toBool(), "pad ui: □ in the composer opens the model & effort picker");
     {
@@ -3353,12 +3378,13 @@ void omnibarUiTests()
           "omni: middle-click opens the card at the pointer (clamped to the 16 px margin)", rectText(cardRect()));
     sendKey(win, Qt::Key_Escape);
 
-    // Anchoring: under the target (x, y + h + 10); a corner target keeps the card inside the window.
+    // Anchoring: right beside the target (x + w + 14, its top); a corner target keeps the card
+    // inside the window.
     reg->setHoverTarget("table_cell", key0, "0", "row=2/col=3", "tok/s: 126", "Table: sweep\n> Row 2: c1 | 126",
                         300, 200, 110, 30);
     sendKey(win, Qt::Key_K, Qt::ControlModifier);
     settle(30);
-    check(isOpen() && card->x() == 300 && card->y() == 240, "omni: card anchors under the hovered target",
+    check(isOpen() && card->x() == 424 && card->y() == 200, "omni: card anchors right beside the hovered target",
           rectText(cardRect()));
     sendKey(win, Qt::Key_Escape);
     reg->setHoverTarget("table_cell", key0, "0", "row=9/col=3", "tok/s: 410", "corner", 1860, 1050, 50, 20);
@@ -3577,7 +3603,9 @@ void omnibarUiTests()
         settle(30);
         QMetaObject::invokeMethod(app, "goLens", Q_ARG(QVariant, QVariant(0)));
         settle(400);
-        check(!reg->hasActiveTarget(), "hover: changing lens clears the hover target");
+        // The turn goes with its lens; in controller mode the cursor's island is the target now.
+        check(!reg->hasActiveTarget() || reg->activeTarget().value("kind") == "island",
+              "hover: changing lens clears the old lens's hover target", reg->activeTarget().value("kind").toString());
     }
 }
 
@@ -4390,8 +4418,13 @@ void slowmixUiTests()
         settle(60);
     };
 
-    check(pillText() == QStringLiteral("♪") && !overlay->property("open").toBool(),
-          "music ui: idle top-bar pill is a bare ♪, overlay closed", pillText());
+    check(pillText() == QStringLiteral("♪ L1+R1") && !overlay->property("open").toBool(),
+          "music ui: idle top-bar pill names the L1+R1 chord in controller mode, overlay closed", pillText());
+    backend.setNavMode(QStringLiteral("vim"));
+    settle(30);
+    check(pillText() == QStringLiteral("♪"), "music ui: idle pill is a bare ♪ on the keyboard", pillText());
+    backend.setNavMode(QStringLiteral("controller"));
+    settle(30);
     sendKey(win, Qt::Key_M, Qt::ControlModifier);
     settle(300);
     check(overlay->property("open").toBool() && overlay->isVisible() && overlay->hasActiveFocus(),
@@ -4579,7 +4612,8 @@ void memoryTierTests()
     warm.trunk = b.contextTrunk(key);
     const QJsonArray w = QJsonDocument::fromJson(buildTieredWarmRequest(warm)).object().value("messages").toArray();
     auto bytes = [](const QJsonValue &v) { return QJsonDocument(v.toObject()).toJson(QJsonDocument::Compact); };
-    check(w.size() == 2 && m0.size() == 3 && m1.size() == 3 && m2.size() == 3 && bytes(m1[0]) == bytes(w[0])
+    // mem0's exchange is the shared Tier 2 of mem1 and mem2 (2 messages between Tier 1 and the leaf).
+    check(w.size() == 2 && m0.size() == 3 && m1.size() == 5 && m2.size() == 5 && bytes(m1[0]) == bytes(w[0])
               && bytes(m1[1]) == bytes(w[1]) && bytes(m2[0]) == bytes(w[0]) && bytes(m2[1]) == bytes(w[1])
               && bytes(m0[0]) == bytes(m1[0]) && bytes(m0[1]) == bytes(m1[1]),
           "memory tier: Tier 0 + Tier 1 stay byte-identical to the warmed prefix with recall on",
@@ -4712,9 +4746,353 @@ void hotReloadTests()
           "reload: reloaded UI renders on-palette; zero processes spawned");
 }
 
+// Spec gates: natural-language Studio UI actions, the L1+R1 Music chord and the DualShock inside
+// the Music card, shared cross-model history, live screen state, and prefs that tests never touch.
+void studioControlTests()
+{
+    // --- Parser (pure) -------------------------------------------------------------------------
+    struct Case {
+        const char *text;
+        const char *action;
+        const char *arg;
+    };
+    const Case cases[] = {
+        {"Can you open the Slowmix tab inside of this?", "open_music", ""},
+        {"open music", "open_music", ""},
+        {"hey lapis, could you please pull up the music player", "open_music", ""},
+        {"close the music", "close_music", ""},
+        {"play syntheticgod", "play_track", "syntheticgod"},
+        {"Play the song night drive please", "play_track", "night drive"},
+        {"pause the music", "pause_music", ""},
+        {"resume music", "resume_music", ""},
+        {"play some music", "resume_music", ""},
+        {"open session review", "open_review", ""},
+        {"show needs me", "filter_needs_me", ""},
+        {"show me only what needs me", "filter_needs_me", ""},
+        {"show all cards", "filter_all", ""},
+        {"reset layout", "reset_layout", ""},
+        {"open settings", "open_settings", ""},
+        {"switch to lapis blue", "set_theme", "blue"},
+        {"switch to gold theme", "set_theme", "gold"},
+        {"show code diffs", "show_diffs", "1"},
+        {"hide code diffs", "show_diffs", "0"},
+        {"open briefing", "open_briefing", ""},
+        {"Fire off an agent to fix the flaky tile test", "spawn_agent", "fix the flaky tile test"},
+        {"what changed in the sweep?", "", ""},
+        {"why is the music overlay slow to open?", "", ""},
+        {"show me the p99 for the fp4 build", "", ""},
+        {"is gold better than blue for charts?", "", ""},
+    };
+    QStringList wrong;
+    for (const Case &c : cases) {
+        const StudioCommand got = parseStudioCommand(QString::fromUtf8(c.text));
+        if (got.action != QLatin1String(c.action) || got.arg != QString::fromUtf8(c.arg))
+            wrong << QStringLiteral("'%1' -> %2:%3").arg(c.text, got.action, got.arg);
+    }
+    check(wrong.isEmpty(), "studio cmd: voice-typed UI phrasings map to actions; questions stay questions",
+          wrong.join(" | "));
+    check(parseStudioCommand("tell the agent to rerun the bench").steer, "studio cmd: 'tell the agent' steers the live peer");
+    {
+        QString a = QStringLiteral("[[ACTION:open_music]] [[ACTION:bogus:1]] Opening it.");
+        const QList<StudioCommand> tags = extractActionTags(&a);
+        check(tags.size() == 1 && tags[0].action == "open_music" && a == "Opening it.",
+              "studio cmd: [[ACTION:..]] tags parse, unknown names drop, text stays clean", a);
+        QString b = QStringLiteral("[[ACTION:play_track:night drive]]");
+        const QList<StudioCommand> t2 = extractActionTags(&b);
+        check(t2.size() == 1 && t2[0].arg == "night drive" && b.isEmpty(), "studio cmd: tag with an argument");
+    }
+    check(kCompatSystemPrompt.contains("[[ACTION:") && kCompatSystemPrompt.contains("1-3 crisp sentences"),
+          "studio cmd: the system prompt teaches [[ACTION:..]] and short answers");
+
+    // --- Prefs: a mock backend never writes the real studio_prefs.json --------------------------
+    {
+        const QString real = Backend::defaultPrefsPath();
+        QFile rf(real);
+        const bool existed = rf.exists();
+        const QByteArray before = existed && rf.open(QIODevice::ReadOnly) ? rf.readAll() : QByteArray();
+        rf.close();
+        const QDateTime mtime = existed ? QFileInfo(real).lastModified() : QDateTime();
+        {
+            Backend m(Backend::Mode::Mock);
+            m.setPrefsPath(real);  // even pointed straight at it
+            m.setUiScale(1.37);
+            m.setOpenaiCompatUrl(QString());
+            const bool wrote = m.savePrefs();
+            check(!wrote, "prefs: Mode::Mock savePrefs() refuses the real studio_prefs.json");
+            m.setPrefsPath(QString());
+        }
+        QFile af(real);
+        const QByteArray after = af.exists() && af.open(QIODevice::ReadOnly) ? af.readAll() : QByteArray();
+        check(QFileInfo::exists(real) == existed && after == before
+                  && (!existed || QFileInfo(real).lastModified() == mtime),
+              "prefs: the real studio_prefs.json is byte- and mtime-identical after a mock run");
+    }
+    {
+        QTemporaryDir tmp;
+        const QString path = tmp.path() + "/studio_prefs.json";
+        Backend m(Backend::Mode::Mock);
+        m.setPrefsPath(path);
+        m.completeOnboarding("controller");
+        // Another writer adds the endpoint and a key this build does not know.
+        {
+            QFile f(path);
+            QJsonObject o;
+            if (f.open(QIODevice::ReadOnly))
+                o = QJsonDocument::fromJson(f.readAll()).object();
+            f.close();
+            o.insert("openaiCompatUrl", "http://127.0.0.1:9/v1");
+            o.insert("futureKey", 7);
+            check(f.open(QIODevice::WriteOnly | QIODevice::Truncate) && f.write(QJsonDocument(o).toJson()) > 0,
+                  "prefs: an outside writer adds keys to the temp prefs file");
+        }
+        m.setUiScale(1.2);
+        m.savePrefs();
+        auto readBack = [&] {
+            QFile f(path);
+            return f.open(QIODevice::ReadOnly) ? QJsonDocument::fromJson(f.readAll()).object() : QJsonObject();
+        };
+        QJsonObject o = readBack();
+        check(o.value("openaiCompatUrl").toString() == "http://127.0.0.1:9/v1" && o.value("futureKey").toInt() == 7
+                  && qFuzzyCompare(o.value("uiScale").toDouble(), 1.2),
+              "prefs: saving merges over the file, openaiCompatUrl and unknown keys survive",
+              QString::fromUtf8(QJsonDocument(o).toJson(QJsonDocument::Compact)));
+        m.setOpenaiCompatUrl("http://127.0.0.1:8/v1");
+        m.setOpenaiCompatUrl(QString());
+        m.savePrefs();
+        o = readBack();
+        check(!o.contains("openaiCompatUrl") && o.value("futureKey").toInt() == 7,
+              "prefs: only an explicit clear drops openaiCompatUrl");
+    }
+
+    // --- UI: commands, the chord and the pad inside the Music card --------------------------------
+    using S = GamepadSnapshot;
+    Backend backend(Backend::Mode::Mock);
+    QTemporaryDir tmp;
+    backend.setPrefsPath(tmp.path() + "/studio_prefs.json");
+    backend.setHistoryPath(tmp.path() + "/studio_history.jsonl");
+    backend.completeOnboarding("controller");
+    QQmlApplicationEngine engine;
+    QQuickWindow *win = createStudioWindow(engine, &backend, false, QSize(1920, 1080));
+    check(win != nullptr, "studio ui: QML loads");
+    if (!win)
+        return;
+    QObject *app = win->findChild<QObject *>("studioApp");
+    QObject *overlay = win->findChild<QObject *>("slowmixOverlay");
+    QObject *omni = win->findChild<QObject *>("floatingOmnibar");
+    SlowmixController *player = backend.slowmixController();
+    Gamepad *pad = backend.gamepad();
+    if (!app || !overlay || !omni)
+        return;
+    settle(450);
+    QStringList actions;
+    QObject::connect(&backend, &Backend::uiActionRequested,
+                     [&actions](const QString &a, const QString &arg) { actions << (arg.isEmpty() ? a : a + ":" + arg); });
+
+    check(backend.tryHandleStudioCommand("Can you open the Slowmix tab inside of this?") && actions.value(0) == "open_music",
+          "studio ui: 'Can you open the Slowmix tab inside of this?' emits uiActionRequested(open_music)", actions.join(','));
+    settle(250);
+    check(overlay->property("open").toBool(), "studio ui: ... and opens the SlowmixOverlay");
+    check(backend.studioLiveState().contains("Open overlays: Music (Slowmix)") && backend.studioLiveState().contains("Cards (5):"),
+          "studio ui: live state names the open overlay and every card", backend.studioLiveState().left(200));
+    check(!backend.tryHandleStudioCommand("what changed in the sweep?") && actions.size() == 1,
+          "studio ui: a real question is not a command");
+    backend.tryHandleStudioCommand("close the music");
+    settle(250);
+    check(!overlay->property("open").toBool(), "studio ui: 'close the music' closes it");
+
+    // "play syntheticgod" finds the song even outside the 30-day rotation (archive), dry run.
+    {
+        QTemporaryDir clips;
+        for (const char *f : {"syntheticgod_extended.wav", "night_drive.wav"}) {
+            QFile w(clips.path() + "/" + f);
+            if (w.open(QIODevice::WriteOnly))
+                w.write("RIFF");
+        }
+        player->setLibrary(clips.path(), clips.path() + "/.plays.tsv");
+        actions.clear();
+        const bool ok = backend.tryHandleStudioCommand("play syntheticgod");
+        check(ok && player->playing() && player->currentTrack().contains("syntheticgod")
+                  && actions.value(0).startsWith("play_track:") && player->spawnCount() == 0 && backend.spawnCount() == 0,
+              "studio ui: 'play syntheticgod' matches and plays it (mock: no process)",
+              player->currentTrack() + " / " + actions.join(','));
+        check(!backend.tryHandleStudioCommand("play devil's advocate"), "studio ui: 'play <not a song>' falls through to the model");
+        check(backend.tryHandleStudioCommand("pause the music") && !player->playing(), "studio ui: 'pause the music' pauses");
+        check(backend.tryHandleStudioCommand("resume music") && player->playing(), "studio ui: 'resume music' resumes");
+        player->togglePlay();
+        const QString fx = ensureSlowmixFixture();
+        player->setLibrary(fx, fx + "/.plays.tsv");
+    }
+    backend.tryHandleStudioCommand("switch to lapis blue");
+    settle(60);
+    check(backend.theme() == "lapis", "studio ui: 'switch to lapis blue' switches the theme", backend.theme());
+    backend.tryHandleStudioCommand("switch to gold theme");
+    check(backend.theme() == "gold", "studio ui: 'switch to gold theme' switches back");
+    backend.tryHandleStudioCommand("show needs me");
+    settle(60);
+    check(app->property("islandFilter").toString() == "needs", "studio ui: 'show needs me' filters the Constellation");
+    backend.tryHandleStudioCommand("show all cards");
+    settle(60);
+    check(app->property("islandFilter").toString() == "all", "studio ui: 'show all cards' clears the filter");
+
+    // The composer path: the confirmation is the quick answer, no model involved.
+    const QString key0 = backend.projects().value(0).toMap().value("key").toString();
+    backend.ask(key0, 0, "open settings");
+    settle(250);
+    QObject *settingsOv = win->findChild<QObject *>("settingsOverlay");
+    check(backend.quickAnswer() == "Opened Settings." && !backend.quickBusy() && settingsOv
+              && settingsOv->property("open").toBool(),
+          "studio ui: ask('open settings') opens Settings and confirms in the answer strip", backend.quickAnswer());
+    QMetaObject::invokeMethod(settingsOv, "hide");
+    settle(250);
+
+    // The ask card path: Enter on a UI command streams back its confirmation.
+    sendKey(win, Qt::Key_K, Qt::ControlModifier);
+    settle(60);
+    typeText(win, "show code diffs");
+    sendKey(win, Qt::Key_Return);
+    settle(60);
+    check(backend.showCodeDiffs() && omni->property("answer").toString() == "Code diffs are on."
+              && !omni->property("busy").toBool(),
+          "studio ui: the ask card runs a UI command and shows its 1-line confirmation",
+          omni->property("answer").toString());
+    sendKey(win, Qt::Key_Escape);
+    backend.setShowCodeDiffs(false);
+    settle(60);
+
+    // Agent dispatch: lapis-peers new in the project's real folder (mock: no process).
+    backend.setFocusedProject(key0);
+    actions.clear();
+    const bool spawned = backend.tryHandleStudioCommand("fire off an agent to fix the flaky tile test");
+    check(spawned && actions.contains("spawn_agent:fix the flaky tile test")
+              && std::any_of(actions.cbegin(), actions.cend(), [](const QString &a) { return a.startsWith("agent_spawned:"); })
+              && backend.spawnCount() == 0,
+          "studio ui: 'fire off an agent to ...' starts a session in the project folder, confirms its id",
+          actions.join(','));
+    backend.setFocusedProject(QString());
+    QMetaObject::invokeMethod(app, "goLens", Q_ARG(QVariant, QVariant(0)));
+    settle(450);
+
+    // Shared history across a model switch, logged to studio_history.jsonl.
+    {
+        const QString m0 = backend.chatModel();
+        backend.ask(key0, 0, "first question on sonnet");
+        backend.advance(2.0);
+        backend.setChatModel("claude-opus-5-5");
+        backend.ask(key0, 0, "second question on opus");
+        backend.advance(2.0);
+        const QVector<ChatTurn> h = backend.sharedHistory();
+        bool sawFirst = false, sawSecond = false;
+        for (const ChatTurn &t : h) {
+            sawFirst = sawFirst || t.content == "first question on sonnet";
+            sawSecond = sawSecond || t.content == "second question on opus";
+        }
+        const TieredPrompt p = backend.tieredPrompt(key0, QString(), "What were my last 5 questions?", h);
+        const QByteArray body = buildTieredChatRequest(p);
+        check(sawFirst && sawSecond && body.contains("first question on sonnet") && body.contains("Studio live state:"),
+              "studio ui: shared history spans a model switch and rides as Tier 2, with live state in Tier 3",
+              QString::number(h.size()));
+        QFile log(tmp.path() + "/studio_history.jsonl");
+        QStringList models;
+        if (log.open(QIODevice::ReadOnly))
+            for (const QByteArray &line : log.readAll().split('\n'))
+                if (!line.isEmpty())
+                    models << QJsonDocument::fromJson(line).object().value("model").toString();
+        check(models.contains(m0) && models.contains("claude-opus-5-5") && models.contains("studio"),
+              "studio ui: every prompt + reply lands in studio_history.jsonl with its model", models.join(','));
+        backend.setChatModel(m0);
+    }
+
+    // --- DualShock: L1 + R1 opens Music anywhere, then the pad drives the card ------------------
+    pad->setConnected(true, QStringLiteral("DualShock 4"));
+    settle(60);
+    qint64 t = 100000;
+    auto snap = [&](auto set) {
+        S s;
+        set(s);
+        pad->processSnapshot(s, t);
+        t += 20;
+        settle(20);
+    };
+    auto tap = [&](auto set) {
+        snap(set);
+        snap([](S &) {});
+        settle(30);
+    };
+    int steps = 0, accepts = 0, toggles = 0;
+    QObject::connect(pad, &Gamepad::step, [&steps](int) { ++steps; });
+    QObject::connect(pad, &Gamepad::acceptPrediction, [&accepts] { ++accepts; });
+    QObject::connect(pad, &Gamepad::toggleMusic, [&toggles] { ++toggles; });
+    snap([](S &s) { s.l1 = true; s.r1 = true; });
+    snap([](S &) {});
+    settle(250);
+    check(toggles == 1 && steps == 0 && accepts == 0 && overlay->property("open").toBool(),
+          "pad music: L1 + R1 emits toggleMusic (no L1 / R1 actions) and opens the SlowmixOverlay",
+          QStringLiteral("%1 toggles, %2 steps, %3 accepts").arg(toggles).arg(steps).arg(accepts));
+    check(pad->musicMode(), "pad music: the pad is in music mode while the card is open");
+    QQuickItem *hints = firstItem(win, "slowmixHints");
+    check(hints && hints->property("text").toString() == "✕ play · □ pause · ◄► speed · △ reverb · ○ close",
+          "pad music: the footer speaks controller glyphs", hints ? hints->property("text").toString() : QString());
+    const int row0 = overlay->property("row").toInt();
+    tap([](S &s) { s.dpadY = -1; });
+    check(overlay->property("row").toInt() == row0 + 1, "pad music: d-pad down moves the selected track");
+    tap([](S &s) { s.a = true; });
+    const QVariantList tracks = player->tracks();
+    const QString want = tracks.value(row0 + 1).toMap().value("name").toString();
+    check(player->playing() && player->currentTrack() == want, "pad music: ✕ plays the selected track",
+          player->currentTrack() + " vs " + want);
+    tap([](S &s) { s.x = true; });
+    check(!player->playing(), "pad music: □ pauses");
+    tap([](S &s) { s.x = true; });
+    check(player->playing(), "pad music: □ resumes");
+    {
+        const QString r0 = player->reverb();
+        tap([](S &s) { s.y = true; });
+        const QString r1 = player->reverb();
+        tap([](S &s) { s.y = true; });
+        tap([](S &s) { s.y = true; });
+        check(r1 != r0 && player->reverb() == r0, "pad music: △ cycles reverb Off → Hall → Heavy", r0 + " -> " + r1);
+    }
+    {
+        const double s0 = player->speed();
+        tap([](S &s) { s.dpadX = 1; });
+        const double s1 = player->speed();
+        tap([](S &s) { s.l1 = true; });
+        const double s2 = player->speed();
+        tap([](S &s) { s.r1 = true; });
+        check(s1 > s0 && s2 < s1 && player->speed() > s2, "pad music: ◄► / L1 / R1 step the speed",
+              QStringLiteral("%1 %2 %3 %4").arg(s0).arg(s1).arg(s2).arg(player->speed()));
+    }
+    {
+        const bool loop0 = player->looping();
+        snap([](S &s) { s.l2 = 1.0; });
+        snap([](S &) {});
+        check(player->looping() != loop0 && !pad->voiceActive(), "pad music: L2 toggles loop (never the voice key)");
+        const double b0 = player->bass();
+        tap([](S &s) { s.r2 = 1.0; });
+        check(player->bass() != b0, "pad music: R2 cycles bass", QString::number(player->bass()));
+    }
+    tap([](S &s) { s.b = true; });
+    settle(250);
+    check(!overlay->property("open").toBool() && player->playing() && !pad->musicMode(),
+          "pad music: ○ closes the card, playback continues");
+    const int acceptsBefore = accepts;
+    snap([](S &s) { s.l1 = true; });
+    snap([](S &s) { s.l1 = true; s.r1 = true; });
+    snap([](S &) {});
+    settle(250);
+    check(overlay->property("open").toBool() && toggles == 2 && accepts == acceptsBefore,
+          "pad music: L1 held, then R1: the chord still opens Music, R1's own action is suppressed");
+    tap([](S &s) { s.b = true; });
+    settle(250);
+    player->togglePlay();
+    check(backend.spawnCount() == 0 && player->spawnCount() == 0 && Gamepad::platformCalls() == 0,
+          "studio ui: zero processes, zero GameController calls");
+}
+
 int runTests()
 {
     unitTests();
+    studioControlTests();
     gamepadUnitTests();
     openAiCompatUnitTests();
     llmRouterBackendTests();

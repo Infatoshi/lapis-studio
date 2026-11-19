@@ -12,6 +12,10 @@ FocusScope {
     property int artifactIndex: 0
     property bool proseOpen: false
     property int selectedIsland: 0
+    // The docked composer stays collapsed unless it is in use (see the Composer below).
+    property bool composerDocked: false
+    readonly property bool composerShown: composerDocked || answers.inputFocused || answers.pickerOpen
+                                          || answers.hasQuick || answers.hasTrace
     // Constellation filter: "all" | "needs" (only sessions waiting on the human). Cmd+1 / Cmd+2.
     property string islandFilter: "all"
     function setIslandFilter(f) {
@@ -42,7 +46,25 @@ FocusScope {
     // Music (slowmix): "♪ night drive" while a track plays, a bare "♪" otherwise.
     readonly property QtObject player: backend ? backend.slowmix : null
     readonly property bool musicPlaying: player ? player.playing : false
-    readonly property string musicLabel: musicPlaying && player.currentTrack.length > 0 ? "♪ " + player.currentTrack : "♪"
+    // Idle in controller mode it names the chord that opens it: "♪ L1+R1".
+    readonly property string musicLabel: musicPlaying && player.currentTrack.length > 0 ? "♪ " + player.currentTrack
+                                         : (padHints ? "♪ L1+R1" : "♪")
+    // L1 + R1 from anywhere: whatever else is up steps aside for the music card.
+    function padToggleMusic() {
+        poke();
+        if (onboarding.open || controllerMap.open)
+            return;
+        if (music.open) {
+            music.hide();
+            return;
+        }
+        if (omnibar.open) omnibar.close();
+        if (settings.open) settings.hide();
+        if (briefing.open) briefing.hide();
+        if (review.open) review.hide();
+        if (dialog.open) dialog.hide();
+        music.show();
+    }
     function toggleMusic() {
         if (music.open)
             music.hide();
@@ -336,8 +358,89 @@ FocusScope {
     function think(text) { if (project) backend.think(projectKey, artifactIndex, text); }
     function steer(text) { if (project) backend.steer(projectKey, text); }
 
+    // --- Studio UI actions ("can you open the slowmix tab", a model's [[ACTION:..]] tag) ---------
+    // The backend matched the words, ran what it owns (playback, theme, diffs, layout) and put
+    // the one-line confirmation in the answer strip; this side opens and filters the views.
+    property string lastUiAction: ""
+    property int uiActions: 0
+    function clearOverlaysFor(keep) {
+        if (omnibar.open) omnibar.close();
+        if (keep !== "music" && music.open) music.hide();
+        if (keep !== "settings" && settings.open) settings.hide();
+        if (keep !== "briefing" && briefing.open) briefing.hide();
+        if (keep !== "review" && review.open) review.hide();
+        if (dialog.open) dialog.hide();
+    }
+    function runUiAction(action, arg) {
+        lastUiAction = arg && arg.length > 0 ? action + ":" + arg : action;
+        uiActions += 1;
+        if (onboarding.open || controllerMap.open)
+            return;
+        switch (action) {
+        case "open_music": clearOverlaysFor("music"); if (!music.open) music.show(); break;
+        case "close_music": if (music.open) music.hide(); break;
+        case "open_review": clearOverlaysFor("review"); if (!review.open) review.show(); break;
+        case "open_settings": clearOverlaysFor("settings"); if (!settings.open) settings.show(); break;
+        case "open_briefing":
+            clearOverlaysFor("briefing");
+            takeFocus();
+            goLens(0);
+            if (!briefing.open) briefing.show();
+            break;
+        case "filter_needs_me":
+        case "filter_all":
+            if (music.open) music.hide();
+            takeFocus();
+            goLens(0);
+            setIslandFilter(action === "filter_needs_me" ? "needs" : "all");
+            break;
+        case "reset_layout":
+            takeFocus();
+            goLens(0);
+            break;
+        case "show_diffs":
+            // The backend flipped the pref; land on the first diff, or keep the index in range.
+            if (arg === "1" && lens === 2) {
+                for (let i = 0; i < artifacts.length; ++i)
+                    if (artifacts[i].kind === "diff") {
+                        stage.direction = i > artifactIndex ? 1 : -1;
+                        artifactIndex = i;
+                        break;
+                    }
+            } else if (artifactIndex >= artifacts.length) {
+                artifactIndex = Math.max(0, artifacts.length - 1);
+            }
+            break;
+        }
+    }
+
+    // What is on screen, for the model's Tier 3 "Studio live state:" (re-pushed on every change).
+    readonly property var uiStateMap: {
+        const overlays = [];
+        if (music.open) overlays.push("Music (Slowmix)");
+        if (settings.open) overlays.push("Settings");
+        if (briefing.open) overlays.push("Morning Briefing");
+        if (review.open) overlays.push("Session Review");
+        if (dialog.open) overlays.push("New Session");
+        if (controllerMap.open) overlays.push("Controller Map");
+        if (omnibar.open) overlays.push("Ask card");
+        if (proseOpen && lens > 0) overlays.push("Write-up");
+        const t = targets && targets.hasActiveTarget ? targets.activeTarget : null;
+        return {
+            view: lens === 0 ? "Constellation" : (lens === 1 ? "Ladder" : "Stage"),
+            project: project ? project.name : "",
+            artifact: lens === 2 && artifact ? (artifact.title || artifact.kind || "") : "",
+            filter: islandFilter,
+            highlighted: t ? (t.kind + ": " + t.label) : "",
+            overlays: overlays
+        };
+    }
+    onUiStateMapChanged: if (backend) backend.setUiState(uiStateMap)
+    Component.onCompleted: if (backend) backend.setUiState(uiStateMap)
+
     Connections {
         target: app.backend
+        function onUiActionRequested(action, arg) { app.runUiAction(action, arg); }
         function onSessionStarted(key) {
             app.projectKey = key;
             app.artifactIndex = 0;
@@ -624,6 +727,8 @@ FocusScope {
     readonly property string confirmKey: padHints ? padKey("confirm") : (navMode === "wasd" ? "E" : "⏎")
     function padNav(dx, dy) {
         poke();
+        if (omnibar.open)
+            return;  // the ask card is a text field: the stick never moves the lens under it
         if (controllerMap.open) {
             if (dy !== 0 && controllerMap.slots.length > 0)
                 controllerMap.row = (controllerMap.row + dy + controllerMap.slots.length) % controllerMap.slots.length;
@@ -674,7 +779,8 @@ FocusScope {
     }
     function padConfirm() {
         poke();
-        if (controllerMap.open) controllerMap.startCapture();
+        if (omnibar.open) omnibar.submit();
+        else if (controllerMap.open) controllerMap.startCapture();
         else if (onboarding.open) onboarding.confirm();
         else if (briefing.open) briefing.confirm();
         else if (review.open) review.confirm();
@@ -686,12 +792,13 @@ FocusScope {
         else if (lens === 2 && stage.terms.active) scopeToParam(stage.terms.current());
         else if (lens === 0) { if (constellation.count > 0) enterProject(constellation.slotOf(selectedIsland) >= 0 ? selectedIsland : constellation.slots[0]); }
         else if (lens === 1 && artifacts.length > 0) goLens(2);
-        else answers.focusInput("");
+        else omnibar.openAt(-1, -1);  // ✕ Prompt: the ask card, beside what the cursor is on
     }
     function padBack() {
         poke();
         if (onboarding.open) return;  // a mode has to be picked once
-        if (controllerMap.open) controllerMap.hide();
+        if (omnibar.open) omnibar.close();
+        else if (controllerMap.open) controllerMap.hide();
         else if (briefing.open) briefing.hide();
         else if (review.open) review.hide();
         else if (music.open) music.hide();
@@ -711,7 +818,7 @@ FocusScope {
     }
     function padSecondary() {
         poke();
-        if (onboarding.open || dialog.open || briefing.open)
+        if (onboarding.open || dialog.open || briefing.open || omnibar.open)
             return;
         if (settings.open) {
             settings.row = 2;  // Default Model
@@ -726,6 +833,8 @@ FocusScope {
     }
     function padStep(d) {
         poke();
+        if (omnibar.open)
+            return;
         if (onboarding.open) {
             onboarding.choice = Math.max(0, Math.min(onboarding.cards.length - 1, onboarding.choice + d));
         } else if (briefing.open) {
@@ -771,16 +880,18 @@ FocusScope {
             return;
         lensScrollPixels(dy);
     }
+    // L2: dictate into the ask card, opened beside the highlighted target (into the composer
+    // instead when it already has focus).
     function padVoiceHold(active) {
         poke();
-        if (active && !onboarding.open && !dialog.open && !settings.open && !controllerMap.open && lens > 0) {
-            if (!answers.inputFocused)
-                answers.focusInput("");
-        }
+        if (active && !onboarding.open && !dialog.open && !settings.open && !controllerMap.open
+                && !briefing.open && !review.open && !answers.inputFocused && !omnibar.open)
+            omnibar.openAt(-1, -1);
     }
     function padSend() {
         poke();
-        if (controllerMap.open) controllerMap.startCapture();
+        if (omnibar.open) omnibar.submit();
+        else if (controllerMap.open) controllerMap.startCapture();
         else if (onboarding.open) onboarding.confirm();
         else if (dialog.open) dialog.start();
         else if (briefing.open) briefing.hide();
@@ -788,27 +899,50 @@ FocusScope {
         else if (lens > 0) answers.focusInput("");
         else if (!settings.open) briefing.show();  // the Constellation has nothing to send: Morning Briefing
     }
+    // While the Music card is open it owns the pad: ↕ pick · ✕ play · □ pause · ◄► / L1 / R1
+    // speed · △ reverb · L2 loop · R2 bass · ○ close (music keeps playing).
+    Binding {
+        target: app.gamepad
+        when: app.gamepad !== null
+        property: "musicMode"
+        value: music.open
+    }
+    function musicPad(kind, v) {
+        poke();
+        switch (kind) {
+        case "nav": if (v.dy !== 0) music.move(v.dy); else music.stepSpeed(v.dx); break;
+        case "confirm": music.playRow(music.row); break;
+        case "secondary": music.togglePlay(); break;
+        case "prevTab": music.stepSpeed(-1); break;
+        case "nextTab": music.stepSpeed(1); break;
+        case "step": if (v < 0) music.stepSpeed(-1); else music.cycleReverb(); break;
+        case "voice": if (v) music.toggleLoop(); break;
+        case "send": music.cycleBass(); break;
+        case "back": music.hide(); break;
+        }
+    }
     Connections {
         target: app.gamepad
-        function onNav(dx, dy) { app.padNav(dx, dy); }
-        function onConfirm() { app.padConfirm(); }
-        function onBack() { app.padBack(); }
-        function onBackHeld(down) { answers.setBackHeld(down); }
-        function onAcceptPrediction() { app.padAcceptPrediction(); }
-        function onSecondary() { app.padSecondary(); }
-        function onStep(d) { app.padStep(d); }
+        function onNav(dx, dy) { if (music.open) app.musicPad("nav", { dx: dx, dy: dy }); else app.padNav(dx, dy); }
+        function onConfirm() { if (music.open) app.musicPad("confirm"); else app.padConfirm(); }
+        function onBack() { if (music.open) app.musicPad("back"); else app.padBack(); }
+        function onBackHeld(down) { if (!music.open) answers.setBackHeld(down); }
+        function onAcceptPrediction() { if (music.open) app.musicPad("nextTab"); else app.padAcceptPrediction(); }
+        function onSecondary() { if (music.open) app.musicPad("secondary"); else app.padSecondary(); }
+        function onStep(d) { if (music.open) app.musicPad("step", d); else app.padStep(d); }
         function onZoomStep(d) { app.padZoom(d); }
         function onZoomReset() { if (app.backend) app.backend.resetZoom(); }
-        function onToggleSettings() { app.padSettings(); }
-        function onToggleNewSession() { app.padNewSession(); }
+        function onToggleSettings() { if (!music.open) app.padSettings(); }
+        function onToggleNewSession() { if (!music.open) app.padNewSession(); }
+        function onToggleMusic() { app.padToggleMusic(); }
         function onToggleBriefing() {
             app.poke();
-            if (!onboarding.open && !dialog.open && !settings.open && !controllerMap.open)
+            if (!music.open && !onboarding.open && !dialog.open && !settings.open && !controllerMap.open)
                 briefing.open ? briefing.hide() : briefing.show();
         }
-        function onScrollDelta(dy) { app.padScroll(dy); }
+        function onScrollDelta(dy) { if (!music.open) app.padScroll(dy); }
         function onTouchpadPan(dx, dy) {
-            if (onboarding.open || dialog.open || settings.open || controllerMap.open)
+            if (music.open || onboarding.open || dialog.open || settings.open || controllerMap.open)
                 return;
             if (app.proseOpen && app.lens > 0) prose.scrollPixels(dy);
             else if (app.lens === 2) stage.panPixels(dx, dy);
@@ -816,12 +950,12 @@ FocusScope {
         }
         function onHorizontalInspect(dir) {
             app.poke();
-            if (onboarding.open || dialog.open || settings.open || controllerMap.open)
+            if (music.open || onboarding.open || dialog.open || settings.open || controllerMap.open)
                 return;
             if (app.lens === 2) stage.panPixels(dir * 96, 0);
         }
-        function onVoiceHold(active) { app.padVoiceHold(active); }
-        function onSendPressed() { app.padSend(); }
+        function onVoiceHold(active) { if (music.open) app.musicPad("voice", active); else app.padVoiceHold(active); }
+        function onSendPressed() { if (music.open) app.musicPad("send"); else app.padSend(); }
     }
 
     Rectangle {
@@ -1011,8 +1145,8 @@ FocusScope {
                 id: ladder
                 anchors.top: header.bottom
                 anchors.topMargin: 24
-                anchors.bottom: answers.top
-                anchors.bottomMargin: 16
+                anchors.bottom: app.composerShown ? answers.top : parent.bottom
+                anchors.bottomMargin: app.composerShown ? 16 : 28
                 anchors.left: parent.left
                 anchors.right: parent.right
                 project: app.project
@@ -1027,8 +1161,8 @@ FocusScope {
                 id: stage
                 anchors.top: header.bottom
                 anchors.topMargin: 18
-                anchors.bottom: answers.top
-                anchors.bottomMargin: 18
+                anchors.bottom: app.composerShown ? answers.top : parent.bottom
+                anchors.bottomMargin: app.composerShown ? 18 : 30
                 anchors.left: parent.left
                 anchors.right: parent.right
                 anchors.leftMargin: 56
@@ -1066,6 +1200,10 @@ FocusScope {
                 shown: app.proseOpen && app.lens > 0
             }
 
+            // Docked composer: collapsed below the window edge by default, so charts, tables and
+            // the Ladder get the full height (prompts go through the ask card at the target).
+            // It slides in while it has focus (Enter, typing on a lens, Cmd+Shift+M), while it
+            // holds an answer, or while app.composerDocked pins it open.
             Composer {
                 id: answers
                 anchors.left: parent.left
@@ -1073,7 +1211,7 @@ FocusScope {
                 anchors.bottom: parent.bottom
                 anchors.leftMargin: 56
                 anchors.rightMargin: 56
-                anchors.bottomMargin: 32
+                anchors.bottomMargin: app.composerShown ? 32 : -(height + 48)
                 backend: app.backend
                 hasSession: app.project !== null && app.project.sessionCount > 0
                 navMode: app.navMode
@@ -1227,6 +1365,50 @@ FocusScope {
             return Qt.rect(0, 0, 0, 0);
         return s.item.mapToItem(app, s.r.x, s.r.y, s.r.width, s.r.height);
     }
+    // What the controller / keyboard cursor is on, as a semantic target. It becomes the active
+    // prompt target (the same registry mouse hover fills), so ✕ / L2 / Cmd+K / "/" open the ask
+    // card beside it with its chip attached. Mouse mode leaves the target to the pointer.
+    readonly property var cursorTarget: {
+        const s = cursorSpec;
+        const r = cursorRect;
+        if (!s || r.width <= 0 || answers.inputFocused)
+            return null;
+        if (lens === 0) {
+            if (constellation.count === 0)
+                return null;
+            const i = constellation.slotOf(selectedIsland) >= 0 ? selectedIsland : constellation.slots[0];
+            const p = projects[i];
+            if (!p)
+                return null;
+            const line = p.stateLine || p.lastLine || p.nowLine || "";
+            return { kind: "island", session: p.key, artifact: "", path: "", label: p.name,
+                     context: p.name + " (" + p.status + ")" + (line.length > 0 ? ": " + line : ""), r: r };
+        }
+        if (lens === 2) {
+            if (stage.terms.active || stage.terms.expanded >= 0) {
+                const term = stage.terms.current();
+                if (!term)
+                    return null;
+                return { kind: "term", session: projectKey, artifact: String(artifactIndex), path: "",
+                         label: term.name + (term.value ? " = " + term.value : ""), context: scopeLabel(term), r: r };
+            }
+            if (!artifact || !backend)
+                return null;
+            return { kind: "artifact", session: projectKey, artifact: String(artifactIndex), path: artifact.path || "",
+                     label: artifact.title || artifact.name || artifact.kind || "artifact",
+                     context: backend.contextSlice(projectKey, artifactIndex), r: r };
+        }
+        return null;
+    }
+    onCursorTargetChanged: syncCursorTarget()
+    function syncCursorTarget() {
+        const t = cursorTarget;
+        if (!t || !targets || (navMode === "mouse" && !padConnected))
+            return;
+        targets.setHoverTarget(t.kind, t.session, t.artifact, t.path, t.label, t.context,
+                               t.r.x, t.r.y, t.r.width, t.r.height);
+    }
+
     FocusCursor {
         id: focusCursor
         anchors.fill: parent
@@ -1451,6 +1633,7 @@ FocusScope {
         id: music
         anchors.fill: parent
         backend: app.backend
+        padHints: app.padHints
         onClosed: app.takeFocus()
     }
     // Quiet hint, Constellation only: where the briefing lives.

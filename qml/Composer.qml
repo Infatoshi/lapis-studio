@@ -204,94 +204,80 @@ Item {
         width: parent.width
         spacing: 14
 
-        // Quick answer
-        Item {
+        // Quick answer: the question (dim, one line) stacked above the reply. The reply renders
+        // as markdown (code spans and fences, never raw backticks), wraps, and scrolls inside a
+        // capped height, so a long answer never trails off the window.
+        Column {
+            objectName: "quickBlock"
             width: parent.width
-            height: root.hasQuick ? 40 : 0
             visible: root.hasQuick
-            Text {
-                id: qq
-                anchors.verticalCenter: parent.verticalCenter
-                text: root.hasQuick ? root.backend.quickQuestion : ""
-                color: Theme.dim
-                font.family: Theme.sans
-                font.pixelSize: Theme.px(21)
-                width: Math.min(implicitWidth, 420)
-                elide: Text.ElideRight
-            }
-            // A drawn arrow, not the "→" glyph: the glyph sat on its own line box (different size,
-            // possibly a fallback font) and drifted off the text line. This one is centred on the
-            // question's x-height, and the answer and seconds share the question's baseline.
-            FontMetrics { id: qfm; font: qq.font }
-            Canvas {
-                id: arrow
-                objectName: "quickArrow"
-                anchors.left: qq.right
-                anchors.leftMargin: 14
-                width: Math.round(Theme.px(18))
-                height: Math.round(Theme.px(12))
-                y: Math.round(qq.y + qq.baselineOffset - qfm.xHeight / 2 - height / 2)
-                property color stroke: Theme.gold
-                onStrokeChanged: requestPaint()
-                onWidthChanged: requestPaint()
-                onHeightChanged: requestPaint()
-                onPaint: {
-                    const ctx = getContext("2d");
-                    ctx.reset();
-                    const lw = Math.max(1.5, height / 7);
-                    const mid = height / 2;
-                    const head = height / 2 - lw / 2;
-                    ctx.strokeStyle = stroke;
-                    ctx.lineWidth = lw;
-                    ctx.lineCap = "round";
-                    ctx.lineJoin = "round";
-                    ctx.beginPath();
-                    ctx.moveTo(lw / 2, mid);
-                    ctx.lineTo(width - lw / 2, mid);
-                    ctx.moveTo(width - lw / 2 - head, mid - head);
-                    ctx.lineTo(width - lw / 2, mid);
-                    ctx.lineTo(width - lw / 2 - head, mid + head);
-                    ctx.stroke();
+            spacing: 6
+            Item {
+                width: parent.width
+                height: qq.implicitHeight
+                Text {
+                    id: qq
+                    objectName: "quickQuestion"
+                    anchors.left: parent.left
+                    anchors.right: qsec.left
+                    anchors.rightMargin: 20
+                    text: root.hasQuick ? root.backend.quickQuestion : ""
+                    color: Theme.dim
+                    font.family: Theme.sans
+                    font.pixelSize: Theme.px(18)
+                    elide: Text.ElideRight
+                }
+                Text {
+                    id: qsec
+                    objectName: "quickSeconds"
+                    anchors.right: parent.right
+                    anchors.baseline: qq.baseline
+                    // Live seconds while the model works (a 10 Hz tick), the final time once done.
+                    text: !root.hasQuick ? ""
+                          : root.backend.quickBusy ? root.backend.quickElapsed.toFixed(1) + "s"
+                          : root.backend.quickSeconds > 0
+                            ? (root.backend.quickThinking.length > 0 || root.backend.quickThinkingTokens > 0 ? "✦ " : "")
+                              + root.backend.quickSeconds.toFixed(1) + "s"
+                          : ""
+                    color: root.hasQuick && root.backend.quickBusy ? Theme.dim : Theme.faint
+                    font.family: Theme.mono
+                    font.pixelSize: Theme.px(16)
                 }
             }
-            Text {
-                objectName: "quickAnswer"
-                anchors.left: arrow.right
-                anchors.leftMargin: 14
-                anchors.right: qsec.left
-                anchors.rightMargin: 20
-                anchors.baseline: qq.baseline
-                readonly property bool waiting: root.hasQuick && root.backend.quickBusy && root.backend.quickAnswer.length === 0
-                readonly property bool thinking: waiting && root.backend.quickThinking.length > 0
-                // Before the first answer token: live thinking text (claude thinking_delta, codex
-                // reasoning summaries, agy thinking when it sends any), newest words, dim #6e665e.
-                // With no thinking text yet, the phase says what the model is doing. The first
-                // answer token replaces it all.
-                text: !root.hasQuick ? "" : thinking ? root.backend.quickThinking
-                                      : waiting ? root.phaseLabel()
-                                      : root.backend.quickAnswer
-                color: waiting ? "#6e665e" : Theme.ink
-                font.italic: waiting && !thinking
-                elide: thinking ? Text.ElideLeft : Text.ElideRight
-                font.family: Theme.sans
-                font.pixelSize: Theme.px(23)
-                font.weight: Font.Medium
-            }
-            Text {
-                id: qsec
-                objectName: "quickSeconds"
-                anchors.right: parent.right
-                anchors.baseline: qq.baseline
-                // Live seconds while the model works (a 10 Hz tick), the final time once it is done.
-                text: !root.hasQuick ? ""
-                      : root.backend.quickBusy ? root.backend.quickElapsed.toFixed(1) + "s"
-                      : root.backend.quickSeconds > 0
-                        ? (root.backend.quickThinking.length > 0 || root.backend.quickThinkingTokens > 0 ? "✦ " : "")
-                          + root.backend.quickSeconds.toFixed(1) + "s"
-                      : ""
-                color: root.hasQuick && root.backend.quickBusy ? Theme.dim : Theme.faint
-                font.family: Theme.mono
-                font.pixelSize: Theme.px(16)
+            Flickable {
+                id: qaFlick
+                objectName: "quickAnswerScroll"
+                width: parent.width
+                height: Math.min(Math.round(Theme.px(210)), qaText.implicitHeight)
+                contentHeight: qaText.implicitHeight
+                clip: true
+                interactive: contentHeight > height
+                boundsBehavior: Flickable.StopAtBounds
+                onContentHeightChanged: if (root.hasQuick && root.backend.quickBusy) contentY = Math.max(0, contentHeight - height)
+                Text {
+                    id: qaText
+                    objectName: "quickAnswer"
+                    width: qaFlick.width
+                    readonly property bool waiting: root.hasQuick && root.backend.quickBusy && root.backend.quickAnswer.length === 0
+                    readonly property bool thinking: waiting && root.backend.quickThinking.length > 0
+                    // Before the first answer token: live thinking text (claude thinking_delta, codex
+                    // reasoning summaries, agy thinking when it sends any), newest words, dim #6e665e.
+                    // With no thinking text yet, the phase says what the model is doing. The first
+                    // answer token replaces it all.
+                    text: !root.hasQuick ? "" : thinking ? root.backend.quickThinking
+                                          : waiting ? root.phaseLabel()
+                                          : root.backend.quickAnswer
+                    textFormat: waiting ? Text.PlainText : Text.MarkdownText
+                    wrapMode: Text.Wrap
+                    maximumLineCount: waiting ? 2 : 100000
+                    elide: waiting ? Text.ElideRight : Text.ElideNone
+                    color: waiting ? "#6e665e" : Theme.ink
+                    linkColor: Theme.gold
+                    font.italic: waiting && !thinking
+                    font.family: Theme.sans
+                    font.pixelSize: Theme.px(21)
+                    onLinkActivated: link => Qt.openUrlExternally(link)
+                }
             }
         }
 
