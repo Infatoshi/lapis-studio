@@ -92,6 +92,8 @@ QVector<Entry> scan(int pid, int maxNodes, int maxDepth, const Budget &budget, b
         n.role = stringValue(attribute(e.get(), kAXRoleAttribute, budget).get());
         n.title = stringValue(attribute(e.get(), kAXTitleAttribute, budget).get());
         if (depth == 0) appName = n.title;
+        // Chrome's toolbar and omnibox carry their names in AXDescription, not AXTitle.
+        else if (n.title.isEmpty()) n.title = stringValue(attribute(e.get(), kAXDescriptionAttribute, budget).get());
         n.appName = appName;
         // Never copy secure text-field contents into model context.
         const auto subrole = stringValue(attribute(e.get(), kAXSubroleAttribute, budget).get());
@@ -224,6 +226,98 @@ QVector<DisplayInfo> listDisplays() {
         result.push_back({id, text ? QString::fromCFString(text.get()) : QString(), {b.origin.x, b.origin.y, b.size.width, b.size.height}, scale, id == CGMainDisplayID()});
     }
     return result;
+}
+QVector<AppWindowInfo> listAppWindows() {
+    QVector<AppWindowInfo> result;
+    @autoreleasepool {
+        const auto displays = listDisplays();
+        CF<CFArrayRef> windows(CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements, kCGNullWindowID));
+        if (!windows) return result;
+        for (CFIndex i = 0; i < CFArrayGetCount(windows.get()); ++i) {
+            auto info = (CFDictionaryRef)CFArrayGetValueAtIndex(windows.get(), i);
+            auto rawBounds = (CFDictionaryRef)CFDictionaryGetValue(info, kCGWindowBounds);
+            auto rawPid = (CFNumberRef)CFDictionaryGetValue(info, kCGWindowOwnerPID);
+            auto rawLayer = (CFNumberRef)CFDictionaryGetValue(info, kCGWindowLayer);
+            CGRect rect{}; int pid = 0, layer = 0;
+            if (!rawBounds || !rawPid || !CGRectMakeWithDictionaryRepresentation(rawBounds, &rect)) continue;
+            if (rawLayer) CFNumberGetValue(rawLayer, kCFNumberIntType, &layer);
+            if (layer != 0) continue;  // menu bar, Dock, overlays (our own reticle) are not app windows
+            CFNumberGetValue(rawPid, kCFNumberIntType, &pid);
+            AppWindowInfo w;
+            w.pid = pid;
+            w.globalRect = {rect.origin.x, rect.origin.y, rect.size.width, rect.size.height};
+            if (w.globalRect.isEmpty()) continue;
+            w.appName = stringValue(CFDictionaryGetValue(info, kCGWindowOwnerName));
+            auto rawOnScreen = (CFBooleanRef)CFDictionaryGetValue(info, kCGWindowIsOnscreen);
+            w.onScreen = !rawOnScreen || CFBooleanGetValue(rawOnScreen);
+            double bestArea = 0;
+            for (const auto &d : displays) {
+                if (d.globalPoints.contains(w.globalRect.center())) { w.displayId = d.displayId; break; }
+                const QRectF overlap = d.globalPoints.intersected(w.globalRect);
+                if (overlap.width() * overlap.height() > bestArea) { bestArea = overlap.width() * overlap.height(); w.displayId = d.displayId; }
+            }
+            result.push_back(w);
+        }
+    }
+    return result;
+}
+QString canonicalAppName(const QString &hint) {
+    const QString h = hint.simplified();
+    const QString k = h.toLower();
+    static const QList<std::pair<QStringList, QString>> aliases{
+        {{"chrome", "google chrome"}, "Google Chrome"},
+        {{"vscode", "vs code", "code", "visual studio code"}, "Visual Studio Code"},
+        {{"iterm", "iterm2"}, "iTerm2"},
+        {{"edge", "microsoft edge"}, "Microsoft Edge"},
+        {{"brave", "brave browser"}, "Brave Browser"},
+        {{"settings", "system settings", "system preferences"}, "System Settings"},
+        {{"whatsapp"}, "WhatsApp"},
+    };
+    for (const auto &[keys, name] : aliases) if (keys.contains(k)) return name;
+    return h;
+}
+bool appNameMatches(const QString &appName, const QString &hint) {
+    const QString canon = canonicalAppName(hint), name = appName.simplified();
+    if (canon.isEmpty() || name.isEmpty()) return false;
+    if (name.compare(canon, Qt::CaseInsensitive) == 0) return true;
+    return (canon.size() >= 3 && name.contains(canon, Qt::CaseInsensitive)) ||
+        (name.size() >= 3 && canon.contains(name, Qt::CaseInsensitive));
+}
+bool activateAppByName(const QString &hint, uint32_t *outDisplayId) {
+    if (outDisplayId) *outDisplayId = 0;
+    const QString canon = canonicalAppName(hint);
+    if (canon.isEmpty()) return false;
+    @autoreleasepool {
+        const pid_t self = getpid();
+        NSRunningApplication *exact = nil, *loose = nil;
+        for (NSRunningApplication *app in NSWorkspace.sharedWorkspace.runningApplications) {
+            if (app.processIdentifier == self || app.terminated || app.activationPolicy != NSApplicationActivationPolicyRegular) continue;
+            const QString name = QString::fromNSString(app.localizedName ?: @"");
+            if (name.compare(canon, Qt::CaseInsensitive) == 0) { exact = app; break; }
+            if (!loose && appNameMatches(name, canon)) loose = app;
+        }
+        NSRunningApplication *app = exact ?: loose;
+        if (!app) return false;
+        bool activated = false;
+        if (@available(macOS 14.0, *)) {
+            // Cooperative activation: we are usually frontmost, so hand activation over first.
+            if (NSApp) [NSApp yieldActivationToApplication:app];
+            activated = [app activateFromApplication:NSRunningApplication.currentApplication options:NSApplicationActivateAllWindows]
+                || [app activateWithOptions:NSApplicationActivateAllWindows];
+        } else {
+            activated = [app activateWithOptions:NSApplicationActivateAllWindows];
+        }
+        if (!activated) return false;
+        if (outDisplayId) {
+            double bestArea = 0;
+            for (const auto &w : listAppWindows())
+                if (w.pid == app.processIdentifier && w.displayId && w.globalRect.width() * w.globalRect.height() > bestArea) {
+                    bestArea = w.globalRect.width() * w.globalRect.height();
+                    *outDisplayId = w.displayId;
+                }
+        }
+        return true;
+    }
 }
 QPointF capturePixelToGlobalPoint(QPointF p, const DisplayInfo &d, QSizeF size) {
     size = pixels(d, size);
@@ -403,7 +497,23 @@ ActionResult typeText(const QString &text) {
     if (!AXIsProcessTrusted()) return {false, "Accessibility permission is required"};
     for (qsizetype offset = 0; offset < text.size();) {
         if (cancelFlag.load()) return cancelled();
+        const QChar c = text.at(offset);
+        if (c == '\n' || c == '\r') {
+            // A real Return key: a typed newline character is ignored by address bars.
+            offset += (c == '\r' && offset + 1 < text.size() && text.at(offset + 1) == '\n') ? 2 : 1;
+            std::this_thread::sleep_for(std::chrono::milliseconds(30));  // let autocomplete settle
+            CF<CGEventRef> down(CGEventCreateKeyboardEvent(nullptr, CGKeyCode(36), true));
+            CF<CGEventRef> up(CGEventCreateKeyboardEvent(nullptr, CGKeyCode(36), false));
+            if (!down || !up) return {false, "Cannot create keyboard events"};
+            CGEventSetFlags(down.get(), 0);
+            CGEventSetFlags(up.get(), 0);
+            if (!post(down.get())) return cancelled();
+            CGEventPost(kCGHIDEventTap, up.get());
+            continue;
+        }
         qsizetype count = std::min<qsizetype>(20, text.size() - offset);
+        for (qsizetype i = 0; i < count; ++i)
+            if (text.at(offset + i) == '\n' || text.at(offset + i) == '\r') { count = i; break; }
         if (offset + count < text.size() && text.at(offset + count - 1).isHighSurrogate()) --count;
         CF<CGEventRef> down(CGEventCreateKeyboardEvent(nullptr, 0, true));
         CF<CGEventRef> up(CGEventCreateKeyboardEvent(nullptr, 0, false));

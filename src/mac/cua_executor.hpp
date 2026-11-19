@@ -54,6 +54,13 @@ struct CuaHooks {
     std::function<void()> reticleHide;
     std::function<uint32_t()> reticleWindowId;  // excluded from captures; 0 when none
     std::function<void(int ms)> pause;          // lets a glide land before the click; no-op in tests
+    // Multi-monitor routing; every one is optional. Unset listAppWindows means "no window info",
+    // unset activateApp means no activation, unset selfPid means no self filtering, unset
+    // lapisDisplayId is derived from listAppWindows (largest selfPid window).
+    std::function<QVector<AppWindowInfo>()> listAppWindows;
+    std::function<bool(const QString &appHint, uint32_t *outDisplayId)> activateApp;
+    std::function<int()> selfPid;
+    std::function<uint32_t()> lapisDisplayId;  // 0 when Lapis has no on-screen window
 };
 CuaHooks defaultCuaHooks();
 
@@ -74,6 +81,13 @@ int axMatchScore(const AxNode &node, const QString &targetDesc);
 // The index of the single best AX match for targetDesc, -1 when none or when the top score is
 // tied between nodes with different rects (ambiguous: let the VLM decide).
 int bestAxMatch(const QVector<AxNode> &nodes, const QString &targetDesc);
+// The app a target names, as a short hint ("Chrome address bar" -> "Chrome", "Send button in
+// Discord" -> "Discord", "VS Code terminal" -> "VS Code"); empty when it names none.
+QString extractAppHint(const QString &targetDesc);
+// targetDesc without the app phrase and its connector ("Send button in Discord" -> "Send button").
+QString stripAppHint(const QString &targetDesc, const QString &appHint);
+// Model tags carry "\n" as two characters; turn each literal backslash-n into a real newline.
+QString normalizeTypedText(const QString &text);
 
 // Visible computer use: L1 Accessibility first, L3 local VLM pixel grounding as fallback, with
 // the reticle showing every step. Blocking; run it on a worker thread (capture requires one).
@@ -100,8 +114,19 @@ private:
         AxNode node;
         QString detail;
     };
-    bool primaryDisplay(DisplayInfo *out, QString *err) const;
-    Located locate(const QString &targetDesc, bool refineCrop, const QString &label);
+    // Where to look for one target: displays in search order (the hinted app's display, then
+    // displays without Lapis, primary first, then Lapis's own), plus the self filter.
+    struct Route {
+        QVector<DisplayInfo> displays;
+        QString appHint;
+        uint32_t targetDisplayId = 0;
+        uint32_t lapisDisplayId = 0;
+        int selfPid = 0;
+        bool allowSelf = false;
+    };
+    // Activates the hinted app (with a settle pause) when activate is true.
+    bool route(const QString &targetDesc, bool activate, Route *out, QString *err);
+    Located locate(const QString &targetDesc, bool refineCrop, const QString &label, Route *routeOut = nullptr);
 
     CuaHooks m_hooks;
     bool m_preferAxPress = false;

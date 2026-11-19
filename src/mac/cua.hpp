@@ -30,6 +30,27 @@ QPointF globalPointToCapturePixel(QPointF point, const DisplayInfo &display, QSi
 // AppKit flips around the primary display, NOT the union of all displays.
 QPointF globalPointToAppKit(QPointF point, const QRectF &primaryGlobalPoints);
 
+// One normal-layer (layer 0) on-screen window, front to back. displayId is the display holding
+// the window's centre (else the one it overlaps most); 0 when it is on no active display.
+struct AppWindowInfo {
+    int pid = 0;
+    QString appName;
+    uint32_t displayId = 0;
+    QRectF globalRect;  // Quartz global points
+    bool onScreen = false;
+};
+QVector<AppWindowInfo> listAppWindows();
+// Pure: maps a voice/model app hint to the macOS app name ("chrome" -> "Google Chrome",
+// "vscode" / "code" -> "Visual Studio Code"); unknown hints come back trimmed, unchanged.
+QString canonicalAppName(const QString &appHint);
+// Pure: true when a running app's localized name matches a hint (canonical name equality, else
+// case-insensitive substring either way of the canonical name).
+bool appNameMatches(const QString &appName, const QString &appHint);
+// Activates the regular running app matching appHint (never this process). On success,
+// *outDisplayId is the display of its largest on-screen window, or 0 when none is on screen yet.
+// Call on the main thread (AppKit activation).
+bool activateAppByName(const QString &appHint, uint32_t *outDisplayId = nullptr);
+
 struct AxNode {
     int id = 0;
     QString role, title, value, appName;
@@ -55,6 +76,8 @@ struct PointerLeaseConfig { double userMoveAbortPx = 12.0; bool restoreCursor = 
 bool shouldRestoreCursor(QPointF saved, QPointF beforeRestore, QPointF expectedTarget, double abortPx);
 ActionResult clickAt(QPointF globalPt, bool doubleClick = false, const PointerLeaseConfig &cfg = {});
 ActionResult scrollAt(QPointF globalPt, int deltaY);
+// '\n' (and "\r\n" / '\r') posts a real Return key (keycode 36) instead of a newline character,
+// so address bars and search fields submit.
 ActionResult typeText(const QString &text);
 // Caller latches true on abort and explicitly resets before a new operation.
 // A posted mouse/key down is always balanced by an up, even on cancellation.

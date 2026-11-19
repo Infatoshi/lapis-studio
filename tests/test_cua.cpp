@@ -175,10 +175,27 @@ struct MockRig {
     bool clickDouble = false;
     int scrollDy = 0;
     QString typed;
+    // Multi-monitor: per-display AX nodes (falls back to `nodes`), on-screen windows, activation.
+    QMap<uint32_t, QVector<AxNode>> nodesByDisplay;
+    QVector<AppWindowInfo> windows;
+    int selfPid = 0;
+    bool activateOk = false;
+    uint32_t activateDisplay = 0;
+    QStringList pauses;
     CuaHooks hooks() {
         CuaHooks h;
         h.listDisplays = [this] { calls << "listDisplays"; return displays; };
-        h.inspectDisplay = [this](uint32_t id) { calls << QString("inspectDisplay:%1").arg(id); return nodes; };
+        h.inspectDisplay = [this](uint32_t id) {
+            calls << QString("inspectDisplay:%1").arg(id);
+            return nodesByDisplay.isEmpty() ? nodes : nodesByDisplay.value(id);
+        };
+        h.listAppWindows = [this] { calls << "listAppWindows"; return windows; };
+        h.activateApp = [this](const QString &hint, uint32_t *out) {
+            calls << QString("activate:%1").arg(hint);
+            if (out) *out = activateOk ? activateDisplay : 0;
+            return activateOk;
+        };
+        h.selfPid = [this] { return selfPid; };
         h.captureDisplayJpeg = [this](uint32_t id, int w, uint32_t ex, QString *err) {
             calls << "capture";
             capturedDisplay = id; capturedWidth = w; capturedExclude = ex;
@@ -197,13 +214,19 @@ struct MockRig {
         h.reticlePulse = [this](QPointF p, const QString &) { calls << "reticlePulse"; pulsePt = p; };
         h.reticleHide = [this] { calls << "reticleHide"; };
         h.reticleWindowId = [this] { return windowId; };
-        h.pause = [](int) {};
+        h.pause = [this](int ms) { pauses << QString::number(ms); };
         return h;
     }
     // The calls that matter for ordering (drops the read-only listing / inspection steps).
     QStringList effects() const {
         QStringList out;
-        for (const QString &c : calls) if (c != "listDisplays" && !c.startsWith("inspectDisplay")) out << c;
+        for (const QString &c : calls)
+            if (c != "listDisplays" && c != "listAppWindows" && !c.startsWith("inspectDisplay")) out << c;
+        return out;
+    }
+    QStringList inspected() const {
+        QStringList out;
+        for (const QString &c : calls) if (c.startsWith("inspectDisplay:")) out << c.mid(15);
         return out;
     }
 };
@@ -379,6 +402,125 @@ void executorTests() {
         check(ranOn == mainThread, "exec: worker call is marshalled onto the main thread");
     }
 }
+AxNode appNode(const QString &role, const QString &title, QRectF rect, int pid, const QString &app) {
+    return AxNode{1, role, title, {}, app, pid, rect, {"AXPress"}};
+}
+// Lapis fullscreen on display 1 (primary), Chrome on display 2 to its right.
+MockRig dualMonitorRig() {
+    MockRig m;
+    m.displays = {{1, "left", {0, 0, 1920, 1080}, 1, true}, {2, "right", {1920, 0, 1920, 1080}, 1, false}};
+    m.selfPid = 500;
+    m.windows = {{500, "lapis_studio", 1, {0, 0, 1920, 1080}, true},
+                 {600, "Google Chrome", 2, {1920, 25, 1920, 1055}, true}};
+    return m;
+}
+void multiMonitorTests() {
+    // App hints and stripping.
+    check(extractAppHint("Chrome address bar") == "Chrome", "hint: Chrome address bar -> Chrome");
+    check(extractAppHint("Send button in Discord") == "Discord", "hint: Send button in Discord -> Discord");
+    check(extractAppHint("address bar in Google Chrome") == "Chrome", "hint: Google Chrome -> Chrome");
+    check(extractAppHint("VS Code terminal tab") == "VS Code", "hint: leftmost app wins (VS Code before Terminal)");
+    check(extractAppHint("the code block") == "" && extractAppHint("send") == "" && extractAppHint("searchbar") == "",
+        "hint: generic words and substrings name no app");
+    check(extractAppHint("Spotify play button") == "Spotify" && extractAppHint("Slack message box") == "Slack"
+              && extractAppHint("Finder sidebar") == "Finder" && extractAppHint("Safari tab") == "Safari",
+        "hint: Spotify, Slack, Finder, Safari");
+    check(stripAppHint("Send button in Discord", "Discord") == "Send button", "strip: trailing 'in Discord'");
+    check(stripAppHint("Chrome address bar", "Chrome") == "address bar", "strip: leading app name");
+    check(stripAppHint("address bar inside of the Chrome window", "Chrome") == "address bar", "strip: 'inside of the ... window'");
+    check(stripAppHint("Discord", "Discord") == "Discord", "strip: never empties the target");
+    check(canonicalAppName("chrome") == "Google Chrome" && canonicalAppName("vscode") == "Visual Studio Code"
+              && canonicalAppName("code") == "Visual Studio Code" && canonicalAppName(" Discord ") == "Discord",
+        "alias: chrome, vscode, code");
+    check(appNameMatches("Google Chrome", "Chrome") && appNameMatches("Visual Studio Code", "VS Code")
+              && appNameMatches("discord", "Discord") && !appNameMatches("Safari", "Chrome") && !appNameMatches("", "Chrome"),
+        "alias: running-app name matching");
+    check(bestAxMatch({axNode(1, "AXButton", "Send", {10, 10, 50, 20})}, "Send button") == 0, "match: role noun dropped");
+    check(axMatchScore(axNode(1, "AXTextField", "Address and search bar", {10, 10, 500, 30}), "address bar") > 0
+              && axMatchScore(axNode(1, "AXButton", "Address and search bar", {10, 10, 500, 30}), "address bar") == 0,
+        "match: address bar synonym needs an editable field");
+
+    // "\n" normalization.
+    check(normalizeTypedText("x.com\\n") == "x.com\n" && normalizeTypedText("a\\r\\nb") == "a\nb"
+              && normalizeTypedText("plain") == "plain",
+        "type: literal \\n becomes a real newline");
+
+    // L1 across displays: Lapis's own field on display 1 is skipped, Chrome's on display 2 wins.
+    {
+        MockRig m = dualMonitorRig();
+        m.activateOk = true; m.activateDisplay = 2;
+        const QRectF omni(2100, 60, 900, 32);
+        m.nodesByDisplay[1] = {appNode("AXTextField", "Address bar", {600, 20, 700, 40}, 500, "lapis_studio")};
+        m.nodesByDisplay[2] = {appNode("AXTextField", "Address and search bar", omni, 600, "Google Chrome")};
+        CuaExecutor ex(m.hooks());
+        const auto res = ex.typeIntoTarget("Chrome address bar", "x.com\\n");
+        check(res.ok && res.tier == "L1_AX", "multi L1: ok via AX");
+        check(close(m.clickPt, omni.center()) && m.clickPt.x() >= 1920, "multi L1: clicks Chrome's omnibox on display 2");
+        check(m.typed == "x.com\n" && res.detail.contains("Return"), "multi L1: typed x.com then Return");
+        check(m.calls.contains("activate:Chrome") && m.pauses.contains("220"), "multi L1: Chrome activated, 220 ms settle");
+        check(m.inspected().value(0) == "2", "multi L1: the Chrome display is inspected first");
+        check(m.effects() == QStringList({"activate:Chrome", "reticleHighlight", "reticlePulse", "click", "type"}),
+            "multi L1: activate -> highlight -> pulse -> click -> type");
+    }
+    {
+        // No hint: Lapis's matching node is never a candidate; the other display is searched first.
+        MockRig m = dualMonitorRig();
+        const QRectF field(2300, 400, 400, 30);
+        m.nodesByDisplay[1] = {appNode("AXTextField", "Search", {600, 20, 700, 40}, 500, "lapis_studio")};
+        m.nodesByDisplay[2] = {appNode("AXTextField", "Search", field, 700, "Finder")};
+        CuaExecutor ex(m.hooks());
+        const auto res = ex.clickTarget("search");
+        check(res.ok && close(m.clickPt, field.center()), "multi L1: non-Lapis display first, Lapis node skipped");
+        check(m.inspected().value(0) == "2" && !m.calls.join(",").contains("activate"), "multi L1: no hint, no activation");
+        MockRig only = dualMonitorRig();
+        only.nodesByDisplay[1] = {appNode("AXTextField", "Search", {600, 20, 700, 40}, 500, "lapis_studio")};
+        only.ground.ok = false;
+        CuaExecutor exo(only.hooks());
+        check(!exo.clickTarget("search").ok && !only.calls.contains("click"), "multi L1: a Lapis-only match is never clicked");
+        MockRig self = dualMonitorRig();
+        self.nodesByDisplay[1] = {appNode("AXButton", "Lapis settings", {10, 10, 80, 20}, 500, "lapis_studio")};
+        CuaExecutor exs(self.hooks());
+        check(exs.clickTarget("Lapis settings").ok && close(self.clickPt, {50, 20}), "multi L1: a target naming Lapis may hit Lapis");
+    }
+
+    // L3: capture the Chrome display, not fullscreen Lapis, and map onto display 2's rect.
+    {
+        MockRig m = dualMonitorRig();
+        m.activateOk = true; m.activateDisplay = 0;  // activated, display found via the window list
+        m.ground.ok = true; m.ground.hasPoint1000 = true; m.ground.point1000 = {500, 50};
+        CuaExecutor ex(m.hooks());
+        const auto res = ex.typeIntoTarget("Chrome address bar", "x.com\\n");
+        check(res.ok && res.tier == "L3_VLM", "multi L3: ok via VLM");
+        check(m.capturedDisplay == 2, "multi L3: captures display 2 (Chrome), not display 1 (Lapis)");
+        // 1920x1080 at 1x captured at 1280x720: 500/1000 -> 960 pt, 50/1000 -> 54 pt, offset by x=1920.
+        check(close(res.globalPt, {2880, 54}) && m.clickPt.x() >= 1920 && close(m.movePt, {2880, 54}),
+            "multi L3: point maps onto display 2's global rect");
+        check(m.groundInstruction == "Chrome address bar" && m.typed == "x.com\n", "multi L3: full target grounded, Return typed");
+    }
+    {
+        // No hint and no app info beyond Lapis: any non-Lapis display beats Lapis's.
+        MockRig m = dualMonitorRig();
+        m.windows = {{500, "lapis_studio", 1, {0, 0, 1920, 1080}, true}};
+        m.ground.ok = true; m.ground.hasPoint1000 = true; m.ground.point1000 = {100, 100};
+        CuaExecutor ex(m.hooks());
+        check(ex.clickTarget("the gear icon").ok && m.capturedDisplay == 2 && m.clickPt.x() >= 1920,
+            "multi L3: avoids the Lapis display without a hint");
+        // Single monitor with Lapis fullscreen: the primary after activation is all there is.
+        MockRig s;
+        s.displays = {{1, "only", {0, 0, 1440, 900}, 2, true}};
+        s.selfPid = 500;
+        s.windows = {{500, "lapis_studio", 1, {0, 0, 1440, 900}, true}};
+        s.activateOk = true;
+        s.ground.ok = true; s.ground.hasPoint1000 = true; s.ground.point1000 = {500, 500};
+        CuaExecutor exs(s.hooks());
+        check(exs.clickTarget("Send button in Discord").ok && s.capturedDisplay == 1 && s.calls.contains("activate:Discord"),
+            "multi L3: single monitor activates the app and captures the primary");
+        // Scroll's centre fallback also lands on the non-Lapis display.
+        MockRig c = dualMonitorRig();
+        CuaExecutor exc(c.hooks());
+        check(exc.scrollTarget("", 3).ok && close(c.scrollPt, {2880, 540}), "multi scroll: centre of the non-Lapis display");
+    }
+}
 void liveTests() {
     const auto displays = listDisplays();
     check(!displays.isEmpty(), "live display enumeration");
@@ -453,7 +595,7 @@ void captureSmokeTest() {
 int main(int argc, char **argv) {
     QCoreApplication app(argc, argv);
     geometryTests(); leaseTests(); formattingTests(); cancellationTests(); liveTests();
-    reticleGeometryTests(); reticleOffscreenTests(); executorTests();
+    reticleGeometryTests(); reticleOffscreenTests(); executorTests(); multiMonitorTests();
     if (app.arguments().contains("--capture-smoke")) captureSmokeTest();
     std::printf("test_cua: %d passed, %d failed\n", passed, failed);
     return failed ? 1 : 0;

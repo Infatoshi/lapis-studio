@@ -8,8 +8,10 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QMetaObject>
+#include <QRegularExpression>
 #include <QThread>
 #include <curl/curl.h>
+#include <unistd.h>
 #include <algorithm>
 #include <cmath>
 #include <mutex>
@@ -103,6 +105,81 @@ CuaReticle *sharedReticle()
 
 constexpr int kGlideSettleMs = 170;  // the reticle glide (140 ms) plus a beat, so the click lands visibly
 constexpr int kPulseLeadMs = 60;
+constexpr int kActivateSettleMs = 220;  // the activated app comes forward on its own monitor
+
+// Apps a target may name, with the short hint each maps to. Bare generic words ("code",
+// "cursor", "edge", "notes") are left out on purpose: they name UI more often than apps.
+struct AppPattern { QRegularExpression re; QString hint; };
+const QVector<AppPattern> &appPatterns()
+{
+    static const QVector<AppPattern> patterns = [] {
+        const QList<std::pair<QString, QString>> raw{
+            {"google chrome", "Chrome"}, {"chrome", "Chrome"}, {"safari", "Safari"}, {"firefox", "Firefox"},
+            {"arc browser", "Arc"}, {"brave browser", "Brave"}, {"microsoft edge", "Microsoft Edge"},
+            {"discord", "Discord"}, {"slack", "Slack"}, {"finder", "Finder"}, {"terminal", "Terminal"},
+            {"iterm2?", "iTerm"}, {"ghostty", "Ghostty"}, {"spotify", "Spotify"},
+            {"visual studio code", "VS Code"}, {"vs ?code", "VS Code"}, {"xcode", "Xcode"},
+            {"zoom", "Zoom"}, {"notion", "Notion"}, {"obsidian", "Obsidian"}, {"telegram", "Telegram"},
+            {"whatsapp", "WhatsApp"}, {"figma", "Figma"}, {"system settings", "System Settings"}};
+        QVector<AppPattern> out;
+        for (const auto &[re, hint] : raw)
+            out.push_back({QRegularExpression(QStringLiteral("\\b%1\\b").arg(re), QRegularExpression::CaseInsensitiveOption), hint});
+        return out;
+    }();
+    return patterns;
+}
+
+// The leftmost (then longest) app mention in desc; false when none.
+bool findApp(const QString &desc, QString *hint, qsizetype *start, qsizetype *len)
+{
+    bool found = false;
+    for (const AppPattern &p : appPatterns()) {
+        const QRegularExpressionMatch m = p.re.match(desc);
+        if (!m.hasMatch())
+            continue;
+        if (!found || m.capturedStart() < *start || (m.capturedStart() == *start && m.capturedLength() > *len)) {
+            found = true;
+            *hint = p.hint;
+            *start = m.capturedStart();
+            *len = m.capturedLength();
+        }
+    }
+    return found;
+}
+
+// "send button" -> "send": the role noun a model adds that AX titles never carry.
+QString withoutRoleNoun(const QString &q)
+{
+    static const QRegularExpression tail(QStringLiteral("\\s+(button|field|tab|link|icon|menu item|checkbox|text box|box)$"));
+    QString out = q;
+    out.remove(tail);
+    return out == q ? QString() : out;
+}
+
+bool editableRole(const QString &role)
+{
+    return role == QLatin1String("AXTextField") || role == QLatin1String("AXComboBox") || role == QLatin1String("AXSearchField");
+}
+
+// Index of the single best positive score, -1 when none or tied across different rects.
+int bestIndex(const QVector<AxNode> &nodes, const std::function<int(const AxNode &)> &score, int *scoreOut = nullptr)
+{
+    int best = -1, bestScore = 0;
+    bool tied = false;
+    for (int i = 0; i < nodes.size(); ++i) {
+        const int s = score(nodes[i]);
+        if (s > bestScore) {
+            best = i;
+            bestScore = s;
+            tied = false;
+        } else if (s && s == bestScore && nodes[i].globalRect != nodes[best].globalRect) {
+            tied = true;  // a parent and child sharing one rect is still one target
+        }
+    }
+    if (scoreOut)
+        *scoreOut = tied ? 0 : bestScore;
+    return tied ? -1 : best;
+}
 
 }  // namespace
 
@@ -241,7 +318,48 @@ CuaHooks defaultCuaHooks()
         if (ms > 0)
             QThread::msleep(static_cast<unsigned long>(ms));
     };
+    h.listAppWindows = [] { return studio::cua::listAppWindows(); };
+    h.activateApp = [](const QString &hint, uint32_t *outDisplayId) {
+        bool ok = false;
+        runOnMainThread([&] { ok = activateAppByName(hint, outDisplayId); });
+        return ok;
+    };
+    h.selfPid = [] { return int(getpid()); };
+    // lapisDisplayId stays unset: the executor derives it from the listAppWindows it already has.
     return h;
+}
+
+QString extractAppHint(const QString &targetDesc)
+{
+    QString hint;
+    qsizetype start = 0, len = 0;
+    return findApp(targetDesc, &hint, &start, &len) ? hint : QString();
+}
+
+QString stripAppHint(const QString &targetDesc, const QString &appHint)
+{
+    QString hint;
+    qsizetype start = 0, len = 0;
+    if (appHint.isEmpty() || !findApp(targetDesc, &hint, &start, &len) || hint != appHint)
+        return targetDesc.simplified();
+    QString before = targetDesc.left(start), after = targetDesc.mid(start + len);
+    static const QRegularExpression connector(QStringLiteral("\\s*\\b(inside of|inside|within|in|on|of|from|at)(\\s+the)?\\s*$"),
+                                              QRegularExpression::CaseInsensitiveOption);
+    static const QRegularExpression article(QStringLiteral("\\s*\\bthe\\s*$"), QRegularExpression::CaseInsensitiveOption);
+    static const QRegularExpression suffix(QStringLiteral("^('s|\\s+(app|window))\\b"), QRegularExpression::CaseInsensitiveOption);
+    before.remove(connector);
+    before.remove(article);
+    after.remove(suffix);
+    const QString out = (before + QLatin1Char(' ') + after).simplified();
+    return out.isEmpty() ? targetDesc.simplified() : out;
+}
+
+QString normalizeTypedText(const QString &text)
+{
+    QString out = text;
+    out.replace(QLatin1String("\\r\\n"), QLatin1String("\n"));
+    out.replace(QLatin1String("\\n"), QLatin1String("\n"));
+    return out;
 }
 
 int axMatchScore(const AxNode &node, const QString &targetDesc)
@@ -262,6 +380,23 @@ int axMatchScore(const AxNode &node, const QString &targetDesc)
         score = 60;
     else if (!value.isEmpty() && value.contains(q))
         score = 50;
+    if (!score) {
+        // "address bar" / "url bar": browsers name the field "Address and search bar" or similar.
+        static const QStringList addressBar{QStringLiteral("address bar"), QStringLiteral("url bar"),
+                                            QStringLiteral("location bar"), QStringLiteral("omnibox"),
+                                            QStringLiteral("address field"), QStringLiteral("url field")};
+        if (addressBar.contains(q) && editableRole(node.role)
+            && (title.contains(QLatin1String("address")) || title.contains(QLatin1String("url"))))
+            score = 80;
+    }
+    if (!score) {
+        // "Send button" -> a node titled "Send"; a little below a direct hit.
+        const QString bare = withoutRoleNoun(q);
+        if (!bare.isEmpty()) {
+            const int s = axMatchScore(node, bare);
+            return s > 5 ? s - 5 : 0;
+        }
+    }
     if (score && clickableRole(node.role))
         score += 20;
     return score;
@@ -269,55 +404,124 @@ int axMatchScore(const AxNode &node, const QString &targetDesc)
 
 int bestAxMatch(const QVector<AxNode> &nodes, const QString &targetDesc)
 {
-    int best = -1, bestScore = 0;
-    bool tied = false;
-    for (int i = 0; i < nodes.size(); ++i) {
-        const int s = axMatchScore(nodes[i], targetDesc);
-        if (s > bestScore) {
-            best = i;
-            bestScore = s;
-            tied = false;
-        } else if (s && s == bestScore && nodes[i].globalRect != nodes[best].globalRect) {
-            tied = true;  // a parent and child sharing one rect is still one target
-        }
-    }
-    return tied ? -1 : best;
+    return bestIndex(nodes, [&](const AxNode &n) { return axMatchScore(n, targetDesc); });
 }
 
 CuaExecutor::CuaExecutor(CuaHooks hooks) : m_hooks(std::move(hooks)) {}
 
-bool CuaExecutor::primaryDisplay(DisplayInfo *out, QString *err) const
+bool CuaExecutor::route(const QString &targetDesc, bool activate, Route *r, QString *err)
 {
+    *r = Route{};
     const QVector<DisplayInfo> displays = m_hooks.listDisplays ? m_hooks.listDisplays() : QVector<DisplayInfo>();
-    for (const DisplayInfo &d : displays)
-        if (d.primary) {
-            *out = d;
-            return true;
-        }
-    if (!displays.isEmpty()) {
-        *out = displays.first();
-        return true;
+    if (displays.isEmpty()) {
+        *err = QStringLiteral("No display");
+        return false;
     }
-    *err = QStringLiteral("No display");
-    return false;
+    r->appHint = extractAppHint(targetDesc);
+    r->allowSelf = targetDesc.contains(QLatin1String("lapis"), Qt::CaseInsensitive);
+    r->selfPid = m_hooks.selfPid ? m_hooks.selfPid() : 0;
+    QVector<AppWindowInfo> windows = m_hooks.listAppWindows ? m_hooks.listAppWindows() : QVector<AppWindowInfo>();
+    // The display holding the largest window matching pred; 0 when none.
+    const auto largestOn = [&](const std::function<bool(const AppWindowInfo &)> &pred) {
+        uint32_t id = 0;
+        double area = 0;
+        for (const AppWindowInfo &w : windows)
+            if (w.displayId && pred(w) && w.globalRect.width() * w.globalRect.height() > area) {
+                area = w.globalRect.width() * w.globalRect.height();
+                id = w.displayId;
+            }
+        return id;
+    };
+    if (m_hooks.lapisDisplayId)
+        r->lapisDisplayId = m_hooks.lapisDisplayId();
+    else if (r->selfPid > 0)
+        r->lapisDisplayId = largestOn([&](const AppWindowInfo &w) { return w.pid == r->selfPid; });
+
+    if (!r->appHint.isEmpty()) {
+        uint32_t id = 0;
+        if (activate && m_hooks.activateApp && m_hooks.activateApp(r->appHint, &id)) {
+            if (m_hooks.pause)
+                m_hooks.pause(kActivateSettleMs);
+            if (!id && m_hooks.listAppWindows)
+                windows = m_hooks.listAppWindows();  // a window may only just have come on screen
+        }
+        if (!id)
+            id = largestOn([&](const AppWindowInfo &w) { return w.pid != r->selfPid && appNameMatches(w.appName, r->appHint); });
+        r->targetDisplayId = id;
+    }
+
+    // Search order: hinted app's display, (Lapis's own when the target names Lapis), displays
+    // without Lapis with the primary first, then Lapis's display last.
+    const auto add = [&](uint32_t id) {
+        if (!id)
+            return;
+        for (const DisplayInfo &d : r->displays)
+            if (d.displayId == id)
+                return;
+        for (const DisplayInfo &d : displays)
+            if (d.displayId == id)
+                r->displays.push_back(d);
+    };
+    add(r->targetDisplayId);
+    if (r->allowSelf)
+        add(r->lapisDisplayId);
+    for (const DisplayInfo &d : displays)
+        if (d.primary && d.displayId != r->lapisDisplayId)
+            add(d.displayId);
+    for (const DisplayInfo &d : displays)
+        if (d.displayId != r->lapisDisplayId)
+            add(d.displayId);
+    for (const DisplayInfo &d : displays)
+        add(d.displayId);
+    return true;
 }
 
-CuaExecutor::Located CuaExecutor::locate(const QString &targetDesc, bool refineCrop, const QString &label)
+CuaExecutor::Located CuaExecutor::locate(const QString &targetDesc, bool refineCrop, const QString &label, Route *routeOut)
 {
     Located loc;
-    DisplayInfo display;
-    if (!primaryDisplay(&display, &loc.detail))
+    Route rt;
+    if (!route(targetDesc, true, &rt, &loc.detail))
         return loc;
+    if (routeOut)
+        *routeOut = rt;
+    const DisplayInfo display = rt.displays.first();
 
-    // L1: Accessibility tree of the primary display.
+    // L1: Accessibility trees of every display in route order, never Lapis's own nodes unless
+    // the target names Lapis. With an app hint, a hit inside that app beats any other hit.
     if (m_hooks.inspectDisplay) {
-        const QVector<AxNode> nodes = m_hooks.inspectDisplay(display.displayId);
-        const int i = bestAxMatch(nodes, targetDesc);
-        if (i >= 0) {
+        const QString query = rt.appHint.isEmpty() ? targetDesc : stripAppHint(targetDesc, rt.appHint);
+        AxNode fallback;
+        bool haveFallback = false;
+        bool found = false;
+        for (const DisplayInfo &d : rt.displays) {
+            QVector<AxNode> nodes = m_hooks.inspectDisplay(d.displayId);
+            if (rt.selfPid > 0 && !rt.allowSelf)
+                nodes.erase(std::remove_if(nodes.begin(), nodes.end(), [&](const AxNode &n) { return n.pid == rt.selfPid; }),
+                            nodes.end());
+            const int i = bestIndex(nodes, [&](const AxNode &n) {
+                const int s = axMatchScore(n, query);
+                return s && !rt.appHint.isEmpty() && appNameMatches(n.appName, rt.appHint) ? s + 30 : s;
+            });
+            if (i < 0)
+                continue;
+            if (rt.appHint.isEmpty() || appNameMatches(nodes[i].appName, rt.appHint)) {
+                loc.node = nodes[i];
+                found = true;
+                break;
+            }
+            if (!haveFallback) {
+                fallback = nodes[i];
+                haveFallback = true;
+            }
+        }
+        if (!found && haveFallback) {
+            loc.node = fallback;
+            found = true;
+        }
+        if (found) {
             loc.ok = true;
             loc.tier = QStringLiteral("L1_AX");
-            loc.node = nodes[i];
-            loc.rect = nodes[i].globalRect;
+            loc.rect = loc.node.globalRect;
             loc.pt = loc.rect.center();
             loc.detail = QStringLiteral("%1 \"%2\" (%3)").arg(loc.node.role, loc.node.title.isEmpty() ? loc.node.value : loc.node.title,
                                                                loc.node.appName);
@@ -327,7 +531,8 @@ CuaExecutor::Located CuaExecutor::locate(const QString &targetDesc, bool refineC
         }
     }
 
-    // L3: local VLM pixel grounding on a capture that leaves our own overlay out.
+    // L3: local VLM pixel grounding on the first routed display (the hinted app's monitor, else
+    // one Lapis is not on), on a capture that leaves our own overlay out.
     if (!m_hooks.captureDisplayJpeg || !m_hooks.groundPixel) {
         loc.detail = QStringLiteral("No AX match and no grounder");
         return loc;
@@ -399,17 +604,20 @@ CuaExecResult CuaExecutor::clickTarget(const QString &targetDesc, bool doubleCli
 
 CuaExecResult CuaExecutor::typeIntoTarget(const QString &targetDesc, const QString &text)
 {
-    if (text.isEmpty())
+    const QString typed = normalizeTypedText(text);
+    if (typed.isEmpty())
         return {false, QStringLiteral("ERR"), {}, QStringLiteral("Nothing to type")};
     CuaExecResult r = clickTarget(targetDesc);
     if (!r.ok)
         return r;
     if (m_hooks.pause)
         m_hooks.pause(kPulseLeadMs);  // let the field take focus
-    const ActionResult t = m_hooks.typeText ? m_hooks.typeText(text) : ActionResult{false, QStringLiteral("No typist")};
+    const ActionResult t = m_hooks.typeText ? m_hooks.typeText(typed) : ActionResult{false, QStringLiteral("No typist")};
     if (!t.ok)
         return {false, QStringLiteral("ERR"), r.globalPt, QStringLiteral("Typing failed: %1").arg(t.detail)};
-    r.detail += QStringLiteral("; typed %1 chars").arg(text.size());
+    r.detail += QStringLiteral("; typed %1 chars").arg(typed.size());
+    if (typed.contains(QLatin1Char('\n')))
+        r.detail += QStringLiteral(" + Return");
     return r;
 }
 
@@ -420,14 +628,16 @@ CuaExecResult CuaExecutor::scrollTarget(const QString &targetDesc, int deltaY)
     const QString target = targetDesc.simplified();
     const QString label = target.isEmpty() ? QStringLiteral("Scrolling") : QStringLiteral("Scrolling %1").arg(target);
     Located loc;
+    Route rt;
     if (!target.isEmpty())
-        loc = locate(target, false, label);
+        loc = locate(target, false, label, &rt);
     if (!loc.ok) {
-        // No target, or it was not found: scroll the middle of the primary display.
-        DisplayInfo display;
+        // No target, or it was not found: scroll the middle of the routed display (never
+        // fullscreen Lapis when another monitor has the user's apps).
         QString err;
-        if (!primaryDisplay(&display, &err))
+        if (rt.displays.isEmpty() && !route(target, !target.isEmpty(), &rt, &err))
             return {false, QStringLiteral("ERR"), {}, err};
+        const DisplayInfo display = rt.displays.first();
         const QString why = loc.detail;
         loc = Located{};
         loc.ok = true;
