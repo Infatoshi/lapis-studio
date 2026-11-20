@@ -2,11 +2,16 @@
 #include "mac/cua_reticle.hpp"
 #include "mac/cua_executor.hpp"
 #include <QCoreApplication>
+#include <QDateTime>
+#include <QDir>
 #include <QElapsedTimer>
 #include <QEventLoop>
+#include <QFile>
 #include <QImage>
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QTemporaryDir>
 #include <QThread>
 #include <cmath>
 #include <cstdio>
@@ -908,8 +913,162 @@ void captureSmokeTest() {
     if (!image.isNull()) std::printf("Capture smoke: %d x %d JPEG (memory only)\n", image.width(), image.height());
 }
 }
+// Every non-empty JSONL line of the trace log, parsed.
+QVector<QJsonObject> traceLines(const QString &dir) {
+    QFile f(dir + "/traces.jsonl");
+    QVector<QJsonObject> out;
+    if (!f.open(QIODevice::ReadOnly)) return out;
+    for (const QByteArray &l : f.readAll().split('\n'))
+        if (!l.trimmed().isEmpty()) out << QJsonDocument::fromJson(l).object();
+    return out;
+}
+int traceFiles(const QString &dir) {
+    return int(QDir(dir + "/frames").entryList(QDir::Files).size()) + (QFile::exists(dir + "/traces.jsonl") ? 1 : 0);
+}
+bool intArray(const QJsonValue &v, const QVector<int> &want) {
+    const QJsonArray a = v.toArray();
+    if (a.size() != want.size()) return false;
+    for (int i = 0; i < want.size(); ++i)
+        if (a.at(i).toInt(-1) != want[i]) return false;
+    return true;
+}
+void traceTests() {
+    check(traceBlocked(true, {}) && traceBlocked(false, {"x", "Slack · INFINITY ops"}) && !traceBlocked(false, {"Chrome", ""}),
+        "trace: redacted or any 'infinity' field blocks");
+    check(close(toDisplay1000(QPointF(1440 + 960, 540), {9, "side", {1440, 0, 1920, 1080}, 1, false}), {500, 500}),
+        "trace: point_1000 is relative to the step's own display");
+    const QRectF button(400, 300, 120, 40);  // centre (460, 320) on the 1440x900 primary
+    // L1 click: before + after frames, one JSONL line with point_1000 and the AX bbox_1000.
+    {
+        QTemporaryDir tmp;
+        MockRig m;
+        m.nodes = {axNode(2, "AXButton", "Send", button)};
+        CuaHooks h = m.hooks();
+        h.traceDir = tmp.path();
+        CuaExecutor ex(h);
+        ex.setTraceContext({"send the message", "lapis", false});
+        const auto res = ex.clickTarget("Send");
+        const auto lines = traceLines(tmp.path());
+        check(res.ok && lines.size() == 1, "trace L1 click: one JSONL line");
+        check(m.calls.count("capture") == 2 && m.capturedWidth == 1280 && m.capturedExclude == QVector<uint32_t>({4242, 5151}),
+            "trace L1 click: two 1280-wide captures excluding reticle + HUD");
+        check(m.effects().indexOf("capture") < m.effects().indexOf("click") && m.effects().lastIndexOf("capture") > m.effects().indexOf("click"),
+            "trace L1 click: before frame precedes the click, after frame follows it");
+        if (lines.size() == 1) {
+            const QJsonObject o = lines[0];
+            check(o["action"] == "click" && o["tier"] == "L1_AX" && o["ok"].toBool() && o["app"] == "Example"
+                      && o["goal"] == "send the message" && o["target"] == "Send" && o["text"] == "",
+                "trace L1 click: action, tier, ok, app, goal");
+            check(o["display_w"].toDouble() == 1440 && o["display_h"].toDouble() == 900, "trace L1 click: display size in points");
+            check(intArray(o["point_1000"], {319, 356}), "trace L1 click: point_1000 normalized to the display");
+            check(intArray(o["bbox_1000"], {278, 333, 361, 378}), "trace L1 click: bbox_1000 from the AX rect");
+            const QString before = o["before_image"].toString(), after = o["after_image"].toString();
+            check(before.startsWith("frames/") && before.endsWith("_before.jpg") && after.endsWith("_after.jpg"),
+                "trace L1 click: frame names <ts_ms>_before/after.jpg");
+            QFile bf(tmp.path() + "/" + before), af(tmp.path() + "/" + after);
+            check(bf.open(QIODevice::ReadOnly) && bf.readAll() == m.jpeg && af.exists(), "trace L1 click: both frames on disk");
+            check(QDateTime::fromString(o["ts"].toString(), Qt::ISODateWithMs).isValid(), "trace L1 click: ISO 8601 ts");
+        }
+    }
+    // Type: the typed text is recorded; one before (pre-click) and one after frame.
+    {
+        QTemporaryDir tmp;
+        MockRig m;
+        m.nodes = {axNode(5, "AXTextField", "Search", button)};
+        CuaHooks h = m.hooks();
+        h.traceDir = tmp.path();
+        CuaExecutor ex(h);
+        const auto res = ex.typeIntoTarget("Search", "hello world");
+        const auto lines = traceLines(tmp.path());
+        check(res.ok && lines.size() == 1 && lines[0]["action"] == "type" && lines[0]["text"] == "hello world"
+                  && intArray(lines[0]["bbox_1000"], {278, 333, 361, 378}),
+            "trace type: text and bbox recorded");
+        check(m.calls.count("capture") == 2 && traceFiles(tmp.path()) == 3, "trace type: before + after + log");
+    }
+    // L3: the grounding capture is the before frame (no second capture), no bbox.
+    {
+        QTemporaryDir tmp;
+        MockRig m;
+        m.ground.ok = true; m.ground.hasPoint1000 = true; m.ground.point1000 = {250, 500};
+        CuaHooks h = m.hooks();
+        h.traceDir = tmp.path();
+        CuaExecutor ex(h);
+        const auto res = ex.clickTarget("the gear icon");
+        const auto lines = traceLines(tmp.path());
+        check(res.ok && m.calls.count("capture") == 2, "trace L3: reuses the grounding capture as the before frame");
+        check(lines.size() == 1 && lines[0]["tier"] == "L3_VLM" && intArray(lines[0]["point_1000"], {250, 500})
+                  && lines[0]["bbox_1000"].isNull(),
+            "trace L3: point_1000 kept, bbox_1000 null");
+    }
+    // Scroll records its delta.
+    {
+        QTemporaryDir tmp;
+        MockRig m;
+        m.nodes = {axNode(2, "AXScrollArea", "Feed", button)};
+        CuaHooks h = m.hooks();
+        h.traceDir = tmp.path();
+        CuaExecutor ex(h);
+        ex.scrollTarget("Feed", -5);
+        const auto lines = traceLines(tmp.path());
+        check(lines.size() == 1 && lines[0]["action"] == "scroll" && lines[0]["delta_y"].toInt() == -5, "trace scroll: delta_y recorded");
+    }
+    // Privacy: infinity in the target, the app, the goal, or a redacted project writes nothing.
+    {
+        struct Case { const char *name; QString target; QString app; TraceContext ctx; };
+        const QVector<Case> cases{
+            {"trace skip: 'infinity' in targetDesc", "Infinity", "Example", {"open it", "p", false}},
+            {"trace skip: 'infinity' in appName", "Send", "Infinity Slack", {"send", "p", false}},
+            {"trace skip: redacted project", "Send", "Example", {"send", "p", true}},
+            {"trace skip: 'infinity' in goal", "Send", "Example", {"reply in INFINITY", "p", false}},
+        };
+        for (const Case &c : cases) {
+            QTemporaryDir tmp;
+            MockRig m;
+            AxNode n = axNode(2, "AXButton", c.target, button);
+            n.appName = c.app;
+            m.nodes = {n};
+            CuaHooks h = m.hooks();
+            h.traceDir = tmp.path();
+            CuaExecutor ex(h);
+            ex.setTraceContext(c.ctx);
+            const bool ok = ex.clickTarget(c.target).ok && ex.typeIntoTarget(c.target, "hi").ok;
+            check(ok && traceFiles(tmp.path()) == 0 && !QDir(tmp.path() + "/frames").exists() && !m.calls.contains("capture"),
+                c.name);
+        }
+    }
+    // Off when traceDir is empty (every test rig and LAPIS_CUA_TRACE=0): no extra capture.
+    {
+        MockRig m;
+        m.nodes = {axNode(2, "AXButton", "Send", button)};
+        CuaExecutor ex(m.hooks());
+        check(ex.clickTarget("Send").ok && !m.calls.contains("capture"), "trace off: no traceDir, no capture");
+        qputenv("LAPIS_CUA_TRACE", "0");
+        check(defaultTraceDir().isEmpty(), "trace off: LAPIS_CUA_TRACE=0");
+        qunsetenv("LAPIS_CUA_TRACE");
+        check(defaultTraceDir().endsWith("/.lapis-next/cua_traces"), "trace on: default dir ~/.lapis-next/cua_traces");
+    }
+    // Disk cap: the newest traceMaxSteps steps survive, older frames are deleted.
+    {
+        QTemporaryDir tmp;
+        MockRig m;
+        m.nodes = {axNode(2, "AXButton", "Send", button)};
+        CuaHooks h = m.hooks();
+        h.traceDir = tmp.path();
+        h.traceMaxSteps = 2;
+        CuaExecutor ex(h);
+        for (int i = 0; i < 5; ++i) ex.clickTarget("Send");
+        const auto lines = traceLines(tmp.path());
+        bool framesMatch = lines.size() == 2;
+        for (const QJsonObject &o : lines)
+            framesMatch = framesMatch && QFile::exists(tmp.path() + "/" + o["before_image"].toString())
+                          && QFile::exists(tmp.path() + "/" + o["after_image"].toString());
+        check(framesMatch && QDir(tmp.path() + "/frames").entryList(QDir::Files).size() == 4,
+            "trace cap: keeps the newest 2 steps (4 frames), deletes the rest");
+    }
+}
 int main(int argc, char **argv) {
     QCoreApplication app(argc, argv);
+    traceTests();
     geometryTests(); leaseTests(); formattingTests(); cancellationTests(); liveTests();
     reticleGeometryTests(); reticleOffscreenTests(); hudTests(); executorTests(); multiMonitorTests();
     spaceSwitchTests();

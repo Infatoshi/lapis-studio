@@ -5137,9 +5137,11 @@ void studioControlTests()
         check(cuaFollowupPrompt({missed}).contains("(ERR, ok=0, detail=No AX match)"), "cua loop: a failure reads ok=0");
 
         Backend b(Backend::Mode::Mock);
-        check(b.runModelAnswer("[[ACTION:cua_click:Send button]]").contains("Clicking Send button") && b.cuaLoopDepth() == 0
-                  && b.cuaFollowups().isEmpty(),
-              "cua loop: a clean click batch earns no follow-up");
+        check(b.runModelAnswer("[[ACTION:cua_click:Send button]]").contains("Clicking Send button") && b.cuaLoopDepth() == 1
+                  && b.cuaFollowups().size() == 1
+                  && b.cuaFollowups()[0].startsWith("[CUA observation after cua_click:Send button (MOCK, ok=1"),
+              "cua loop: a clean click batch earns one follow-up (the model sees the result)", b.cuaFollowups().join(" | "));
+        b.clearAnswers();
         b.runModelAnswer("[[ACTION:cua_observe:Discord]]");
         check(b.cuaLoopDepth() == 1 && b.cuaFollowups().size() == 1
                   && b.cuaFollowups()[0].startsWith("[CUA observation after cua_observe:Discord (MOCK, ok=1")

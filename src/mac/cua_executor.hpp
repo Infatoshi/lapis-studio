@@ -81,8 +81,27 @@ struct CuaHooks {
     // waiting for the app to come to the front; unset hideSelf means Lapis is never hidden.
     std::function<int()> frontmostPid;  // 0 when unknown
     std::function<bool()> hideSelf;     // hides Lapis so its fullscreen Space slides away
+    // Passive trajectory logging (training traces for the local grounder). Empty traceDir means
+    // off: test rigs leave it empty, defaultCuaHooks sets defaultTraceDir() (empty when
+    // LAPIS_CUA_TRACE=0). The log keeps the newest traceMaxSteps steps.
+    QString traceDir = {};
+    int traceMaxSteps = 1500;
 };
 CuaHooks defaultCuaHooks();
+// ~/.lapis-next/cua_traces, or empty when LAPIS_CUA_TRACE=0 (or off/false/no).
+QString defaultTraceDir();
+
+// Who asked for a step: the user's prompt and whether its project is redacted (infinity).
+struct TraceContext {
+    QString goal;
+    QString projectKey;
+    bool redacted = false;
+};
+// True when a step must never be traced: redacted, or "infinity" anywhere in the fields given.
+bool traceBlocked(bool redacted, const QStringList &fields);
+// A Quartz global point / rect as 0..1000 fractions of the display (clamped to the display).
+QPointF toDisplay1000(QPointF globalPt, const DisplayInfo &display);
+QRectF toDisplay1000(const QRectF &globalRect, const DisplayInfo &display);
 
 // Runs fn on the Qt main thread: directly when already there, else via
 // QMetaObject::invokeMethod(qApp, fn, Qt::BlockingQueuedConnection). No-op without a qApp.
@@ -145,9 +164,19 @@ public:
     // L1 hits press through AXPress instead of a visible synthetic click (off by default, so
     // Chrome and native apps behave the same and the click shows on screen).
     void setPreferAxPress(bool on) { m_preferAxPress = on; }
+    // Goal and privacy for the trace log; a redacted context never writes a trace.
+    void setTraceContext(TraceContext ctx) { m_trace = std::move(ctx); }
     const CuaHooks &hooks() const { return m_hooks; }
 
 private:
+    // One public call's trace material, all in memory until the privacy check passes.
+    struct StepTrace {
+        QByteArray before;  // JPEG captured before the action (the L3 capture when there was one)
+        uint32_t beforeDisplayId = 0;
+        QRectF rect;        // the L1 AX rect, when the target came from Accessibility
+        QString app;        // the matched node's app, else the route's hint
+        QString target, text;  // what the public call was asked, for the privacy check
+    };
     struct Located {
         bool ok = false;
         QString tier;
@@ -181,11 +210,26 @@ private:
     // slide finish. False on timeout.
     bool waitFrontmost(int pid, bool launched, int selfPid);
     CuaExecResult click(const QString &targetDesc, bool doubleClick, bool refineCrop, bool finish, Route *routeOut);
+    // The public calls' bodies; the wrappers reset m_step and trace the result.
+    CuaExecResult typeImpl(const QString &targetDesc, const QString &text, bool clearFirst, Route *rt);
+    CuaExecResult scrollImpl(const QString &targetDesc, int deltaY, Route *rt);
+    CuaExecResult observeImpl(const QString &appHint, Route *rt);
     void hud(const QString &status, HudTone tone) const;
     void hudFail(const QString &targetDesc, const QString &why) const;
+    bool tracing() const { return !m_hooks.traceDir.isEmpty() && m_hooks.captureDisplayJpeg; }
+    // The display a step happened on: the one holding pt, else the route's first.
+    DisplayInfo traceDisplay(const Route &rt, QPointF pt, bool hasPt) const;
+    // Grabs the pre-action frame once (the L3 capture already counts), excluding our overlays.
+    void traceBefore(const Route &rt, QPointF pt, bool hasPt);
+    // After the action (and its settle): privacy check, after frame, frames + one JSONL line.
+    void traceStep(const QString &action, const QString &target, const QString &text, const Route &rt,
+                   const CuaExecResult &r, int deltaY = 0);
+    QByteArray captureFrame(uint32_t displayId) const;
 
     CuaHooks m_hooks;
     bool m_preferAxPress = false;
+    TraceContext m_trace;
+    StepTrace m_step;
 };
 
 }  // namespace studio::cua

@@ -3,13 +3,19 @@
 
 #include <QBuffer>
 #include <QCoreApplication>
+#include <QDateTime>
+#include <QDir>
+#include <QFile>
 #include <QImageReader>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QMetaObject>
 #include <QRegularExpression>
+#include <QSaveFile>
+#include <QSet>
 #include <QThread>
+#include <QTimeZone>
 #include <curl/curl.h>
 #include <unistd.h>
 #include <algorithm>
@@ -375,7 +381,197 @@ CuaHooks defaultCuaHooks()
         return ok;
     };
     // lapisDisplayId stays unset: the executor derives it from the listAppWindows it already has.
+    h.traceDir = defaultTraceDir();
     return h;
+}
+
+QString defaultTraceDir()
+{
+    const QString env = qEnvironmentVariable("LAPIS_CUA_TRACE").trimmed().toLower();
+    if (env == QLatin1String("0") || env == QLatin1String("off") || env == QLatin1String("false") || env == QLatin1String("no"))
+        return {};
+    return QDir::homePath() + QStringLiteral("/.lapis-next/cua_traces");
+}
+
+bool traceBlocked(bool redacted, const QStringList &fields)
+{
+    if (redacted)
+        return true;
+    return std::any_of(fields.cbegin(), fields.cend(),
+                       [](const QString &f) { return f.contains(QLatin1String("infinity"), Qt::CaseInsensitive); });
+}
+
+QPointF toDisplay1000(QPointF globalPt, const DisplayInfo &display)
+{
+    const QRectF g = display.globalPoints;
+    if (g.width() <= 0 || g.height() <= 0)
+        return {};
+    return {std::clamp((globalPt.x() - g.x()) / g.width() * 1000.0, 0.0, 1000.0),
+            std::clamp((globalPt.y() - g.y()) / g.height() * 1000.0, 0.0, 1000.0)};
+}
+
+QRectF toDisplay1000(const QRectF &globalRect, const DisplayInfo &display)
+{
+    const QPointF a = toDisplay1000(globalRect.topLeft(), display), b = toDisplay1000(globalRect.bottomRight(), display);
+    return QRectF(a, b).normalized();
+}
+
+namespace {
+
+constexpr int kTraceFrameWidth = 1280;  // the L3 capture width, so a reused L3 frame matches
+constexpr const char *kTraceLog = "traces.jsonl";
+
+QString frameName(const QJsonValue &v)
+{
+    const QString s = v.toString();
+    return s.isEmpty() ? QString() : s.section(QLatin1Char('/'), -1);
+}
+
+// Keeps the newest maxSteps lines (with 10% slack, so it rewrites rarely) and deletes every
+// frame no kept line names, orphans from an interrupted write included.
+void pruneTraces(const QString &dir, int maxSteps)
+{
+    if (maxSteps <= 0)
+        return;
+    QFile f(dir + QLatin1Char('/') + QLatin1String(kTraceLog));
+    if (!f.open(QIODevice::ReadOnly))
+        return;
+    QList<QByteArray> lines = f.readAll().split('\n');
+    f.close();
+    lines.removeIf([](const QByteArray &l) { return l.trimmed().isEmpty(); });
+    if (lines.size() <= maxSteps + maxSteps / 10)
+        return;
+    lines = lines.mid(lines.size() - maxSteps);
+    QSaveFile out(f.fileName());
+    if (!out.open(QIODevice::WriteOnly))
+        return;
+    QSet<QString> keep;
+    for (const QByteArray &l : lines) {
+        out.write(l);
+        out.write("\n");
+        const QJsonObject o = QJsonDocument::fromJson(l).object();
+        keep << frameName(o.value(QStringLiteral("before_image"))) << frameName(o.value(QStringLiteral("after_image")));
+    }
+    if (!out.commit())
+        return;
+    QDir frames(dir + QStringLiteral("/frames"));
+    for (const QString &name : frames.entryList(QDir::Files))
+        if (!keep.contains(name))
+            frames.remove(name);
+}
+
+}  // namespace
+
+QByteArray CuaExecutor::captureFrame(uint32_t displayId) const
+{
+    if (!m_hooks.captureDisplayJpeg || !displayId)
+        return {};
+    QVector<uint32_t> exclude;  // the reticle and HUD bar never appear in a training frame
+    for (const uint32_t id : {m_hooks.reticleWindowId ? m_hooks.reticleWindowId() : 0u,
+                              m_hooks.hudWindowId ? m_hooks.hudWindowId() : 0u})
+        if (id)
+            exclude.push_back(id);
+    QString err;
+    return m_hooks.captureDisplayJpeg(displayId, kTraceFrameWidth, exclude, &err);
+}
+
+DisplayInfo CuaExecutor::traceDisplay(const Route &rt, QPointF pt, bool hasPt) const
+{
+    if (hasPt)
+        for (const DisplayInfo &d : rt.displays)
+            if (d.globalPoints.adjusted(0, 0, 0.001, 0.001).contains(pt))
+                return d;
+    return rt.displays.isEmpty() ? DisplayInfo{} : rt.displays.first();
+}
+
+void CuaExecutor::traceBefore(const Route &rt, QPointF pt, bool hasPt)
+{
+    if (!tracing() || !m_step.before.isEmpty() || rt.displays.isEmpty())
+        return;
+    // Privacy first: a redacted step never even captures (the target is known by now).
+    if (traceBlocked(m_trace.redacted, {m_trace.goal, m_trace.projectKey, m_step.target, m_step.text, m_step.app, rt.appHint}))
+        return;
+    const DisplayInfo d = traceDisplay(rt, pt, hasPt);
+    m_step.before = captureFrame(d.displayId);
+    m_step.beforeDisplayId = d.displayId;
+}
+
+void CuaExecutor::traceStep(const QString &action, const QString &target, const QString &text, const Route &rt,
+                            const CuaExecResult &r, int deltaY)
+{
+    if (!tracing() || rt.displays.isEmpty())
+        return;
+    const QString app = m_step.app.isEmpty() ? rt.appHint : m_step.app;
+    if (traceBlocked(m_trace.redacted, {m_trace.goal, m_trace.projectKey, target, text, app, rt.appHint, r.detail,
+                                        r.observation}))
+        return;
+    const bool observe = action == QLatin1String("observe");
+    const bool hasPt = !observe && (r.ok || !r.globalPt.isNull());
+    const DisplayInfo d = traceDisplay(rt, r.globalPt, hasPt);
+    if (m_step.before.isEmpty() || m_step.beforeDisplayId != d.displayId) {
+        // No action ran (a miss, or observe): the screen now is the screen before.
+        m_step.before = captureFrame(d.displayId);
+        m_step.beforeDisplayId = d.displayId;
+    }
+    if (m_step.before.isEmpty())
+        return;  // no frame (capture denied): nothing worth training on
+    // The action path already settled kObserveSettleMs inside observeAfterAction.
+    const QByteArray after = observe ? QByteArray() : captureFrame(d.displayId);
+
+    const QString dir = m_hooks.traceDir;
+    if (!QDir().mkpath(dir + QStringLiteral("/frames")))
+        return;
+    qint64 ts = QDateTime::currentMSecsSinceEpoch();
+    while (QFile::exists(QStringLiteral("%1/frames/%2_before.jpg").arg(dir).arg(ts)))
+        ++ts;  // two steps in one millisecond keep separate frames
+    auto writeFrame = [&](const QByteArray &jpeg, const char *suffix) -> QString {
+        if (jpeg.isEmpty())
+            return {};
+        const QString rel = QStringLiteral("frames/%1_%2.jpg").arg(ts).arg(QLatin1String(suffix));
+        QFile f(dir + QLatin1Char('/') + rel);
+        if (!f.open(QIODevice::WriteOnly) || f.write(jpeg) != jpeg.size())
+            return {};
+        return rel;
+    };
+    const QString beforeRel = writeFrame(m_step.before, "before");
+    if (beforeRel.isEmpty())
+        return;
+    const QString afterRel = writeFrame(after, "after");
+
+    QJsonObject o;
+    o[QStringLiteral("ts")] = QDateTime::fromMSecsSinceEpoch(ts, QTimeZone::UTC).toString(Qt::ISODateWithMs);
+    o[QStringLiteral("goal")] = m_trace.goal;
+    o[QStringLiteral("action")] = action;
+    o[QStringLiteral("target")] = target;
+    o[QStringLiteral("text")] = text;
+    if (deltaY)
+        o[QStringLiteral("delta_y")] = deltaY;
+    o[QStringLiteral("tier")] = r.ok ? r.tier : QStringLiteral("ERR");
+    o[QStringLiteral("ok")] = r.ok;
+    o[QStringLiteral("app")] = app;
+    o[QStringLiteral("display_w")] = d.globalPoints.width();
+    o[QStringLiteral("display_h")] = d.globalPoints.height();
+    if (hasPt) {
+        const QPointF p = toDisplay1000(r.globalPt, d);
+        o[QStringLiteral("point_1000")] = QJsonArray{qRound(p.x()), qRound(p.y())};
+    } else {
+        o[QStringLiteral("point_1000")] = QJsonValue::Null;
+    }
+    if (r.tier == QLatin1String("L1_AX") && m_step.rect.isValid() && !m_step.rect.isEmpty()) {
+        const QRectF b = toDisplay1000(m_step.rect, d);
+        o[QStringLiteral("bbox_1000")] = QJsonArray{qRound(b.left()), qRound(b.top()), qRound(b.right()), qRound(b.bottom())};
+    } else {
+        o[QStringLiteral("bbox_1000")] = QJsonValue::Null;
+    }
+    o[QStringLiteral("before_image")] = beforeRel;
+    o[QStringLiteral("after_image")] = afterRel;
+    o[QStringLiteral("detail")] = r.detail;
+    QFile log(dir + QLatin1Char('/') + QLatin1String(kTraceLog));
+    if (!log.open(QIODevice::WriteOnly | QIODevice::Append))
+        return;
+    log.write(QJsonDocument(o).toJson(QJsonDocument::Compact) + '\n');
+    log.close();
+    pruneTraces(dir, m_hooks.traceMaxSteps);
 }
 
 QString extractAppHint(const QString &targetDesc)
@@ -634,6 +830,8 @@ CuaExecutor::Located CuaExecutor::locate(const QString &targetDesc, bool refineC
             loc.pt = loc.rect.center();
             loc.detail = QStringLiteral("%1 \"%2\" (%3)").arg(loc.node.role, loc.node.title.isEmpty() ? loc.node.value : loc.node.title,
                                                                loc.node.appName);
+            m_step.rect = loc.rect;
+            m_step.app = loc.node.appName;
             if (m_hooks.reticleHighlight)
                 m_hooks.reticleHighlight(loc.rect, label);
             return loc;
@@ -657,6 +855,10 @@ CuaExecutor::Located CuaExecutor::locate(const QString &targetDesc, bool refineC
     if (jpeg.isEmpty()) {
         loc.detail = QStringLiteral("Capture failed: %1").arg(err.isEmpty() ? QStringLiteral("empty image") : err);
         return loc;
+    }
+    if (tracing()) {
+        m_step.before = jpeg;  // the trace reuses this frame instead of capturing again
+        m_step.beforeDisplayId = display.displayId;
     }
     const GroundResult g = m_hooks.groundPixel(jpeg, targetDesc, refineCrop);
     if (!g.ok) {
@@ -687,7 +889,12 @@ CuaExecutor::Located CuaExecutor::locate(const QString &targetDesc, bool refineC
 
 CuaExecResult CuaExecutor::clickTarget(const QString &targetDesc, bool doubleClick, bool refineCrop)
 {
-    return click(targetDesc, doubleClick, refineCrop, true, nullptr);
+    m_step = {};
+    m_step.target = targetDesc;
+    Route rt;
+    const CuaExecResult r = click(targetDesc, doubleClick, refineCrop, true, &rt);
+    traceStep(QStringLiteral("click"), targetDesc.simplified(), {}, rt, r);
+    return r;
 }
 
 CuaExecResult CuaExecutor::click(const QString &targetDesc, bool doubleClick, bool refineCrop, bool finish, Route *routeOut)
@@ -713,6 +920,7 @@ CuaExecResult CuaExecutor::click(const QString &targetDesc, bool doubleClick, bo
         m_hooks.reticlePulse(loc.pt, label);
     if (m_hooks.pause)
         m_hooks.pause(kPulseLeadMs);
+    traceBefore(rt, loc.pt, true);  // the last frame before the input lands
     ActionResult act{false, QStringLiteral("No actuator")};
     if (loc.tier == QLatin1String("L1_AX") && m_preferAxPress && m_hooks.axPress && !doubleClick) {
         const QString key = loc.node.title.isEmpty() ? loc.node.role : loc.node.title;
@@ -755,11 +963,42 @@ QString CuaExecutor::observeAfterAction(const Route &rt)
 
 CuaExecResult CuaExecutor::observeApp(const QString &appHint)
 {
+    m_step = {};
+    m_step.target = appHint;
+    Route rt;
+    const CuaExecResult r = observeImpl(appHint, &rt);
+    traceStep(QStringLiteral("observe"), appHint.simplified(), {}, rt, r);
+    return r;
+}
+
+CuaExecResult CuaExecutor::typeIntoTarget(const QString &targetDesc, const QString &text, bool clearFirst)
+{
+    m_step = {};
+    m_step.target = targetDesc;
+    m_step.text = text;
+    Route rt;
+    const CuaExecResult r = typeImpl(targetDesc, text, clearFirst, &rt);
+    traceStep(QStringLiteral("type"), targetDesc.simplified(), normalizeTypedText(text), rt, r);
+    return r;
+}
+
+CuaExecResult CuaExecutor::scrollTarget(const QString &targetDesc, int deltaY)
+{
+    m_step = {};
+    m_step.target = targetDesc;
+    Route rt;
+    const CuaExecResult r = scrollImpl(targetDesc, deltaY, &rt);
+    traceStep(QStringLiteral("scroll"), targetDesc.simplified(), {}, rt, r, deltaY);
+    return r;
+}
+
+CuaExecResult CuaExecutor::observeImpl(const QString &appHint, Route *rtOut)
+{
     const QString raw = appHint.simplified();
     QString hint = extractAppHint(raw);
     if (hint.isEmpty())
         hint = raw;  // an app the hint table does not list: activate it by name anyway
-    Route rt;
+    Route &rt = *rtOut;
     QString err;
     if (!route(raw, !hint.isEmpty(), &rt, &err, hint)) {
         hudFail(raw, QStringLiteral("Observe failed · %1").arg(err));
@@ -783,12 +1022,12 @@ CuaExecResult CuaExecutor::observeApp(const QString &appHint)
     return r;
 }
 
-CuaExecResult CuaExecutor::typeIntoTarget(const QString &targetDesc, const QString &text, bool clearFirst)
+CuaExecResult CuaExecutor::typeImpl(const QString &targetDesc, const QString &text, bool clearFirst, Route *rtOut)
 {
     const QString typed = normalizeTypedText(text);
     if (typed.isEmpty())
         return {false, QStringLiteral("ERR"), {}, QStringLiteral("Nothing to type")};
-    Route rt;
+    Route &rt = *rtOut;
     CuaExecResult r = click(targetDesc, false, false, false, &rt);
     if (!r.ok)
         return r;
@@ -816,14 +1055,14 @@ CuaExecResult CuaExecutor::typeIntoTarget(const QString &targetDesc, const QStri
     return r;
 }
 
-CuaExecResult CuaExecutor::scrollTarget(const QString &targetDesc, int deltaY)
+CuaExecResult CuaExecutor::scrollImpl(const QString &targetDesc, int deltaY, Route *rtOut)
 {
     if (deltaY == 0)
         return {false, QStringLiteral("ERR"), {}, QStringLiteral("Zero scroll")};
     const QString target = targetDesc.simplified();
     const QString label = target.isEmpty() ? QStringLiteral("Scrolling") : QStringLiteral("Scrolling %1").arg(target);
     Located loc;
-    Route rt;
+    Route &rt = *rtOut;
     if (!target.isEmpty())
         loc = locate(target, false, label, QStringLiteral("Scrolling"), &rt);
     if (!loc.ok) {
@@ -850,6 +1089,7 @@ CuaExecResult CuaExecutor::scrollTarget(const QString &targetDesc, int deltaY)
     }
     if (m_hooks.pause)
         m_hooks.pause(kGlideSettleMs);
+    traceBefore(rt, loc.pt, true);
     const ActionResult s = m_hooks.scrollAt ? m_hooks.scrollAt(loc.pt, deltaY) : ActionResult{false, QStringLiteral("No scroller")};
     if (!s.ok) {
         hudFail(target, QStringLiteral("Scroll failed · %1").arg(s.detail));

@@ -705,6 +705,7 @@ private:
         QString projectKey;
         int outstanding = 0;
         QVector<CuaStepResult> steps;
+        QString goal;  // the user's own prompt (follow-ups keep it), for the CUA trace log
     };
     CuaBatch m_cuaBatch;
     quint64 m_cuaBatchId = 0;  // bumped per batch and per reset: a stale action's result is dropped
@@ -712,6 +713,8 @@ private:
     QStringList m_cuaFollowups;
     bool m_cuaFollowupAsk = false;  // ask() / startConversation are carrying a follow-up, not the user
     QString m_cuaFollowupNote;      // the compact user turn a follow-up leaves in the history
+    QString m_cuaFollowupGoal;      // the user prompt a follow-up continues (trace log)
+    QString m_cuaAnswerGoal;        // the goal of the stream runAnswerTags is handling
     QString m_cuaAnswerStream;      // which stream runAnswerTags is handling ("" = the quick ask)
     int m_quickArtifact = -1;       // the user ask's artifact, reused by its follow-ups
     QString m_quickNote;            // the user turn finishQuick records (follow-ups: compact header)
@@ -873,6 +876,7 @@ private:
         QString answer;
         QString projectKey;
         QString note;  // the user turn recorded in history (a CUA follow-up's compact header)
+        QString goal = {};  // the user's own prompt, kept across CUA follow-ups
     };
     QHash<QString, StreamAsk> m_streamAsks;              // in-flight askStream ids
     QHash<QString, QVector<ChatTurn>> m_streamHistory;    // Tier 2 per conversation stream

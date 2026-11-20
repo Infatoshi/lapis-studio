@@ -3052,8 +3052,10 @@ void Backend::onRouterFinished(const QString &streamId, const QString &error)
         const QString keep = m_commandProject;
         m_commandProject = done.projectKey;
         m_cuaAnswerStream = streamId;
+        m_cuaAnswerGoal = done.goal;
         runAnswerTags(&answer);  // the card strips the tag itself; the action runs here once
         m_cuaAnswerStream.clear();
+        m_cuaAnswerGoal.clear();
         m_commandProject = keep;
         const QString userTurn = done.note.isEmpty() ? done.question : done.note;
         QVector<ChatTurn> &h = m_streamHistory[streamId];
@@ -3114,7 +3116,8 @@ void Backend::startConversation(const QString &streamId, const QString &projectK
     }
     // Tier 2 is the shared ring: every Studio exchange, whichever model or card answered it.
     const TieredPrompt p = tieredPrompt(projectKey, slice, q, m_sharedHistory);
-    m_streamAsks.insert(streamId, StreamAsk{q, QString(), projectKey, followup ? m_cuaFollowupNote : QString()});
+    m_streamAsks.insert(streamId, StreamAsk{q, QString(), projectKey, followup ? m_cuaFollowupNote : QString(),
+                                            followup ? m_cuaFollowupGoal : q});
     LlmStreamRequest req;
     req.streamId = streamId;
     req.endpoint = endpoint;
@@ -5217,9 +5220,18 @@ QString Backend::startCuaAction(const QString &action, const CuaCommand &c)
     ++m_cuaPending;
     if (m_cuaHud)
         studio::cua::showCuaHud(verb + QStringLiteral("\u2026"), studio::cua::HudTone::Working);
+    // The trace log (training data) learns who asked and whether that project is redacted; the
+    // executor skips the step entirely for redacted / infinity work.
+    studio::cua::TraceContext trace;
+    trace.projectKey = inBatch ? m_cuaBatch.projectKey : m_commandProject;
+    trace.goal = inBatch ? m_cuaBatch.goal : m_quickQuestion;
+    if (const Project *p = find(trace.projectKey))
+        trace.redacted = std::any_of(p->sessions.cbegin(), p->sessions.cend(), [](const SessionInfo &s) { return s.redacted; })
+                         || studio::cua::traceBlocked(false, {p->name, p->dir});
     QPointer<Backend> self(this);
-    m_cuaPool->start([self, action, c, logLine, inBatch, batchId] {
+    m_cuaPool->start([self, action, c, logLine, inBatch, batchId, trace] {
         studio::cua::CuaExecutor ex;
+        ex.setTraceContext(trace);
         const studio::cua::CuaExecResult r = c.kind == QLatin1String("type")      ? ex.typeIntoTarget(c.target, c.text)
                                              : c.kind == QLatin1String("scroll")  ? ex.scrollTarget(c.target, c.deltaY)
                                              : c.kind == QLatin1String("observe") ? ex.observeApp(c.target)
@@ -5287,6 +5299,7 @@ void Backend::runAnswerTags(QString *answer)
     m_cuaBatch.open = true;
     m_cuaBatch.streamId = m_cuaAnswerStream;
     m_cuaBatch.projectKey = m_commandProject;
+    m_cuaBatch.goal = m_cuaAnswerStream.isEmpty() ? m_quickQuestion : m_cuaAnswerGoal;
     ++m_cuaBatchId;
     const QStringList replies = runStudioActions(parsed.actions);
     m_cuaBatch.open = false;
@@ -5341,14 +5354,15 @@ void Backend::maybeFinishCuaBatch()
                                       s.ok, s.detail, QStringLiteral("-"))
                      .section(QLatin1Char('\n'), 0, 0);
     const QString note = heads.join(QLatin1Char(' '));  // history keeps the headers, never the AX dump
-    const QString streamId = m_cuaBatch.streamId, project = m_cuaBatch.projectKey;
+    const QString streamId = m_cuaBatch.streamId, project = m_cuaBatch.projectKey, goal = m_cuaBatch.goal;
     const quint64 id = m_cuaBatchId;
     // Next event-loop turn: the answer that started this batch has been recorded by then.
-    QTimer::singleShot(0, this, [this, id, streamId, project, prompt, note] {
+    QTimer::singleShot(0, this, [this, id, streamId, project, prompt, note, goal] {
         if (id != m_cuaBatchId)
             return;  // reset (new question, cancel) in between
         m_cuaFollowupAsk = true;
         m_cuaFollowupNote = note;
+        m_cuaFollowupGoal = goal;
         if (streamId.isEmpty()) {
             m_quickNote = note;
             ask(project, m_quickArtifact, prompt);
@@ -5357,6 +5371,7 @@ void Backend::maybeFinishCuaBatch()
         }
         m_cuaFollowupAsk = false;
         m_cuaFollowupNote.clear();
+        m_cuaFollowupGoal.clear();
     });
 }
 
