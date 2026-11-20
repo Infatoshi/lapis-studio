@@ -14,4 +14,15 @@ Window {
         backend: win.backend
         demoMode: win.demoMode
     }
+
+    // Hide the OS mouse cursor while fullscreen in controller mode so only the controller cursor is visible.
+    Item {
+        anchors.fill: parent
+        z: 999999
+        enabled: win.visibility === Window.FullScreen && win.backend !== null && win.backend.navMode === "controller"
+        HoverHandler {
+            enabled: parent.enabled
+            cursorShape: Qt.BlankCursor
+        }
+    }
 }

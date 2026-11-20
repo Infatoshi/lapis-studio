@@ -64,6 +64,8 @@ struct Gamepad::Platform {
     void start()
     {
         ++g_platformCalls;
+        if (@available(macOS 11.3, *))
+            GCController.shouldMonitorBackgroundEvents = YES;  // keep controller active even if another app takes focus
         NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
         connectObserver = keep([nc addObserverForName:GCControllerDidConnectNotification object:nil
                                            queue:[NSOperationQueue mainQueue]
