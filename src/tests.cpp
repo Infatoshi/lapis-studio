@@ -5125,8 +5125,9 @@ void studioControlTests()
         const CuaStepResult seen{"cua_observe", "Discord", true, "L1_OBS", "12 AX nodes", "{\"title\":\"John Gout\"}"};
         const CuaStepResult clicked{"cua_click", "Send", true, "L1_AX", "AXButton \"Send\"", "{}"};
         const CuaStepResult missed{"cua_click", "Ghost", false, "ERR", "No AX match", "{}"};
-        check(cuaShouldContinue({seen}, 0) && cuaShouldContinue({clicked, missed}, 3) && !cuaShouldContinue({clicked}, 0),
-              "cua loop: observe or a failure continues; a clean action batch stops");
+        check(cuaShouldContinue({seen}, 0) && cuaShouldContinue({clicked, missed}, 3) && cuaShouldContinue({clicked}, 0)
+                  && !cuaShouldContinue({}, 0),
+              "cua loop: any non-empty cua batch continues until the model stops emitting tags or hits depth cap");
         check(!cuaShouldContinue({seen}, kMaxCuaLoopDepth) && !cuaShouldContinue({missed}, kMaxCuaLoopDepth + 3) && kMaxCuaLoopDepth == 4,
               "cua loop: never past depth 4");
         const QString p = cuaFollowupPrompt({seen});

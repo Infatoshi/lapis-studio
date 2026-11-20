@@ -82,7 +82,12 @@ QVector<Entry> scan(int pid, int maxNodes, int maxDepth, const Budget &budget, b
     }
     QVector<Entry> result;
     std::deque<std::pair<Element, int>> pending;
-    pending.push_back({own(AXUIElementCreateApplication(pid)), 0});
+    Element app = own(AXUIElementCreateApplication(pid));
+    if (app) {
+        // Unlock full DOM accessibility trees in Electron/Chromium apps (Discord, Slack, VS Code).
+        AXUIElementSetAttributeValue(app.get(), CFSTR("AXManualAccessibility"), kCFBooleanTrue);
+        pending.push_back({std::move(app), 0});
+    }
     CF<CFMutableSetRef> visited(CFSetCreateMutable(nullptr, 0, &kCFTypeSetCallBacks));
     QString appName;
     while (!pending.empty() && result.size() < maxNodes && budget.left() > 0 && !cancelFlag.load()) {

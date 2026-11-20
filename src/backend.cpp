@@ -4517,12 +4517,9 @@ QString cuaObservationPrompt(const QString &action, const QString &tier, bool ok
 
 bool cuaShouldContinue(const QVector<CuaStepResult> &steps, int depth)
 {
-    if (depth >= kMaxCuaLoopDepth)
+    if (depth >= kMaxCuaLoopDepth || steps.isEmpty())
         return false;
-    for (const CuaStepResult &s : steps)
-        if (s.action == QLatin1String("cua_observe") || !s.ok)
-            return true;
-    return false;
+    return true;  // feed post-action observation back until the model finishes without cua_* tags or hits depth cap
 }
 
 QString cuaFollowupPrompt(const QVector<CuaStepResult> &steps)
