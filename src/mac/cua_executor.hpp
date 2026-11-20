@@ -61,6 +61,10 @@ struct CuaHooks {
     // Cmd+A then Backspace in the focused field (clear-before-type). Unset means no clearing.
     std::function<ActionResult()> selectAllAndDelete;
     std::function<ActionResult(int pid, const QString &titleOrRole, const QRectF &nearRect)> axPress;
+    // A desktop keyboard shortcut ("cmd+l"); see parseHotkeyCombo.
+    std::function<ActionResult(const QString &combo)> pressHotkey;
+    // A visible left-button drag between two Quartz global points.
+    std::function<ActionResult(QPointF fromPt, QPointF toPt)> dragBetween;
     std::function<void(QPointF globalPt, const QString &label)> reticleMove;
     std::function<void(QRectF globalRect, const QString &label)> reticleHighlight;
     std::function<void(QPointF globalPt, const QString &label)> reticlePulse;
@@ -126,7 +130,9 @@ constexpr int kPostActionChars = 2500;   // the post-action observation's budget
 
 struct CuaExecResult {
     bool ok = false;
-    QString tier;  // "L1_AX", "L3_VLM", "L1_OBS", "ERR"; scrollTarget's display-centre fallback is "CENTER"
+    // "L1_AX", "L3_VLM", "L1_OBS", "ERR"; scrollTarget's display-centre fallback is "CENTER";
+    // hotkeyAction is "KEY"; dragTarget is "L1_AX" when both ends came from AX, else "L3_VLM".
+    QString tier;
     QPointF globalPt;
     QString detail;
     // What the screen showed afterwards: formatted AX nodes (formatNodesForModel), never Lapis's
@@ -163,6 +169,13 @@ public:
     // No input: brings appHint forward (when given) and returns its display's AX tree as
     // tier "L1_OBS" with observation = up to kObserveChars of formatted nodes, the app's first.
     CuaExecResult observeApp(const QString &appHint);
+    // Brings appHint forward (when given; else hides a single-screen fullscreen Lapis) and presses
+    // the shortcut there. globalPt stays null: a key press has no screen point.
+    CuaExecResult hotkeyAction(const QString &appHint, const QString &combo);
+    // Locates both ends (AX, then VLM; a bare toDesc inherits fromDesc's app), glides the reticle
+    // to from, pulses, then glides to to while the drag runs. Nothing is pressed unless both are
+    // found. globalPt is the from point.
+    CuaExecResult dragTarget(const QString &fromDesc, const QString &toDesc);
 
     // L1 hits press through AXPress instead of a visible synthetic click (off by default, so
     // Chrome and native apps behave the same and the click shows on screen).
@@ -179,6 +192,8 @@ private:
         QRectF rect;        // the L1 AX rect, when the target came from Accessibility
         QString app;        // the matched node's app, else the route's hint
         QString target, text;  // what the public call was asked, for the privacy check
+        bool hasToPt = false;  // drags: where the button was released
+        QPointF toPt;
     };
     struct Located {
         bool ok = false;
@@ -217,6 +232,8 @@ private:
     CuaExecResult typeImpl(const QString &targetDesc, const QString &text, bool clearFirst, Route *rt);
     CuaExecResult scrollImpl(const QString &targetDesc, int deltaY, Route *rt);
     CuaExecResult observeImpl(const QString &appHint, Route *rt);
+    CuaExecResult hotkeyImpl(const QString &appHint, const QString &combo, Route *rt);
+    CuaExecResult dragImpl(const QString &fromDesc, const QString &toDesc, Route *rt);
     void hud(const QString &status, HudTone tone) const;
     void hudFail(const QString &targetDesc, const QString &why) const;
     bool tracing() const { return !m_hooks.traceDir.isEmpty() && m_hooks.captureDisplayJpeg; }

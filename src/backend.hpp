@@ -221,8 +221,10 @@ QList<StudioCommand> extractActionTags(QString *answer);
 // A visible computer-use action from a cua_click / cua_type / cua_scroll tag. cua_type's arg is
 // "<target>|<text>" (split at the first '|'); cua_scroll's is "<target>|<deltaY>" (split at the
 // last '|'; deltaY is an integer line count, positive scrolls up, or "up" / "down" for +-5).
+// cua_hotkey's is "<combo>" or "<app>|<combo>" (target = app, text = combo, valid only when
+// parseHotkeyCombo accepts it); cua_drag's is "<from>|<to>" (target = from, text = to).
 struct CuaCommand {
-    QString kind;  // "click", "type", "scroll"
+    QString kind;  // "click", "type", "scroll", "observe", "hotkey", "drag"
     QString target;
     QString text;
     int deltaY = 0;

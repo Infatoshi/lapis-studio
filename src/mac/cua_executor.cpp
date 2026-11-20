@@ -350,6 +350,8 @@ CuaHooks defaultCuaHooks()
     h.typeText = [](const QString &t) { return studio::cua::typeText(t); };
     h.selectAllAndDelete = [] { return studio::cua::selectAllAndDelete(); };
     h.axPress = [](int pid, const QString &k, const QRectF &r) { return studio::cua::axPress(pid, k, r); };
+    h.pressHotkey = [](const QString &combo) { return studio::cua::pressHotkey(combo); };
+    h.dragBetween = [](QPointF from, QPointF to) { return studio::cua::dragBetween(from, to); };
     h.reticleMove = [](QPointF p, const QString &label) { runOnMainThread([&] { sharedReticle()->moveTo(p, label); }); };
     h.reticleHighlight = [](QRectF r, const QString &label) {
         runOnMainThread([&] { sharedReticle()->highlightRect(r, label); });
@@ -517,7 +519,8 @@ void CuaExecutor::traceStep(const QString &action, const QString &target, const 
                                         r.observation}))
         return;
     const bool observe = action == QLatin1String("observe");
-    const bool hasPt = !observe && (r.ok || !r.globalPt.isNull());
+    const bool pointless = observe || action == QLatin1String("hotkey");  // no screen point to learn
+    const bool hasPt = !pointless && (r.ok || !r.globalPt.isNull());
     const DisplayInfo d = traceDisplay(rt, r.globalPt, hasPt);
     if (m_step.before.isEmpty() || m_step.beforeDisplayId != d.displayId) {
         // No action ran (a miss, or observe): the screen now is the screen before.
@@ -567,6 +570,10 @@ void CuaExecutor::traceStep(const QString &action, const QString &target, const 
         o[QStringLiteral("point_1000")] = QJsonArray{qRound(p.x()), qRound(p.y())};
     } else {
         o[QStringLiteral("point_1000")] = QJsonValue::Null;
+    }
+    if (m_step.hasToPt) {
+        const QPointF p = toDisplay1000(m_step.toPt, d);
+        o[QStringLiteral("to_point_1000")] = QJsonArray{qRound(p.x()), qRound(p.y())};
     }
     if (r.tier == QLatin1String("L1_AX") && m_step.rect.isValid() && !m_step.rect.isEmpty()) {
         const QRectF b = toDisplay1000(m_step.rect, d);
@@ -1108,6 +1115,115 @@ CuaExecResult CuaExecutor::scrollImpl(const QString &targetDesc, int deltaY, Rou
     }
     hud(target.isEmpty() ? QStringLiteral("Done · Scrolled") : QStringLiteral("Done · Scrolled %1").arg(target), HudTone::Done);
     return {true, loc.tier, loc.pt, loc.detail, observeAfterAction(rt)};
+}
+
+CuaExecResult CuaExecutor::hotkeyAction(const QString &appHint, const QString &combo)
+{
+    m_step = {};
+    m_step.target = appHint;
+    m_step.text = combo;
+    Route rt;
+    const CuaExecResult r = hotkeyImpl(appHint, combo, &rt);
+    traceStep(QStringLiteral("hotkey"), appHint.simplified(), combo.simplified(), rt, r);
+    return r;
+}
+
+CuaExecResult CuaExecutor::dragTarget(const QString &fromDesc, const QString &toDesc)
+{
+    m_step = {};
+    m_step.target = fromDesc;
+    m_step.text = toDesc;
+    Route rt;
+    const CuaExecResult r = dragImpl(fromDesc, toDesc, &rt);
+    traceStep(QStringLiteral("drag"), fromDesc.simplified(), toDesc.simplified(), rt, r);
+    return r;
+}
+
+CuaExecResult CuaExecutor::hotkeyImpl(const QString &appHint, const QString &combo, Route *rtOut)
+{
+    const ParsedHotkey hk = parseHotkeyCombo(combo);
+    if (!hk.valid) {
+        hudFail(combo, QStringLiteral("Unknown shortcut · %1").arg(combo.simplified()));
+        return {false, QStringLiteral("ERR"), {}, QStringLiteral("Invalid hotkey: %1").arg(combo.simplified())};
+    }
+    const QString raw = appHint.simplified();
+    QString hint = extractAppHint(raw);
+    if (hint.isEmpty())
+        hint = raw;  // an app the hint table does not list: activate it by name anyway
+    Route &rt = *rtOut;
+    QString err;
+    // No app: nothing to activate, but route() still hides a single-screen fullscreen Lapis so
+    // the shortcut reaches the desktop instead of Lapis.
+    if (!route(raw, !hint.isEmpty(), &rt, &err, hint)) {
+        hudFail(hk.display, QStringLiteral("Shortcut failed · %1").arg(err));
+        return {false, QStringLiteral("ERR"), {}, err};
+    }
+    hud(hudScope(rt.appHint) + QStringLiteral("Pressing %1").arg(hk.display), HudTone::Working);
+    traceBefore(rt, {}, false);
+    const ActionResult a = m_hooks.pressHotkey ? m_hooks.pressHotkey(combo) : ActionResult{false, QStringLiteral("No keyboard")};
+    if (!a.ok) {
+        hudFail(hk.display, QStringLiteral("Shortcut failed · %1").arg(hk.display));
+        return {false, QStringLiteral("ERR"), {}, QStringLiteral("Hotkey failed: %1").arg(a.detail)};
+    }
+    hud(QStringLiteral("Done · Pressed %1").arg(hk.display), HudTone::Done);
+    const QString detail = rt.appHint.isEmpty() ? QStringLiteral("Pressed %1").arg(hk.display)
+                                                : QStringLiteral("Pressed %1 in %2").arg(hk.display, rt.appHint);
+    return {true, QStringLiteral("KEY"), {}, detail, observeAfterAction(rt)};
+}
+
+CuaExecResult CuaExecutor::dragImpl(const QString &fromDesc, const QString &toDesc, Route *rtOut)
+{
+    const QString from = fromDesc.simplified(), to = toDesc.simplified();
+    if (from.isEmpty() || to.isEmpty())
+        return {false, QStringLiteral("ERR"), {}, QStringLiteral("A drag needs both a from and a to target")};
+    const QString label = QStringLiteral("Dragging %1 to %2").arg(from, to);
+    Route &rt = *rtOut;
+    const Located a = locate(from, false, label, QStringLiteral("Dragging from"), &rt);
+    const auto miss = [&](const QString &which, const QString &desc, const QString &why) -> CuaExecResult {
+        if (m_hooks.reticleHide)
+            m_hooks.reticleHide();
+        hudFail(desc, {});
+        return {false, QStringLiteral("ERR"), {}, QStringLiteral("%1 target \"%2\": %3").arg(which, desc, why),
+                observeAfterAction(rt)};
+    };
+    if (!a.ok)
+        return miss(QStringLiteral("From"), from, a.detail);
+    const QRectF fromRect = a.rect;
+    const QString fromApp = m_step.app;
+    // "volume max" after "Chrome slider handle" means the one in Chrome too.
+    const QString toQuery = extractAppHint(to).isEmpty() && !rt.appHint.isEmpty()
+                                ? QStringLiteral("%1 in %2").arg(to, rt.appHint)
+                                : to;
+    Route toRoute;
+    const Located b = locate(toQuery, false, label, QStringLiteral("Dragging to"), &toRoute);
+    if (!b.ok)
+        return miss(QStringLiteral("To"), to, b.detail);
+    // The trace's bbox and app describe where the drag starts.
+    m_step.rect = a.tier == QLatin1String("L1_AX") ? fromRect : QRectF();
+    m_step.app = fromApp;
+    hud(hudScope(rt.appHint) + label, HudTone::Working);
+    if (m_hooks.reticleMove)
+        m_hooks.reticleMove(a.pt, label);
+    if (m_hooks.pause)
+        m_hooks.pause(kGlideSettleMs);
+    if (m_hooks.reticlePulse)
+        m_hooks.reticlePulse(a.pt, label);
+    if (m_hooks.pause)
+        m_hooks.pause(kPulseLeadMs);
+    traceBefore(rt, a.pt, true);
+    if (m_hooks.reticleMove)
+        m_hooks.reticleMove(b.pt, label);  // glides alongside the drag
+    const ActionResult d = m_hooks.dragBetween ? m_hooks.dragBetween(a.pt, b.pt) : ActionResult{false, QStringLiteral("No pointer")};
+    const QString tier = a.tier == QLatin1String("L1_AX") && b.tier == QLatin1String("L1_AX") ? QStringLiteral("L1_AX")
+                                                                                               : QStringLiteral("L3_VLM");
+    if (!d.ok) {
+        hudFail(from, QStringLiteral("Drag failed · %1").arg(from));
+        return {false, QStringLiteral("ERR"), a.pt, QStringLiteral("%1: %2").arg(tier, d.detail)};
+    }
+    m_step.hasToPt = true;
+    m_step.toPt = b.pt;
+    hud(QStringLiteral("Done · Dragged %1 to %2").arg(from, to), HudTone::Done);
+    return {true, tier, a.pt, QStringLiteral("from %1; to %2").arg(a.detail, b.detail), observeAfterAction(rt)};
 }
 
 }  // namespace studio::cua

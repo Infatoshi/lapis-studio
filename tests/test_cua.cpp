@@ -2,6 +2,7 @@
 #include "mac/cua_reticle.hpp"
 #include "mac/cua_executor.hpp"
 #include "mac/cua_shadow.hpp"
+#include <CoreGraphics/CGEventTypes.h>
 #include <QCoreApplication>
 #include <QDateTime>
 #include <QDir>
@@ -183,6 +184,9 @@ struct MockRig {
     int scrollDy = 0;
     QString typed;
     bool clearOk = true;
+    QString hotkeyCombo;
+    QPointF dragFrom, dragTo;
+    bool dragOk = true;
     // Multi-monitor: per-display AX nodes (falls back to `nodes`), on-screen windows, activation.
     QMap<uint32_t, QVector<AxNode>> nodesByDisplay;
     QVector<AppWindowInfo> windows;
@@ -245,6 +249,10 @@ struct MockRig {
         h.typeText = [this](const QString &t) { calls << "type"; typed = t; return ActionResult{true, "ok"}; };
         h.selectAllAndDelete = [this] { calls << "clear"; return ActionResult{clearOk, clearOk ? "Cleared" : "denied"}; };
         h.axPress = [this](int, const QString &, const QRectF &) { calls << "axPress"; return ActionResult{true, "ok"}; };
+        h.pressHotkey = [this](const QString &c) { calls << "hotkey"; hotkeyCombo = c; return ActionResult{true, "ok"}; };
+        h.dragBetween = [this](QPointF a, QPointF b) {
+            calls << "drag"; dragFrom = a; dragTo = b; return ActionResult{dragOk, dragOk ? "ok" : "denied"};
+        };
         h.reticleMove = [this](QPointF p, const QString &) { calls << "reticleMove"; movePt = p; };
         h.reticleHighlight = [this](QRectF r, const QString &) { calls << "reticleHighlight"; highlightRect = r; };
         h.reticlePulse = [this](QPointF p, const QString &) { calls << "reticlePulse"; pulsePt = p; };
@@ -1067,6 +1075,203 @@ void traceTests() {
             "trace cap: keeps the newest 2 steps (4 frames), deletes the rest");
     }
 }
+void hotkeyDragTests() {
+    // parseHotkeyCombo: modifiers in any order and case, one key, a clean label.
+    {
+        const ParsedHotkey l = parseHotkeyCombo("cmd+l");
+        check(l.valid && l.keyCode == 37 && l.flags == kCGEventFlagMaskCommand && l.display == "Cmd+L", "hotkey: cmd+l");
+        const ParsedHotkey t = parseHotkeyCombo(" Shift + CMD + t ");
+        check(t.valid && t.keyCode == 17 && t.flags == (kCGEventFlagMaskCommand | kCGEventFlagMaskShift) && t.display == "Cmd+Shift+T",
+            "hotkey: shift+cmd+t is Cmd+Shift+T");
+        check(parseHotkeyCombo("cmd+shift+t").display == "Cmd+Shift+T", "hotkey: cmd+shift+t label");
+        const ParsedHotkey s = parseHotkeyCombo("ctrl+opt+space");
+        check(s.valid && s.keyCode == 49 && s.flags == (kCGEventFlagMaskControl | kCGEventFlagMaskAlternate)
+                  && s.display == "Ctrl+Opt+Space",
+            "hotkey: ctrl+opt+space");
+        check(parseHotkeyCombo("control+option+space").flags == s.flags && parseHotkeyCombo("alt+ctrl+space").display == s.display,
+            "hotkey: control/option/alt aliases");
+        const ParsedHotkey e = parseHotkeyCombo("escape");
+        check(e.valid && e.keyCode == 53 && e.flags == 0 && e.display == "Esc" && parseHotkeyCombo("esc").keyCode == 53,
+            "hotkey: escape / esc, no modifiers");
+        const ParsedHotkey en = parseHotkeyCombo("enter");
+        check(en.valid && en.keyCode == 36 && en.display == "Enter" && parseHotkeyCombo("return").keyCode == 36, "hotkey: enter / return");
+        check(parseHotkeyCombo("command+meta+a").flags == kCGEventFlagMaskCommand, "hotkey: command and meta are cmd");
+        check(parseHotkeyCombo("cmd+f12").keyCode == 111 && parseHotkeyCombo("cmd+=").keyCode == 24
+                  && parseHotkeyCombo("cmd+-").keyCode == 27 && parseHotkeyCombo("cmd+[").keyCode == 33
+                  && parseHotkeyCombo("cmd+,").display == "Cmd+," && parseHotkeyCombo("up").keyCode == 126
+                  && parseHotkeyCombo("pagedown").keyCode == 121 && parseHotkeyCombo("cmd+delete").keyCode == 51
+                  && parseHotkeyCombo("forwarddelete").keyCode == 117 && parseHotkeyCombo("cmd+0").keyCode == 29,
+            "hotkey: f-keys, punctuation, arrows, paging, deletes, digits");
+        bool allInvalid = true;
+        for (const char *bad : {"", "  ", "cmd", "cmd+shift", "cmd+", "+l", "cmd++l", "cmd+l+t", "hyper+l", "cmd+f13", "cmd+ll",
+                                "lapis", "cmd|l"})
+            allInvalid = allInvalid && !parseHotkeyCombo(bad).valid;
+        check(allInvalid, "hotkey: modifier-only, empty parts, two keys, unknown names rejected");
+    }
+    // hotkeyAction with an app: activates it, HUD "Chrome · Pressing Cmd+L", presses, observes.
+    {
+        MockRig m;
+        m.activateOk = true; m.activatePid = 600; m.activateDisplay = 9;
+        m.nodesByDisplay[9] = {AxNode{1, "AXTextField", "Address and search bar", "", "Google Chrome", 600, {1500, 40, 600, 30}, {}}};
+        CuaExecutor ex(m.hooks());
+        const auto res = ex.hotkeyAction("Chrome", "cmd+l");
+        check(res.ok && res.tier == "KEY" && res.globalPt.isNull() && res.detail == "Pressed Cmd+L in Chrome",
+            "hotkey exec: ok, tier KEY, no point");
+        check(m.calls.contains("activate:Chrome") && m.hotkeyCombo == "cmd+l", "hotkey exec: activates Chrome, presses cmd+l");
+        check(m.effects().indexOf("activate:Chrome") < m.effects().indexOf("hotkey"), "hotkey exec: activation precedes the press");
+        check(m.huds.contains("working|Chrome · Pressing Cmd+L") && m.huds.last() == "done|Done · Pressed Cmd+L",
+            "hotkey exec: HUD shows Chrome · Pressing Cmd+L, then Done");
+        check(res.observation.contains("Address and search bar") && m.pauses.contains("200")
+                  && m.inspected().last() == "9",
+            "hotkey exec: settles 200 ms, then observes the app's display");
+        check(!m.calls.contains("click") && !m.calls.contains("reticlePulse"), "hotkey exec: no pointer input");
+    }
+    // No app: nothing is activated; a fullscreen single-screen Lapis is hidden first.
+    {
+        MockRig m = singleScreenRig();
+        m.frontSeq = {500, 700};
+        CuaExecutor ex(m.hooks());
+        const auto res = ex.hotkeyAction("", "cmd+space");
+        check(res.ok && m.hotkeyCombo == "cmd+space" && !m.calls.join(",").contains("activate:"),
+            "hotkey bare: presses without activating");
+        check(m.calls.contains("hideSelf") && m.effects().indexOf("hideSelf") < m.effects().indexOf("hotkey"),
+            "hotkey bare: hides fullscreen Lapis before pressing");
+        check(m.huds.contains("working|Pressing Cmd+Space"), "hotkey bare: HUD 'Pressing Cmd+Space'");
+    }
+    // Invalid combo: no route, no press, an error.
+    {
+        MockRig m;
+        CuaExecutor ex(m.hooks());
+        const auto res = ex.hotkeyAction("Chrome", "cmd+banana");
+        check(!res.ok && res.tier == "ERR" && !m.calls.contains("hotkey") && !m.calls.join(",").contains("activate:"),
+            "hotkey exec: invalid combo fails before activating or pressing");
+    }
+    // Trace: one JSONL line with action hotkey, text = combo, no point, before + after frames.
+    {
+        QTemporaryDir tmp;
+        MockRig m;
+        CuaHooks h = m.hooks();
+        h.traceDir = tmp.path();
+        CuaExecutor ex(h);
+        ex.setTraceContext({"open a new tab", "lapis", false});
+        const auto res = ex.hotkeyAction("", "cmd+t");
+        const auto lines = traceLines(tmp.path());
+        check(res.ok && lines.size() == 1 && lines[0]["action"] == "hotkey" && lines[0]["text"] == "cmd+t"
+                  && lines[0]["tier"] == "KEY" && lines[0]["point_1000"].isNull() && lines[0]["bbox_1000"].isNull()
+                  && lines[0]["goal"] == "open a new tab",
+            "trace hotkey: action, text, KEY tier, null point");
+        check(m.calls.count("capture") == 2 && m.effects().indexOf("capture") < m.effects().indexOf("hotkey")
+                  && m.effects().lastIndexOf("capture") > m.effects().indexOf("hotkey") && traceFiles(tmp.path()) == 3,
+            "trace hotkey: before frame, press, after frame");
+    }
+
+    const QRectF handle(100, 400, 20, 20), maxMark(600, 400, 40, 20);  // centres (110, 410), (620, 410)
+    // dragTarget: both ends via AX, reticle glides from -> pulse -> to, drag with exact points.
+    {
+        MockRig m;
+        m.nodes = {axNode(1, "AXValueIndicator", "slider handle", handle), axNode(2, "AXButton", "volume max", maxMark)};
+        CuaExecutor ex(m.hooks());
+        const auto res = ex.dragTarget("slider handle", "volume max");
+        check(res.ok && res.tier == "L1_AX" && close(res.globalPt, {110, 410}), "drag exec: ok via AX, globalPt is from");
+        check(close(m.dragFrom, {110, 410}) && close(m.dragTo, {620, 410}), "drag exec: dragBetween gets the exact centres");
+        const QStringList fx = m.effects();
+        check(fx == QStringList({"reticleHighlight", "reticleHighlight", "reticleMove", "reticlePulse", "reticleMove", "drag"}),
+            "drag exec: locate both, glide to from, pulse, glide to to, drag");
+        check(close(m.pulsePt, {110, 410}) && close(m.movePt, {620, 410}), "drag exec: pulse at from, reticle ends at to");
+        check(m.huds.contains("working|Dragging slider handle to volume max")
+                  && m.huds.last() == "done|Done · Dragged slider handle to volume max",
+            "drag exec: HUD 'Dragging <from> to <to>', then Done");
+        check(m.pauses.contains("200") && res.observation.contains("volume max"), "drag exec: settles, then observes");
+    }
+    // To via the VLM: from is AX, to is not in the tree, so the grounder places it.
+    {
+        MockRig m;
+        m.nodes = {axNode(1, "AXValueIndicator", "slider handle", handle)};
+        m.ground.ok = true; m.ground.hasPoint1000 = true; m.ground.point1000 = {500, 500};  // (720, 450) on the primary
+        CuaExecutor ex(m.hooks());
+        const auto res = ex.dragTarget("slider handle", "the far right end");
+        check(res.ok && res.tier == "L3_VLM" && m.groundInstruction == "the far right end" && close(m.dragFrom, {110, 410})
+                  && close(m.dragTo, {720, 450}),
+            "drag exec: AX from + VLM to, exact points");
+    }
+    // A missing end: nothing is pressed, the reticle hides, the screen comes back.
+    {
+        MockRig m;
+        m.nodes = {axNode(2, "AXButton", "volume max", maxMark)};
+        CuaExecutor ex(m.hooks());
+        const auto res = ex.dragTarget("slider handle", "volume max");
+        check(!res.ok && res.tier == "ERR" && !m.calls.contains("drag") && m.calls.contains("reticleHide")
+                  && res.detail.startsWith("From target \"slider handle\"") && res.observation.contains("volume max"),
+            "drag exec: missing from never drags");
+        MockRig n;
+        n.nodes = {axNode(1, "AXValueIndicator", "slider handle", handle)};
+        CuaExecutor exn(n.hooks());
+        const auto r2 = exn.dragTarget("slider handle", "volume max");
+        check(!r2.ok && !n.calls.contains("drag") && !n.calls.contains("reticlePulse") && r2.detail.startsWith("To target \"volume max\""),
+            "drag exec: missing to never drags or pulses");
+        check(!exn.dragTarget("slider handle", "  ").ok && !n.calls.contains("drag"), "drag exec: empty to rejected");
+        MockRig f;
+        f.dragOk = false;
+        f.nodes = {axNode(1, "AXValueIndicator", "slider handle", handle), axNode(2, "AXButton", "volume max", maxMark)};
+        CuaExecutor exf(f.hooks());
+        const auto r3 = exf.dragTarget("slider handle", "volume max");
+        check(!r3.ok && r3.detail.contains("denied") && f.huds.last().startsWith("error|"), "drag exec: a failed drag reports the error");
+    }
+    // A bare to inherits from's app: the second locate is routed to the same app.
+    {
+        MockRig m;
+        m.activateOk = true; m.activatePid = 600; m.activateDisplay = 9;
+        AxNode h = axNode(1, "AXValueIndicator", "slider handle", {1500, 400, 20, 20});
+        AxNode x = axNode(2, "AXButton", "volume max", {1900, 400, 40, 20});
+        h.appName = x.appName = "Google Chrome";
+        m.nodesByDisplay[9] = {h, x};
+        CuaExecutor ex(m.hooks());
+        const auto res = ex.dragTarget("Chrome slider handle", "volume max");
+        check(res.ok && m.calls.count("activate:Chrome") == 2 && close(m.dragFrom, {1510, 410}) && close(m.dragTo, {1920, 410}),
+            "drag exec: bare to inherits Chrome, both found on its display");
+    }
+    // Trace: one JSONL line, point_1000 = from, to_point_1000 = to, bbox from the from rect.
+    {
+        QTemporaryDir tmp;
+        MockRig m;
+        m.nodes = {axNode(1, "AXValueIndicator", "slider handle", handle), axNode(2, "AXButton", "volume max", maxMark)};
+        CuaHooks h = m.hooks();
+        h.traceDir = tmp.path();
+        CuaExecutor ex(h);
+        const auto res = ex.dragTarget("slider handle", "volume max");
+        const auto lines = traceLines(tmp.path());
+        check(res.ok && lines.size() == 1 && lines[0]["action"] == "drag" && lines[0]["target"] == "slider handle"
+                  && lines[0]["text"] == "volume max" && lines[0]["tier"] == "L1_AX",
+            "trace drag: action, from target, to text");
+        if (lines.size() == 1) {
+            // 1440x900: (110, 410) -> (76, 456); (620, 410) -> (431, 456); handle rect -> 69..83 x 444..467.
+            check(intArray(lines[0]["point_1000"], {76, 456}) && intArray(lines[0]["to_point_1000"], {431, 456})
+                      && intArray(lines[0]["bbox_1000"], {69, 444, 83, 467}),
+                "trace drag: from point, to point and from bbox normalized");
+        }
+        check(m.calls.count("capture") == 2 && m.effects().indexOf("capture") < m.effects().indexOf("drag")
+                  && m.effects().lastIndexOf("capture") > m.effects().indexOf("drag"),
+            "trace drag: before frame, drag, after frame");
+        QTemporaryDir tmp2;
+        MockRig n;
+        n.nodes = {axNode(1, "AXValueIndicator", "slider handle", handle)};
+        CuaHooks h2 = n.hooks();
+        h2.traceDir = tmp2.path();
+        CuaExecutor ex2(h2);
+        ex2.dragTarget("slider handle", "volume max");
+        const auto miss = traceLines(tmp2.path());
+        check(miss.size() == 1 && !miss[0]["ok"].toBool() && miss[0]["tier"] == "ERR" && !miss[0].contains("to_point_1000"),
+            "trace drag: a miss logs ERR without a to point");
+    }
+    // Real actuators under cancellation: nothing posts, both return at once.
+    cancelFlag.store(true);
+    check(!pressHotkey("cmd+l").ok && !dragBetween({0, 0}, {10, 10}).ok, "cancel hotkey and drag");
+    cancelFlag.store(false);
+    check(!pressHotkey("cmd+banana").ok && pressHotkey("cmd+banana").detail.startsWith("Invalid hotkey"),
+        "pressHotkey: invalid combo rejected before posting");
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    check(!dragBetween({nan, 0}, {10, 10}).ok && !dragBetween({0, 0}, {1e9, 1e9}).ok, "dragBetween: off-display endpoints rejected");
+}
 // Human-click shadow recorder: recordClickSample against fake displays / AX / capture.
 struct ShadowRig {
     QVector<DisplayInfo> displays{{7, "primary", {0, 0, 1440, 900}, 2, true}, {9, "side", {1440, 0, 1920, 1080}, 1, false}};
@@ -1215,6 +1420,7 @@ int main(int argc, char **argv) {
     geometryTests(); leaseTests(); formattingTests(); cancellationTests(); liveTests();
     reticleGeometryTests(); reticleOffscreenTests(); hudTests(); executorTests(); multiMonitorTests();
     spaceSwitchTests();
+    hotkeyDragTests();
     if (app.arguments().contains("--capture-smoke")) captureSmokeTest();
     std::printf("test_cua: %d passed, %d failed\n", passed, failed);
     return failed ? 1 : 0;

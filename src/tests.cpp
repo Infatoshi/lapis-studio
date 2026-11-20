@@ -5108,6 +5108,53 @@ void studioControlTests()
         check(kCompatSystemPrompt.contains("cua_click:<on-screen target>"), "cua: the system prompt teaches the cua tags");
     }
 
+    // --- Desktop hotkeys and click-drags: cua_hotkey / cua_drag tags --------------------------------
+    {
+        QString a = QStringLiteral("[[ACTION:cua_hotkey:cmd+l]] [[ACTION:cua_hotkey:Chrome|cmd+t]] "
+                                   "[[ACTION:cua_drag:slider handle|volume max]] Done.");
+        const QList<StudioCommand> tags = extractActionTags(&a);
+        check(tags.size() == 3 && tags[0].action == "cua_hotkey" && tags[0].arg == "cmd+l" && tags[1].action == "cua_hotkey"
+                  && tags[1].arg == "Chrome|cmd+t" && tags[2].action == "cua_drag" && tags[2].arg == "slider handle|volume max"
+                  && a == "Done.",
+              "cua keys: [[ACTION:cua_hotkey]] and [[ACTION:cua_drag]] are known tags", a);
+        const CuaCommand k = parseCuaAction("cua_hotkey", "cmd+l");
+        check(k.valid && k.kind == "hotkey" && k.target.isEmpty() && k.text == "cmd+l", "cua keys: cua_hotkey:cmd+l has no app");
+        const CuaCommand kt = parseCuaAction("cua_hotkey", " Chrome | cmd + t ");
+        check(kt.valid && kt.kind == "hotkey" && kt.target == "Chrome" && kt.text == "cmd+t",
+              "cua keys: cua_hotkey:Chrome|cmd+t targets Chrome", kt.target + " / " + kt.text);
+        check(!parseCuaAction("cua_hotkey", "").valid && !parseCuaAction("cua_hotkey", "cmd+banana").valid
+                  && !parseCuaAction("cua_hotkey", "Chrome|").valid && !parseCuaAction("cua_hotkey", "cmd+shift").valid,
+              "cua keys: empty, unknown and modifier-only combos rejected");
+        const CuaCommand d = parseCuaAction("cua_drag", " slider   handle | volume max ");
+        check(d.valid && d.kind == "drag" && d.target == "slider handle" && d.text == "volume max",
+              "cua keys: cua_drag:slider handle|volume max parses from / to");
+        check(!parseCuaAction("cua_drag", "slider handle").valid && !parseCuaAction("cua_drag", "|volume max").valid
+                  && !parseCuaAction("cua_drag", "slider handle| ").valid,
+              "cua keys: a drag needs both ends");
+
+        Backend b(Backend::Mode::Mock);
+        QStringList finished;
+        QObject::connect(&b, &Backend::cuaActionFinished, [&](const QString &act, const QString &target, bool ok,
+                                                            const QString &tier, const QString &) {
+            finished << QStringLiteral("%1:%2:%3:%4").arg(act, target, ok ? "1" : "0", tier);
+        });
+        const QString r1 = b.dispatchStudioAction("cua_hotkey", "cmd+l");
+        const QString r2 = b.dispatchStudioAction("cua_hotkey", "Chrome|cmd+t");
+        const QString r3 = b.dispatchStudioAction("cua_drag", "slider handle|volume max");
+        check(r1.contains("Pressing Cmd+L") && r2.contains("Pressing Cmd+T in Chrome") && r3.contains("Dragging slider handle to volume max")
+                  && r3.contains("not run"),
+              "cua keys: mock dispatch confirms without running", r1 + " | " + r2 + " | " + r3);
+        check(b.cuaLog() == QStringList({"cua_hotkey:cmd+l", "cua_hotkey:Chrome|cmd+t", "cua_drag:slider handle|volume max"}),
+              "cua keys: mock backend records hotkeys and drags", b.cuaLog().join(" | "));
+        check(finished == QStringList({"cua_hotkey:cmd+l:1:MOCK", "cua_hotkey:Chrome|cmd+t:1:MOCK",
+                                       "cua_drag:slider handle|volume max:1:MOCK"}),
+              "cua keys: finished signals name the combo and both drag ends", finished.join(" | "));
+        check(b.dispatchStudioAction("cua_hotkey", "cmd+banana").isEmpty() && b.cuaLog().size() == 3,
+              "cua keys: an invalid hotkey is not dispatched");
+        check(kCompatSystemPrompt.contains("cua_hotkey:<app>|<combo>") && kCompatSystemPrompt.contains("cua_drag:<from>|<to>"),
+              "cua keys: the system prompt teaches cua_hotkey and cua_drag");
+    }
+
     // --- Closed-loop computer use: cua_observe and the bounded follow-up turns ---------------------
     {
         QString a = QStringLiteral("[[ACTION:cua_observe:Discord]] [[ACTION:cua_observe]] Looking.");

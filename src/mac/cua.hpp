@@ -95,6 +95,18 @@ ActionResult scrollAt(QPointF globalPt, int deltaY);
 ActionResult typeText(const QString &text);
 // Cmd+A, ~25 ms, then Backspace: clears the focused field before typing. Honours cancelFlag.
 ActionResult selectAllAndDelete();
+// A desktop keyboard shortcut: "+"-separated modifiers (cmd/command/meta, shift, opt/option/alt,
+// ctrl/control) and exactly one key (a..z, 0..9, space, enter/return, tab, esc/escape,
+// backspace/delete, forwarddelete, arrows, home/end, pageup/pagedown, f1..f12, - = [ ] / . ,).
+// Case-insensitive. display is the clean label ("Cmd+Shift+T"); flags are CGEventFlags. Pure.
+struct ParsedHotkey { bool valid = false; uint16_t keyCode = 0; uint64_t flags = 0; QString display; };
+ParsedHotkey parseHotkeyCombo(const QString &combo);
+// Posts one real keyDown + keyUp carrying the modifier flags (the up always follows a posted down).
+ActionResult pressHotkey(const QString &combo);
+// A visible left-button drag: move to fromPt, press, `steps` interpolated drags over durationMs,
+// release at toPt. The release is always posted once the press went out, even on cancellation.
+ActionResult dragBetween(QPointF fromPt, QPointF toPt, int steps = 14, int durationMs = 220,
+                         const PointerLeaseConfig &cfg = {});
 // Caller latches true on abort and explicitly resets before a new operation.
 // A posted mouse/key down is always balanced by an up, even on cancellation.
 extern std::atomic<bool> cancelFlag;

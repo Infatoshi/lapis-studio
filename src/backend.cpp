@@ -4568,7 +4568,8 @@ QStringList studioActionNames()
             QStringLiteral("spotify_volume"), QStringLiteral("focus_project"), QStringLiteral("open_stage"),
             QStringLiteral("open_ladder"),    QStringLiteral("go_home"),       QStringLiteral("sort_map"),
             QStringLiteral("move_cluster"),   QStringLiteral("cua_click"),     QStringLiteral("cua_type"),
-            QStringLiteral("cua_scroll"),     QStringLiteral("cua_observe")};
+            QStringLiteral("cua_scroll"),     QStringLiteral("cua_observe"),   QStringLiteral("cua_hotkey"),
+            QStringLiteral("cua_drag")};
 }
 
 QString cuaObservationPrompt(const QString &action, const QString &tier, bool ok, const QString &detail,
@@ -4633,6 +4634,20 @@ CuaCommand parseCuaAction(const QString &action, const QString &arg)
         c.kind = QStringLiteral("observe");
         c.target = arg.simplified();  // the app to read; empty reads whatever is in front
         c.valid = true;
+    } else if (a == QLatin1String("cua_hotkey")) {
+        c.kind = QStringLiteral("hotkey");
+        const qsizetype bar = arg.indexOf(QLatin1Char('|'));
+        c.target = bar < 0 ? QString() : arg.left(bar).simplified();  // the app to press it in; empty = front app
+        c.text = (bar < 0 ? arg : arg.mid(bar + 1)).simplified().remove(QLatin1Char(' '));
+        c.valid = studio::cua::parseHotkeyCombo(c.text).valid;
+    } else if (a == QLatin1String("cua_drag")) {
+        c.kind = QStringLiteral("drag");
+        const qsizetype bar = arg.indexOf(QLatin1Char('|'));
+        if (bar < 0)
+            return c;
+        c.target = arg.left(bar).simplified();
+        c.text = arg.mid(bar + 1).simplified();
+        c.valid = !c.target.isEmpty() && !c.text.isEmpty();
     }
     return c;
 }
@@ -5257,8 +5272,18 @@ QString Backend::startCuaAction(const QString &action, const CuaCommand &c)
                                                                                      : QStringLiteral("Scrolling %1").arg(c.target))
                          : c.kind == QLatin1String("observe") ? (c.target.isEmpty() ? QStringLiteral("Reading the screen")
                                                                                      : QStringLiteral("Reading %1").arg(c.target))
-                                                              : QStringLiteral("Clicking %1").arg(c.target);
-    const QString logLine = action + QLatin1Char(':') + c.target
+                         : c.kind == QLatin1String("hotkey")
+                             ? QStringLiteral("Pressing %1%2")
+                                   .arg(studio::cua::parseHotkeyCombo(c.text).display,
+                                        c.target.isEmpty() ? QString() : QStringLiteral(" in %1").arg(c.target))
+                         : c.kind == QLatin1String("drag") ? QStringLiteral("Dragging %1 to %2").arg(c.target, c.text)
+                                                           : QStringLiteral("Clicking %1").arg(c.target);
+    // What the log, the finished signal and the follow-up turn name as the step's target.
+    const bool hotkey = c.kind == QLatin1String("hotkey");
+    const QString shownTarget = hotkey ? (c.target.isEmpty() ? c.text : c.target + QLatin1Char('|') + c.text)
+                                : c.kind == QLatin1String("drag") ? c.target + QLatin1Char('|') + c.text
+                                                                  : c.target;
+    const QString logLine = action + QLatin1Char(':') + shownTarget
                             + (c.kind == QLatin1String("type")     ? QLatin1Char('|') + c.text
                                : c.kind == QLatin1String("scroll") ? QLatin1Char('|') + QString::number(c.deltaY)
                                                                    : QString());
@@ -5270,9 +5295,9 @@ QString Backend::startCuaAction(const QString &action, const CuaCommand &c)
     if (m_mode != Mode::Live) {
         // --test and every mock backend: record only, never capture, click or type.
         m_cuaLog << logLine;
-        emit cuaActionFinished(action, c.target, true, QStringLiteral("MOCK"), QStringLiteral("recorded, not run"));
+        emit cuaActionFinished(action, shownTarget, true, QStringLiteral("MOCK"), QStringLiteral("recorded, not run"));
         if (inBatch)
-            noteCuaResult(batchId, CuaStepResult{action, c.target, true, QStringLiteral("MOCK"), QStringLiteral("recorded, not run"),
+            noteCuaResult(batchId, CuaStepResult{action, shownTarget, true, QStringLiteral("MOCK"), QStringLiteral("recorded, not run"),
                                                  c.kind == QLatin1String("observe") ? QStringLiteral("(mock: no screen in --test)")
                                                                                     : QString()});
         return verb + QStringLiteral(" (recorded, not run).");
@@ -5293,16 +5318,18 @@ QString Backend::startCuaAction(const QString &action, const CuaCommand &c)
         trace.redacted = std::any_of(p->sessions.cbegin(), p->sessions.cend(), [](const SessionInfo &s) { return s.redacted; })
                          || studio::cua::traceBlocked(false, {p->name, p->dir});
     QPointer<Backend> self(this);
-    m_cuaPool->start([self, action, c, logLine, inBatch, batchId, trace] {
+    m_cuaPool->start([self, action, c, shownTarget, logLine, inBatch, batchId, trace] {
         studio::cua::CuaExecutor ex;
         ex.setTraceContext(trace);
         const studio::cua::CuaExecResult r = c.kind == QLatin1String("type")      ? ex.typeIntoTarget(c.target, c.text)
                                              : c.kind == QLatin1String("scroll")  ? ex.scrollTarget(c.target, c.deltaY)
                                              : c.kind == QLatin1String("observe") ? ex.observeApp(c.target)
+                                             : c.kind == QLatin1String("hotkey")  ? ex.hotkeyAction(c.target, c.text)
+                                             : c.kind == QLatin1String("drag")    ? ex.dragTarget(c.target, c.text)
                                                                                   : ex.clickTarget(c.target);
         QMetaObject::invokeMethod(
             QCoreApplication::instance(),
-            [self, action, target = c.target, logLine, r, inBatch, batchId] {
+            [self, action, target = shownTarget, logLine, r, inBatch, batchId] {
                 if (!self)
                     return;
                 self->m_cuaPending = std::max(0, self->m_cuaPending - 1);

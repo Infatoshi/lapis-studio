@@ -635,4 +635,113 @@ ActionResult selectAllAndDelete() {
     if (const ActionResult d = press(CGKeyCode(51), CGEventFlags(0)); !d.ok) return d;  // Backspace
     return cancelFlag.load() ? cancelled() : ActionResult{true, "Cleared"};
 }
+ParsedHotkey parseHotkeyCombo(const QString &combo) {
+    struct Key { const char *name; uint16_t code; const char *label; };
+    // ANSI virtual key codes (HIToolbox Events.h).
+    static const Key keys[] = {
+        {"a", 0, "A"}, {"b", 11, "B"}, {"c", 8, "C"}, {"d", 2, "D"}, {"e", 14, "E"}, {"f", 3, "F"}, {"g", 5, "G"},
+        {"h", 4, "H"}, {"i", 34, "I"}, {"j", 38, "J"}, {"k", 40, "K"}, {"l", 37, "L"}, {"m", 46, "M"}, {"n", 45, "N"},
+        {"o", 31, "O"}, {"p", 35, "P"}, {"q", 12, "Q"}, {"r", 15, "R"}, {"s", 1, "S"}, {"t", 17, "T"}, {"u", 32, "U"},
+        {"v", 9, "V"}, {"w", 13, "W"}, {"x", 7, "X"}, {"y", 16, "Y"}, {"z", 6, "Z"},
+        {"0", 29, "0"}, {"1", 18, "1"}, {"2", 19, "2"}, {"3", 20, "3"}, {"4", 21, "4"}, {"5", 23, "5"}, {"6", 22, "6"},
+        {"7", 26, "7"}, {"8", 28, "8"}, {"9", 25, "9"},
+        {"space", 49, "Space"}, {"enter", 36, "Enter"}, {"return", 36, "Enter"}, {"tab", 48, "Tab"},
+        {"esc", 53, "Esc"}, {"escape", 53, "Esc"}, {"backspace", 51, "Backspace"}, {"delete", 51, "Backspace"},
+        {"forwarddelete", 117, "ForwardDelete"}, {"up", 126, "Up"}, {"down", 125, "Down"}, {"left", 123, "Left"},
+        {"right", 124, "Right"}, {"home", 115, "Home"}, {"end", 119, "End"}, {"pageup", 116, "PageUp"},
+        {"pagedown", 121, "PageDown"}, {"f1", 122, "F1"}, {"f2", 120, "F2"}, {"f3", 99, "F3"}, {"f4", 118, "F4"},
+        {"f5", 96, "F5"}, {"f6", 97, "F6"}, {"f7", 98, "F7"}, {"f8", 100, "F8"}, {"f9", 101, "F9"}, {"f10", 109, "F10"},
+        {"f11", 103, "F11"}, {"f12", 111, "F12"},
+        {"-", 27, "-"}, {"=", 24, "="}, {"[", 33, "["}, {"]", 30, "]"}, {"/", 44, "/"}, {".", 47, "."}, {",", 43, ","}};
+    ParsedHotkey out;
+    const QStringList parts = combo.trimmed().toLower().split(QLatin1Char('+'));
+    bool cmd = false, shift = false, opt = false, ctrl = false, haveKey = false;
+    const Key *key = nullptr;
+    for (const QString &raw : parts) {
+        const QString p = raw.trimmed();
+        if (p.isEmpty()) return {};
+        if (p == "cmd" || p == "command" || p == "meta") cmd = true;
+        else if (p == "shift") shift = true;
+        else if (p == "opt" || p == "option" || p == "alt") opt = true;
+        else if (p == "ctrl" || p == "control") ctrl = true;
+        else {
+            if (haveKey) return {};  // one key per shortcut
+            for (const Key &k : keys)
+                if (p == QLatin1String(k.name)) { key = &k; break; }
+            if (!key) return {};
+            haveKey = true;
+        }
+    }
+    if (!key) return {};
+    QStringList label;
+    if (cmd) { label << "Cmd"; out.flags |= kCGEventFlagMaskCommand; }
+    if (ctrl) { label << "Ctrl"; out.flags |= kCGEventFlagMaskControl; }
+    if (opt) { label << "Opt"; out.flags |= kCGEventFlagMaskAlternate; }
+    if (shift) { label << "Shift"; out.flags |= kCGEventFlagMaskShift; }
+    label << QLatin1String(key->label);
+    out.valid = true;
+    out.keyCode = key->code;
+    out.display = label.join(QLatin1Char('+'));
+    return out;
+}
+ActionResult pressHotkey(const QString &combo) {
+    if (cancelFlag.load()) return cancelled();
+    const ParsedHotkey hk = parseHotkeyCombo(combo);
+    if (!hk.valid) return {false, QString("Invalid hotkey: %1").arg(combo.simplified())};
+    std::unique_lock lock(actuator, std::defer_lock);
+    if (!acquire(lock)) return cancelled();
+    if (!AXIsProcessTrusted()) return {false, "Accessibility permission is required"};
+    CF<CGEventRef> down(CGEventCreateKeyboardEvent(nullptr, CGKeyCode(hk.keyCode), true));
+    CF<CGEventRef> up(CGEventCreateKeyboardEvent(nullptr, CGKeyCode(hk.keyCode), false));
+    if (!down || !up) return {false, "Cannot create keyboard events"};
+    CGEventSetFlags(down.get(), CGEventFlags(hk.flags));
+    CGEventSetFlags(up.get(), CGEventFlags(hk.flags));
+    if (!post(down.get())) return cancelled();
+    // Safety cleanup is unconditional: never strand a pressed key.
+    CGEventPost(kCGHIDEventTap, up.get());
+    return cancelFlag.load() ? cancelled() : ActionResult{true, QString("Pressed %1").arg(hk.display)};
+}
+ActionResult dragBetween(QPointF from, QPointF to, int steps, int durationMs, const PointerLeaseConfig &cfg) {
+    if (cancelFlag.load()) return cancelled();
+    if (!activePoint(from) || !activePoint(to) || !std::isfinite(cfg.userMoveAbortPx) || cfg.userMoveAbortPx < 0)
+        return {false, "Invalid drag endpoints or threshold"};
+    steps = std::clamp(steps, 1, 200);
+    durationMs = std::clamp(durationMs, 0, 5000);
+    std::unique_lock lock(actuator, std::defer_lock);
+    if (!acquire(lock)) return cancelled();
+    if (!AXIsProcessTrusted()) return {false, "Accessibility permission is required"};
+    const auto saved = cursor();
+    if (!finite(saved)) return {false, "Cannot read cursor"};
+    CursorLease lease{saved, to, cfg};
+    if (!move(from)) return cancelFlag.load() ? cancelled() : ActionResult{false, "Pointer move failed"};
+    lease.moved = true;
+    if (!shouldRestoreCursor(saved, cursor(), from, cfg.userMoveAbortPx)) return {false, "User moved pointer; lease aborted"};
+    const auto mouse = [](CGEventType type, QPointF p) {
+        CGEventRef e = CGEventCreateMouseEvent(nullptr, type, CGPointMake(p.x(), p.y()), kCGMouseButtonLeft);
+        if (e) CGEventSetIntegerValueField(e, kCGMouseEventClickState, 1);
+        return CF<CGEventRef>(e);
+    };
+    if (CF<CGEventRef> hover = mouse(kCGEventMouseMoved, from); !post(hover.get()))
+        return cancelFlag.load() ? cancelled() : ActionResult{false, "Cannot create mouse events"};
+    CF<CGEventRef> down = mouse(kCGEventLeftMouseDown, from);
+    if (!down) return {false, "Cannot create mouse events"};
+    if (!post(down.get())) return cancelled();
+    // The button is down from here: every exit path below releases it.
+    QPointF last = from;
+    const auto pause = std::chrono::microseconds(int64_t(durationMs) * 1000 / steps);
+    for (int i = 1; i <= steps && !cancelFlag.load(); ++i) {
+        std::this_thread::sleep_for(pause);
+        const double t = double(i) / steps;
+        const QPointF p = from + (to - from) * t;
+        CF<CGEventRef> drag = mouse(kCGEventLeftMouseDragged, p);
+        if (!drag || !post(drag.get())) break;
+        last = p;
+    }
+    CF<CGEventRef> up = mouse(kCGEventLeftMouseUp, last);
+    if (!up) return {false, "Cannot create mouse-up event"};
+    CGEventPost(kCGHIDEventTap, up.get());  // unconditional, unlike post(): never strand the button
+    if (cancelFlag.load()) return cancelled();
+    if (last != to) return {false, "Drag interrupted"};
+    return {true, "Drag posted"};
+}
 } // namespace studio::cua
