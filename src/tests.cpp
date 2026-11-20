@@ -2602,6 +2602,43 @@ void gamepadUnitTests()
         log.feed(&g, s, t + 8);
         check(log.count("newSession") == 1, "pad: share + touchpad together toggle the dialog once", log.names());
     }
+    // L3 + R3 together: one confirmProposalRequested, never zoom_reset / zoom_in / r3Pressed.
+    {
+        Gamepad g;
+        PadLog log;
+        log.attach(&g);
+        int confirms = 0, r3s = 0;
+        QObject::connect(&g, &Gamepad::confirmProposalRequested, [&confirms] { ++confirms; });
+        QObject::connect(&g, &Gamepad::r3Pressed, [&r3s] { ++r3s; });
+        S both;
+        both.l3 = both.r3 = true;
+        log.hold(&g, both, 0, 400);  // same-poll press, held well past the 80 ms window
+        log.feed(&g, S(), 408);
+        check(confirms == 1 && r3s == 0 && log.evs.isEmpty(), "pad: L3+R3 same poll emits one confirm and no single actions",
+              log.names());
+        // Staggered within the window: L3 first, R3 48 ms later.
+        S l3;
+        l3.l3 = true;
+        log.hold(&g, l3, 1000, 1040);
+        log.hold(&g, both, 1048, 1300);
+        S r3only;
+        r3only.r3 = true;
+        log.hold(&g, r3only, 1308, 1400);  // L3 lets go first: still the chord, no R3 zoom
+        log.feed(&g, S(), 1408);
+        check(confirms == 2 && r3s == 0 && log.evs.isEmpty(), "pad: L3 then R3 within 80 ms is the chord", log.names());
+        // Outside the window: L3 fires alone after 80 ms, R3 later fires alone too.
+        log.hold(&g, l3, 2000, 2120);
+        log.hold(&g, both, 2128, 2200);
+        log.feed(&g, S(), 2208);
+        check(confirms == 2 && r3s == 1 && log.names() == "zoomReset,zoom",
+              "pad: L3 held past 80 ms then R3 are two single clicks", log.names());
+        log.evs.clear();
+        // A quick single tap still fires on release, inside the window.
+        log.feed(&g, r3only, 3000);
+        log.feed(&g, S(), 3016);
+        check(confirms == 2 && r3s == 2 && log.names() == "zoom" && log.evs.value(0).t == 3016,
+              "pad: a 16 ms R3 tap fires on release", log.names());
+    }
     // Triggers: > 0.55 presses, < 0.45 re-arms. L2 = Phonon hold/release, R2 = Send.
     {
         Gamepad g;
@@ -5577,7 +5614,8 @@ void finalWiringTests()
     {
         QTcpServer server;
         QList<QByteArray> bodies;
-        QList<QByteArray> replies = {"[[ACTION:set_volume:40]] [[ACTION:spotify_next]] Done.", "[[IGNORE]]"};
+        QList<QByteArray> replies = {"[[ACTION:set_volume:40]] [[ACTION:spotify_next]] Done.", "[[IGNORE]]",
+                                     "[[ACTION:set_volume:20]]", "[[ACTION:set_volume:10]]"};
         QObject::connect(&server, &QTcpServer::newConnection, [&] {
             while (QTcpSocket *s = server.nextPendingConnection()) {
                 auto buf = std::make_shared<QByteArray>();
@@ -5626,9 +5664,25 @@ void finalWiringTests()
                   && sys.contains("CTX-AMBIENT") && leaf.endsWith("Spoken: turn it down and skip this one"),
               "ambient: only the new You: line goes out, after the 800 ms debounce, no-think, Tier 0 context",
               QString::number(debounceMs) + "ms " + leaf.right(60));
-        check(done && std::abs(mix->volume() - 0.4) < 1e-9 && sp->commandLog().mid(n0).contains("api POST /v1/me/player/next")
-                  && b.ambientAnswer() == "Done.",
-              "ambient: a compound reply runs both actions in one turn and shows the clean answer", b.ambientAnswer());
+        check(done && b.hasPendingProposal() && b.pendingProposalText() == "Done." && std::abs(mix->volume() - 0.8) < 1e-9
+                  && !sp->commandLog().mid(n0).contains("api POST /v1/me/player/next")
+                  && b.ambientAnswer() == "Done.  ·  L3+R3 Run",
+              "ambient: action tags stage a pending proposal and run nothing yet", b.ambientAnswer());
+        // L3 + R3 on the pad confirms it: both actions run in one go, the proposal clears.
+        {
+            Gamepad *pad = b.gamepad();
+            int l3Zoom = 0;
+            QObject::connect(pad, &Gamepad::zoomReset, [&l3Zoom] { ++l3Zoom; });
+            GamepadSnapshot chord;
+            chord.l3 = chord.r3 = true;
+            pad->processSnapshot(chord, 100000);
+            pad->processSnapshot(GamepadSnapshot(), 100200);
+            check(!b.hasPendingProposal() && b.pendingProposalText().isEmpty() && l3Zoom == 0
+                      && std::abs(mix->volume() - 0.4) < 1e-9
+                      && sp->commandLog().mid(n0).contains("api POST /v1/me/player/next") && !b.ambientAnswer().isEmpty(),
+                  "ambient: L3+R3 runs the staged compound proposal and clears it", b.ambientAnswer());
+            check(!b.confirmPendingProposal(), "ambient: confirming with nothing staged is a no-op");
+        }
 
         const QString answerBefore = b.ambientAnswer();
         const int n1 = int(sp->commandLog().size());
@@ -5644,9 +5698,33 @@ void finalWiringTests()
         settle(50);
         check(bodies.size() == 2 && sp->commandLog().last() == "api PUT /v1/me/player/pause" && b.ambientAnswer() == "Paused Spotify.",
               "ambient: a plain UI command runs locally, no model call", b.ambientAnswer());
+
+        // An unconfirmed proposal expires on its own (15 s live; 150 ms here) and runs nothing.
+        b.setProposalTimeoutMs(150);
+        b.feedAmbientTail("0:12 You: pause spotify\n0:13 You: make it quieter");
+        b.flushAmbient();
+        const bool staged = waitUntil([&] { return bodies.size() == 3 && !b.ambientBusy() && b.hasPendingProposal(); }, 5000);
+        const QString stagedText = b.pendingProposalText();
+        const bool expired = waitUntil([&] { return !b.hasPendingProposal(); }, 3000);
+        check(staged && stagedText == "set_volume 20" && expired && b.pendingProposalText().isEmpty()
+                  && std::abs(mix->volume() - 0.4) < 1e-9 && !b.confirmPendingProposal(),
+              "ambient: an unconfirmed proposal expires and never runs", stagedText);
+        // dismissPendingProposal drops it at once; a later L3+R3 does nothing.
+        b.setProposalTimeoutMs(15000);
+        b.feedAmbientTail("0:13 You: make it quieter\n0:14 You: quieter still");
+        b.flushAmbient();
+        const bool staged2 = waitUntil([&] { return bodies.size() == 4 && !b.ambientBusy() && b.hasPendingProposal(); }, 5000);
+        b.dismissPendingProposal();
+        GamepadSnapshot chord;
+        chord.l3 = chord.r3 = true;
+        b.gamepad()->processSnapshot(chord, 200000);
+        b.gamepad()->processSnapshot(GamepadSnapshot(), 200200);
+        check(staged2 && !b.hasPendingProposal() && std::abs(mix->volume() - 0.4) < 1e-9,
+              "ambient: dismissPendingProposal clears it and L3+R3 then runs nothing");
+
         b.setAmbientVoiceEnabled(false);
-        b.feedAmbientTail("0:12 You: pause spotify\n0:15 You: open music");
-        check(!b.ambientBusy() && bodies.size() == 2, "ambient: off means nothing is sent");
+        b.feedAmbientTail("0:14 You: quieter still\n0:15 You: open music");
+        check(!b.ambientBusy() && bodies.size() == 4, "ambient: off means nothing is sent");
         b.setLlmRouter(nullptr);
     }
 }
@@ -6567,8 +6645,8 @@ void polishTests()
         const QString r3 = b.dispatchStudioAction("spawn_agent", "do work");
         check(r3.contains("no project folder"), "spawn: /tmp is still refused", r3);
     }
-    check(kCompatSystemPrompt.contains("Never say you are spawning or starting an agent unless the same answer emits "
-                                       "[[ACTION:spawn_agent:<task>]]"),
+    check(kCompatSystemPrompt.contains("Never say you are steering, messaging, spawning, or starting an agent unless the "
+                                       "same answer emits [[ACTION:steer_agent:...]] or [[ACTION:spawn_agent:<task>]]"),
           "spawn: Tier 0 forbids prose-only 'Spawning an agent'");
 
     // Wall clock rides in Tier 3 only: the system prompt and the trunk never carry it.

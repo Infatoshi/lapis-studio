@@ -308,6 +308,10 @@ class Backend : public QObject {
     Q_PROPERTY(bool ambientBusy READ ambientBusy NOTIFY ambientChanged)
     Q_PROPERTY(QString ambientAnswer READ ambientAnswer NOTIFY ambientChanged)
     Q_PROPERTY(QString ambientHeard READ ambientHeard NOTIFY ambientChanged)
+    // Ambient action tags are proposed, not run: they wait here (and on the all-Spaces HUD bar)
+    // for L3 + R3 (confirmPendingProposal) and expire after 15 s.
+    Q_PROPERTY(bool hasPendingProposal READ hasPendingProposal NOTIFY pendingProposalChanged)
+    Q_PROPERTY(QString pendingProposalText READ pendingProposalText NOTIFY pendingProposalChanged)
     // Hovered / pinned semantic targets (TargetRegistry); viewers push, FloatingOmnibar reads.
     Q_PROPERTY(QObject *targets READ targets CONSTANT)
     // Morning Briefing: changed / active projects in two lines each (see localBriefing()).
@@ -515,6 +519,12 @@ public:
     Q_INVOKABLE void clearAmbientAnswer();
     void feedAmbientTail(const QString &tail);
     void flushAmbient();
+    bool hasPendingProposal() const { return !m_pendingProposalActions.isEmpty(); }
+    QString pendingProposalText() const { return m_pendingProposalSummary; }
+    // Runs the staged Ambient actions in their project and clears the proposal; false when none.
+    Q_INVOKABLE bool confirmPendingProposal();
+    Q_INVOKABLE void dismissPendingProposal();
+    void setProposalTimeoutMs(int ms) { m_proposalTimer.setInterval(ms); }  // tests: default 15 s
     // The Tier 0 local studio context (loadLocalStudioContext, live mode only; tests may set it).
     QString studioContext() const { return m_studioContext; }
     void setStudioContext(const QString &ctx) { m_studioContext = ctx; }
@@ -645,6 +655,7 @@ signals:
     void tasteRulesChanged();
     void phononTailChanged();
     void ambientChanged();
+    void pendingProposalChanged();
     void sessionStarted(const QString &projectKey);
     void quickTick();
     void streamDelta(const QString &streamId, const QString &textDelta, const QString &thinkingDelta);
@@ -870,6 +881,12 @@ private:
     QString m_ambientHeard;
     QString m_ambientProject;
     QTimer m_ambientDebounce;
+    void stageProposal(const QVector<StudioAction> &actions, const QString &summary, const QString &project);
+    QStringList runStudioActions(const QVector<StudioAction> &actions);
+    QVector<StudioAction> m_pendingProposalActions;
+    QString m_pendingProposalSummary;
+    QString m_pendingProposalProject;
+    QTimer m_proposalTimer;  // single-shot 15 s: an unconfirmed proposal expires
     QString m_studioContext;  // Tier 0 tail, loaded once in live mode
     MemoryIndex m_memory;
     QTimer m_memoryTimer;  // live: periodic background rescan

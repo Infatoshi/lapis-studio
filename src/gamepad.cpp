@@ -155,6 +155,50 @@ void GamepadState::reset()
     m_analog = keepAnalog;
 }
 
+// L3 / R3 with the L3 + R3 chord. A press edge waits up to kStickChordMs for the other stick;
+// both pending at once is the chord (one ConfirmProposal, nothing else until both are up).
+// Otherwise the press fires once the window lapses, or immediately with its release on a
+// quick tap, so single clicks keep their mapped actions at most 80 ms late.
+void GamepadState::processStickClicks(const GamepadSnapshot &s, qint64 nowMs, QList<GamepadAction> &out)
+{
+    const GamepadSnapshot &p = m_prev;
+    if (m_stickChord) {
+        if (!s.l3 && !s.r3)
+            m_stickChord = false;
+        return;
+    }
+    if (s.l3 && !p.l3) {
+        m_l3Pending = true;
+        m_l3Since = nowMs;
+    }
+    if (s.r3 && !p.r3) {
+        m_r3Pending = true;
+        m_r3Since = nowMs;
+    }
+    if (m_l3Pending && m_r3Pending && s.l3 && s.r3) {
+        m_l3Pending = m_r3Pending = false;
+        m_stickChord = true;
+        out.append(GamepadAction::make(GamepadAction::ConfirmProposal));
+        return;
+    }
+    auto resolve = [&](const char *id, bool now, bool &pending, bool &down, qint64 since) {
+        const QString in = QString::fromLatin1(id);
+        if (pending && (!now || nowMs - since >= kStickChordMs)) {
+            pending = false;
+            down = true;
+            emitMappedAction(in, true, out);
+            if (in == QLatin1String("r3"))
+                out.append(GamepadAction::make(GamepadAction::R3Raw));
+        }
+        if (down && !now) {
+            down = false;
+            emitMappedAction(in, false, out);
+        }
+    };
+    resolve("l3", s.l3, m_l3Pending, m_l3Down, m_l3Since);
+    resolve("r3", s.r3, m_r3Pending, m_r3Down, m_r3Since);
+}
+
 void GamepadState::shapeStick(double lx, double ly, double *outX, double *outY)
 {
     *outX = 0;
@@ -328,8 +372,7 @@ QList<GamepadAction> GamepadState::process(const GamepadSnapshot &s, qint64 nowM
         handleDigital("l1", s.l1, p.l1);
         handleDigital("r1", s.r1, p.r1);
     }
-    handleDigital("l3", s.l3, p.l3);
-    handleDigital("r3", s.r3, p.r3);
+    processStickClicks(s, nowMs, out);
     handleDigital("menu", s.menu, p.menu);
     // Split touchpad click: left half opens Morning Briefing; right half (or Share) runs mapped "options" action.
     if (pressed(s.touchpad, p.touchpad) && !s.options && !p.options && s.touchpadX < -0.15)
@@ -487,10 +530,6 @@ QVariantList Gamepad::availableActions() const
 
 void Gamepad::processSnapshot(const Snapshot &s, qint64 nowMs)
 {
-    const bool r3Edge = s.r3 && !m_prevR3;
-    m_prevR3 = s.r3;
-    if (r3Edge)
-        emit r3Pressed();
     const QList<GamepadAction> actions = m_state.process(s, nowMs);
     if (m_state.leftX() != m_leftX || m_state.leftY() != m_leftY) {
         m_leftX = m_state.leftX();
@@ -519,6 +558,8 @@ void Gamepad::processSnapshot(const Snapshot &s, qint64 nowMs)
         case GamepadAction::TouchpadPan: emit touchpadPan(double(a.dx), double(a.dy)); break;
         case GamepadAction::HorizontalInspect: emit horizontalInspect(a.dx); break;
         case GamepadAction::Send: emit sendPressed(); break;
+        case GamepadAction::ConfirmProposal: emit confirmProposalRequested(); break;
+        case GamepadAction::R3Raw: emit r3Pressed(); break;
         case GamepadAction::VoiceHold: {
             const bool active = a.value > 0.5;
             // Music owns the pad: L2 is a plain press (loop toggle), never the Phonon voice key.
@@ -557,7 +598,6 @@ void Gamepad::setConnected(bool on, const QString &name)
     m_connected = on;
     m_name = on ? name : QString();
     m_state.reset();
-    m_prevR3 = false;
     if (m_leftX != 0 || m_leftY != 0) {
         m_leftX = m_leftY = 0;
         emit leftStickChanged();

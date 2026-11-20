@@ -1110,6 +1110,11 @@ Backend::Backend(Mode mode, QObject *parent, bool warmHelpers)
     m_ambientDebounce.setSingleShot(true);
     m_ambientDebounce.setInterval(800);
     connect(&m_ambientDebounce, &QTimer::timeout, this, &Backend::flushAmbient);
+    m_proposalTimer.setSingleShot(true);
+    m_proposalTimer.setInterval(15000);
+    connect(&m_proposalTimer, &QTimer::timeout, this, &Backend::dismissPendingProposal);
+    // L3 + R3 anywhere (background monitoring is on) runs the staged Ambient proposal.
+    connect(&m_gamepad, &Gamepad::confirmProposalRequested, this, [this] { confirmPendingProposal(); });
     if (m_mode == Mode::Mock) {
         ensureFixtureFiles();
         const QString clips = ensureSlowmixFixture();
@@ -1739,6 +1744,8 @@ void Backend::setAmbientVoiceEnabled(bool on)
             m_router->cancelStream(QString::fromLatin1(kAmbientStreamId));
         m_ambientBusy = false;
     }
+    if (!on)
+        dismissPendingProposal();
     emit ambientChanged();
 }
 
@@ -2992,12 +2999,27 @@ void Backend::onRouterFinished(const QString &streamId, const QString &error)
             emit ambientChanged();
             return;
         }
-        const QString keep = m_commandProject;
-        m_commandProject = m_ambientProject;
-        QString answer = raw;
-        runAnswerTags(&answer);  // every tag runs, in order, this turn
-        m_commandProject = keep;
-        m_ambientAnswer = answer.trimmed();
+        // Overheard speech never acts on its own: known action tags become a proposal on the
+        // all-Spaces HUD bar that L3 + R3 runs (or 15 s expires). Plain prose shows as before.
+        const QStringList known = studioActionNames();
+        QVector<StudioAction> actions;
+        for (const StudioAction &c : out.actions)
+            if (known.contains(c.name.toLower()))
+                actions << c;
+        if (!actions.isEmpty()) {
+            QString summary = out.cleanText.simplified();
+            if (summary.isEmpty()) {
+                QStringList parts;
+                for (const StudioAction &c : actions)
+                    parts << (c.arg.isEmpty() ? c.name : c.name + QLatin1Char(' ') + c.arg);
+                summary = parts.join(QStringLiteral(", "));
+            }
+            stageProposal(actions, clampWords(summary, 10), m_ambientProject);
+            m_ambientAnswer = m_pendingProposalSummary + QStringLiteral("  ·  L3+R3 Run");
+            emit ambientChanged();
+            return;
+        }
+        m_ambientAnswer = out.cleanText.trimmed();
         if (!m_ambientAnswer.isEmpty())
             noteExchange(m_ambientProject, compatModel(), m_ambientHeard, m_ambientAnswer);
         emit ambientChanged();
@@ -5194,9 +5216,15 @@ void Backend::runAnswerTags(QString *answer)
     }
     if (parsed.actions.isEmpty())
         return;
+    const QStringList replies = runStudioActions(parsed.actions);
+    *answer = parsed.cleanText.isEmpty() ? replies.join(QLatin1Char(' ')) : parsed.cleanText;
+}
+
+QStringList Backend::runStudioActions(const QVector<StudioAction> &actions)
+{
     const QStringList known = studioActionNames();
     QStringList replies;
-    for (const StudioAction &c : parsed.actions) {
+    for (const StudioAction &c : actions) {
         const QString name = c.name.toLower();
         if (!known.contains(name))
             continue;
@@ -5206,7 +5234,61 @@ void Backend::runAnswerTags(QString *answer)
         if (!r.isEmpty())
             replies << r;
     }
-    *answer = parsed.cleanText.isEmpty() ? replies.join(QLatin1Char(' ')) : parsed.cleanText;
+    return replies;
+}
+
+void Backend::stageProposal(const QVector<StudioAction> &actions, const QString &summary, const QString &project)
+{
+    m_pendingProposalActions = actions;  // a newer proposal replaces one still waiting
+    m_pendingProposalSummary = summary;
+    m_pendingProposalProject = project;
+    m_proposalTimer.start();
+    if (m_cuaHud)
+        studio::cua::showCuaHud(summary + QStringLiteral("  ·  L3+R3 Run"), studio::cua::HudTone::Listening);
+    emit pendingProposalChanged();
+}
+
+bool Backend::confirmPendingProposal()
+{
+    if (m_pendingProposalActions.isEmpty())
+        return false;
+    const QVector<StudioAction> actions = m_pendingProposalActions;
+    const QString summary = m_pendingProposalSummary;
+    const QString project = m_pendingProposalProject;
+    m_pendingProposalActions.clear();
+    m_pendingProposalSummary.clear();
+    m_pendingProposalProject.clear();
+    m_proposalTimer.stop();
+    emit pendingProposalChanged();
+    if (m_cuaHud)
+        studio::cua::showCuaHud(summary + QStringLiteral("…"), studio::cua::HudTone::Working);
+    const QString keep = m_commandProject;
+    m_commandProject = project;
+    const QStringList replies = runStudioActions(actions);
+    m_commandProject = keep;
+    // cua_* actions drive the HUD themselves and fade it when their queue drains.
+    if (m_cuaHud && !m_cuaPending)
+        studio::cua::hideCuaHud(studio::cua::kHudLingerSec);
+    m_ambientAnswer = replies.isEmpty() ? summary : replies.join(QLatin1Char(' '));
+    noteExchange(project, compatModel(), m_ambientHeard, m_ambientAnswer);
+    emit ambientChanged();
+    return true;
+}
+
+void Backend::dismissPendingProposal()
+{
+    m_proposalTimer.stop();
+    if (m_pendingProposalActions.isEmpty())
+        return;
+    m_pendingProposalActions.clear();
+    m_pendingProposalSummary.clear();
+    m_pendingProposalProject.clear();
+    if (m_cuaHud)
+        studio::cua::hideCuaHud(0.0);
+    if (m_ambientAnswer.endsWith(QStringLiteral("L3+R3 Run")))
+        m_ambientAnswer.clear();
+    emit pendingProposalChanged();
+    emit ambientChanged();
 }
 
 void Backend::noteExchange(const QString &projectKey, const QString &model, const QString &prompt, const QString &answer)

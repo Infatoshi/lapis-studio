@@ -62,7 +62,9 @@ struct GamepadAction {
         Send,
         RawCaptured,
         ConfirmHeld,  // value 1.0 on the confirm input's press edge, 0.0 on its release
-        Cursor        // vx, vy: the shaped left stick (screen y down), every poll while deflected
+        Cursor,       // vx, vy: the shaped left stick (screen y down), every poll while deflected
+        ConfirmProposal,  // L3 + R3 clicked together (within kStickChordMs): run the staged proposal
+        R3Raw             // R3 press that resolved as a single click (not part of the L3 + R3 chord)
     };
     Kind kind;
     int dx = 0, dy = 0;   // Nav: screen direction (dy +1 = down); Step: dx = -1 / +1
@@ -88,6 +90,9 @@ public:
     static constexpr double kScrollPxPerSec = 2000;  // full deflection
     static constexpr double kZoomStep = 0.10;
     static constexpr double kCursorDeadzone = 0.14;  // analog cursor: radial deadzone
+    // L3 / R3 presses wait this long for the other stick click before firing alone, so the
+    // L3 + R3 chord never also fires zoom_reset / zoom_in.
+    static constexpr qint64 kStickChordMs = 80;
 
     // The analog cursor's response: a radial deadzone, then a quadratic curve on the magnitude
     // (fine aim near the centre, a fast sweep at full tilt), direction kept. Screen y is down.
@@ -117,6 +122,7 @@ public:
 private:
     void navDirection(const GamepadSnapshot &s, int *dx, int *dy) const;
     void emitMappedAction(const QString &inputId, bool pressed, QList<GamepadAction> &out) const;
+    void processStickClicks(const GamepadSnapshot &s, qint64 nowMs, QList<GamepadAction> &out);
 
     QHash<QString, QString> m_bindings;
     bool m_capture = false;
@@ -130,6 +136,12 @@ private:
     int m_rNavDx = 0;
     qint64 m_nextRNavMs = 0;
     bool m_chord = false;  // L1 + R1 held together: one ToggleMusic, no single-shoulder actions
+    // L3 / R3: a press is pending (not yet emitted) for up to kStickChordMs; m_stickChord holds
+    // until both sticks are released after a ConfirmProposal.
+    bool m_stickChord = false;
+    bool m_l3Pending = false, m_r3Pending = false;
+    bool m_l3Down = false, m_r3Down = false;  // the single press was emitted; its release is owed
+    qint64 m_l3Since = 0, m_r3Since = 0;
     bool m_analog = false;
     double m_leftX = 0, m_leftY = 0;
 };
@@ -224,8 +236,12 @@ signals:
     void horizontalInspect(int dir);
     void voiceHold(bool active);
     void sendPressed();
-    // Raw R3 press edge, whatever it is bound to (the Music card uses it to switch tabs).
+    // Raw R3 press, whatever it is bound to (the Music card uses it to switch tabs). Fires once
+    // the press resolves as a single click, never for the L3 + R3 chord.
     void r3Pressed();
+    // L3 + R3 clicked together: confirm the staged Ambient proposal. Background monitoring is on,
+    // so this fires from any Space or app.
+    void confirmProposalRequested();
     void rawInputCaptured(const QString &inputId);
 
 private:
@@ -236,7 +252,6 @@ private:
     bool m_enabled = false;
     bool m_voiceActive = false;
     bool m_musicMode = false;
-    bool m_prevR3 = false;
     double m_leftX = 0, m_leftY = 0;
     QString m_name;
     std::unique_ptr<Platform> m_platform;
