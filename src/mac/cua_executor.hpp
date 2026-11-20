@@ -58,6 +58,8 @@ struct CuaHooks {
     std::function<ActionResult(QPointF globalPt, bool doubleClick)> clickAt;
     std::function<ActionResult(QPointF globalPt, int deltaY)> scrollAt;
     std::function<ActionResult(const QString &text)> typeText;
+    // Cmd+A then Backspace in the focused field (clear-before-type). Unset means no clearing.
+    std::function<ActionResult()> selectAllAndDelete;
     std::function<ActionResult(int pid, const QString &titleOrRole, const QRectF &nearRect)> axPress;
     std::function<void(QPointF globalPt, const QString &label)> reticleMove;
     std::function<void(QRectF globalRect, const QString &label)> reticleHighlight;
@@ -95,12 +97,19 @@ void hideCuaHud(double afterSeconds = 0);
 // (2.5 s for a cold launch), then give the Space slide 180 ms to finish.
 constexpr int kFrontPollMs = 40, kFrontWaitMs = 900, kLaunchWaitMs = 2500, kSpaceSlideMs = 180;
 constexpr int kActivateSettleMs = 220;  // the fixed fallback when there is no frontmost signal
+// Closed loop: after a visible action, let the UI settle this long, then re-read the AX tree.
+constexpr int kObserveSettleMs = 200;
+constexpr int kObserveChars = 3500;      // observeApp's budget for formatted AX nodes
+constexpr int kPostActionChars = 2500;   // the post-action observation's budget
 
 struct CuaExecResult {
     bool ok = false;
-    QString tier;  // "L1_AX", "L3_VLM", "ERR"; scrollTarget's display-centre fallback is "CENTER"
+    QString tier;  // "L1_AX", "L3_VLM", "L1_OBS", "ERR"; scrollTarget's display-centre fallback is "CENTER"
     QPointF globalPt;
     QString detail;
+    // What the screen showed afterwards: formatted AX nodes (formatNodesForModel), never Lapis's
+    // own unless the target names Lapis. Empty when nothing was observed.
+    QString observation = {};
 };
 
 // Scores one AX node against a target description: 0 = no match. Exact title > exact value >
@@ -124,9 +133,14 @@ public:
     explicit CuaExecutor(CuaHooks hooks = defaultCuaHooks());
 
     CuaExecResult clickTarget(const QString &targetDesc, bool doubleClick = false, bool refineCrop = false);
-    CuaExecResult typeIntoTarget(const QString &targetDesc, const QString &text);
+    // Clicks the field, then (clearFirst) Cmd+A + Backspace so a retry replaces the old text
+    // instead of inserting into it, then types.
+    CuaExecResult typeIntoTarget(const QString &targetDesc, const QString &text, bool clearFirst = true);
     // Glides to the target (AX, then VLM, else the display centre), then scrolls there.
     CuaExecResult scrollTarget(const QString &targetDesc, int deltaY);
+    // No input: brings appHint forward (when given) and returns its display's AX tree as
+    // tier "L1_OBS" with observation = up to kObserveChars of formatted nodes, the app's first.
+    CuaExecResult observeApp(const QString &appHint);
 
     // L1 hits press through AXPress instead of a visible synthetic click (off by default, so
     // Chrome and native apps behave the same and the click shows on screen).
@@ -154,7 +168,12 @@ private:
     };
     // Activates the hinted app (waiting for it to come to the front) when activate is true; on a
     // single display, hides Lapis when it is still frontmost and the target does not name it.
-    bool route(const QString &targetDesc, bool activate, Route *out, QString *err);
+    // hintOverride names the app directly (observeApp's bare "Discord" or an unlisted app).
+    bool route(const QString &targetDesc, bool activate, Route *out, QString *err, const QString &hintOverride = {});
+    // The AX nodes on one display with Lapis's own dropped (unless allowed), the hinted app's first.
+    QVector<AxNode> visibleNodes(const Route &rt, uint32_t displayId) const;
+    // After a visible action: settle kObserveSettleMs, then format the routed display's nodes.
+    QString observeAfterAction(const Route &rt);
     // `verb` ("Clicking") builds the HUD status once the route is known.
     Located locate(const QString &targetDesc, bool refineCrop, const QString &label, const QString &verb,
                    Route *routeOut = nullptr);

@@ -2488,6 +2488,7 @@ bool Backend::contextPieces(const QString &projectKey, int artifactIndex, QStrin
 
 void Backend::clearAnswers()
 {
+    resetCuaLoop();  // the user dismissed the answer: no more automatic turns
     m_quickQuestion.clear();
     m_quickAnswer.clear();
     m_quickBusy = false;
@@ -2505,8 +2506,15 @@ void Backend::ask(const QString &projectKey, int artifactIndex, const QString &q
     if (q.isEmpty())
         return;
     m_commandProject = projectKey;
+    const bool followup = m_cuaFollowupAsk;
+    if (!followup) {
+        // A new question from the user: any closed CUA loop still running for the last one stops.
+        resetCuaLoop();
+        m_quickArtifact = artifactIndex;
+        m_quickNote = q;
+    }
     QString commandReply;
-    if (handleStudioCommand(q, projectKey, &commandReply)) {
+    if (!followup && handleStudioCommand(q, projectKey, &commandReply)) {
         // A UI command: it already ran; the answer strip shows its one-line confirmation.
         m_quickQuestion = q;
         m_quickAnswer = m_quickAnswerRaw = commandReply;
@@ -2522,7 +2530,8 @@ void Backend::ask(const QString &projectKey, int artifactIndex, const QString &q
         emit quickTick();
         return;
     }
-    m_quickQuestion = q;
+    if (!followup)
+        m_quickQuestion = q;  // a follow-up keeps showing the user's own question
     m_quickAnswer.clear();
     m_quickThinking.clear();
     m_quickAnswerRaw.clear();
@@ -2752,8 +2761,9 @@ void Backend::flushCodex(Channel *c)
 void Backend::finishQuick(bool ok)
 {
     if (ok && m_quickBusy) {
+        m_cuaAnswerStream.clear();
         runAnswerTags(&m_quickAnswer);  // a model's [[ACTION:..]] runs, and never shows as text
-        noteExchange(m_commandProject, m_quickModel, m_quickQuestion, m_quickAnswer);
+        noteExchange(m_commandProject, m_quickModel, m_quickNote.isEmpty() ? m_quickQuestion : m_quickNote, m_quickAnswer);
     }
     m_quickBusy = false;
     m_quickPhase.clear();
@@ -3041,13 +3051,16 @@ void Backend::onRouterFinished(const QString &streamId, const QString &error)
         QString answer = done.answer;
         const QString keep = m_commandProject;
         m_commandProject = done.projectKey;
+        m_cuaAnswerStream = streamId;
         runAnswerTags(&answer);  // the card strips the tag itself; the action runs here once
+        m_cuaAnswerStream.clear();
         m_commandProject = keep;
+        const QString userTurn = done.note.isEmpty() ? done.question : done.note;
         QVector<ChatTurn> &h = m_streamHistory[streamId];
-        h << ChatTurn{QStringLiteral("user"), done.question} << ChatTurn{QStringLiteral("assistant"), answer};
+        h << ChatTurn{QStringLiteral("user"), userTurn} << ChatTurn{QStringLiteral("assistant"), answer};
         while (h.size() > kMaxStreamHistory)
             h.remove(0, 2);  // drop the oldest exchange (re-prefills Tier 2 once)
-        noteExchange(done.projectKey, compatModel(), done.question, answer);
+        noteExchange(done.projectKey, compatModel(), userTurn, answer);
     }
     emit streamFinished(streamId, error);
 }
@@ -3079,8 +3092,11 @@ void Backend::startConversation(const QString &streamId, const QString &projectK
     const QString q = question.trimmed();
     if (streamId.isEmpty() || streamId == QLatin1String(kQuickStreamId) || q.isEmpty())
         return;
+    const bool followup = m_cuaFollowupAsk;
+    if (!followup)
+        resetCuaLoop();  // the user asked something new: a running CUA loop stops
     QString commandReply;
-    if (handleStudioCommand(q, projectKey, &commandReply)) {
+    if (!followup && handleStudioCommand(q, projectKey, &commandReply)) {
         // A UI command: done already; its confirmation is the whole answer, in any mode.
         emit streamDelta(streamId, commandReply, QString());
         emit streamFinished(streamId, QString());
@@ -3098,7 +3114,7 @@ void Backend::startConversation(const QString &streamId, const QString &projectK
     }
     // Tier 2 is the shared ring: every Studio exchange, whichever model or card answered it.
     const TieredPrompt p = tieredPrompt(projectKey, slice, q, m_sharedHistory);
-    m_streamAsks.insert(streamId, StreamAsk{q, QString(), projectKey});
+    m_streamAsks.insert(streamId, StreamAsk{q, QString(), projectKey, followup ? m_cuaFollowupNote : QString()});
     LlmStreamRequest req;
     req.streamId = streamId;
     req.endpoint = endpoint;
@@ -3131,6 +3147,8 @@ void Backend::cancelStream(const QString &streamId)
 {
     if (streamId.isEmpty() || streamId == QLatin1String(kQuickStreamId))
         return;
+    if (m_cuaBatch.streamId == streamId)
+        resetCuaLoop();  // the user stopped this conversation: no more automatic turns
     m_streamAsks.remove(streamId);
     if (m_router)
         m_router->cancelStream(streamId);
@@ -4483,7 +4501,38 @@ QStringList studioActionNames()
             QStringLiteral("spotify_volume"), QStringLiteral("focus_project"), QStringLiteral("open_stage"),
             QStringLiteral("open_ladder"),    QStringLiteral("go_home"),       QStringLiteral("sort_map"),
             QStringLiteral("move_cluster"),   QStringLiteral("cua_click"),     QStringLiteral("cua_type"),
-            QStringLiteral("cua_scroll")};
+            QStringLiteral("cua_scroll"),     QStringLiteral("cua_observe")};
+}
+
+QString cuaObservationPrompt(const QString &action, const QString &tier, bool ok, const QString &detail,
+                             const QString &observation)
+{
+    QString obs = observation.trimmed();
+    if (obs.isEmpty())
+        obs = QStringLiteral("(no accessibility nodes visible)");
+    return QStringLiteral("[CUA observation after %1 (%2, ok=%3, detail=%4)]:\n%5")
+        .arg(action, tier.isEmpty() ? QStringLiteral("ERR") : tier, ok ? QStringLiteral("1") : QStringLiteral("0"),
+             detail.simplified(), obs);
+}
+
+bool cuaShouldContinue(const QVector<CuaStepResult> &steps, int depth)
+{
+    if (depth >= kMaxCuaLoopDepth)
+        return false;
+    for (const CuaStepResult &s : steps)
+        if (s.action == QLatin1String("cua_observe") || !s.ok)
+            return true;
+    return false;
+}
+
+QString cuaFollowupPrompt(const QVector<CuaStepResult> &steps)
+{
+    QStringList blocks;
+    for (const CuaStepResult &s : steps)
+        blocks << cuaObservationPrompt(s.action + (s.target.isEmpty() ? QString() : QLatin1Char(':') + s.target), s.tier,
+                                       s.ok, s.detail, s.observation);
+    return blocks.join(QStringLiteral("\n\n"))
+           + QStringLiteral("\nContinue only if more actions are needed; otherwise give a concise final answer without cua_* tags.");
 }
 
 CuaCommand parseCuaAction(const QString &action, const QString &arg)
@@ -4516,6 +4565,10 @@ CuaCommand parseCuaAction(const QString &action, const QString &arg)
         else if (amount == QLatin1String("down"))
             c.deltaY = -5;
         c.valid = c.deltaY != 0;
+    } else if (a == QLatin1String("cua_observe")) {
+        c.kind = QStringLiteral("observe");
+        c.target = arg.simplified();  // the app to read; empty reads whatever is in front
+        c.valid = true;
     }
     return c;
 }
@@ -5135,18 +5188,29 @@ QString Backend::dispatchStudioAction(const QString &action, const QString &arg)
 
 QString Backend::startCuaAction(const QString &action, const CuaCommand &c)
 {
-    const QString verb = c.kind == QLatin1String("type")     ? QStringLiteral("Typing into %1").arg(c.target)
-                         : c.kind == QLatin1String("scroll") ? (c.target.isEmpty() ? QStringLiteral("Scrolling")
-                                                                                    : QStringLiteral("Scrolling %1").arg(c.target))
-                                                             : QStringLiteral("Clicking %1").arg(c.target);
+    const QString verb = c.kind == QLatin1String("type")      ? QStringLiteral("Typing into %1").arg(c.target)
+                         : c.kind == QLatin1String("scroll")  ? (c.target.isEmpty() ? QStringLiteral("Scrolling")
+                                                                                     : QStringLiteral("Scrolling %1").arg(c.target))
+                         : c.kind == QLatin1String("observe") ? (c.target.isEmpty() ? QStringLiteral("Reading the screen")
+                                                                                     : QStringLiteral("Reading %1").arg(c.target))
+                                                              : QStringLiteral("Clicking %1").arg(c.target);
     const QString logLine = action + QLatin1Char(':') + c.target
                             + (c.kind == QLatin1String("type")     ? QLatin1Char('|') + c.text
                                : c.kind == QLatin1String("scroll") ? QLatin1Char('|') + QString::number(c.deltaY)
                                                                    : QString());
+    // Inside a model answer's batch, the result feeds the closed loop (maybeFinishCuaBatch).
+    const bool inBatch = m_cuaBatch.open;
+    const quint64 batchId = m_cuaBatchId;
+    if (inBatch)
+        ++m_cuaBatch.outstanding;
     if (m_mode != Mode::Live) {
         // --test and every mock backend: record only, never capture, click or type.
         m_cuaLog << logLine;
         emit cuaActionFinished(action, c.target, true, QStringLiteral("MOCK"), QStringLiteral("recorded, not run"));
+        if (inBatch)
+            noteCuaResult(batchId, CuaStepResult{action, c.target, true, QStringLiteral("MOCK"), QStringLiteral("recorded, not run"),
+                                                 c.kind == QLatin1String("observe") ? QStringLiteral("(mock: no screen in --test)")
+                                                                                    : QString()});
         return verb + QStringLiteral(" (recorded, not run).");
     }
     if (!m_cuaPool) {
@@ -5157,14 +5221,15 @@ QString Backend::startCuaAction(const QString &action, const CuaCommand &c)
     if (m_cuaHud)
         studio::cua::showCuaHud(verb + QStringLiteral("\u2026"), studio::cua::HudTone::Working);
     QPointer<Backend> self(this);
-    m_cuaPool->start([self, action, c, logLine] {
+    m_cuaPool->start([self, action, c, logLine, inBatch, batchId] {
         studio::cua::CuaExecutor ex;
-        const studio::cua::CuaExecResult r = c.kind == QLatin1String("type")     ? ex.typeIntoTarget(c.target, c.text)
-                                             : c.kind == QLatin1String("scroll") ? ex.scrollTarget(c.target, c.deltaY)
-                                                                                 : ex.clickTarget(c.target);
+        const studio::cua::CuaExecResult r = c.kind == QLatin1String("type")      ? ex.typeIntoTarget(c.target, c.text)
+                                             : c.kind == QLatin1String("scroll")  ? ex.scrollTarget(c.target, c.deltaY)
+                                             : c.kind == QLatin1String("observe") ? ex.observeApp(c.target)
+                                                                                  : ex.clickTarget(c.target);
         QMetaObject::invokeMethod(
             QCoreApplication::instance(),
-            [self, action, target = c.target, logLine, r] {
+            [self, action, target = c.target, logLine, r, inBatch, batchId] {
                 if (!self)
                     return;
                 self->m_cuaPending = std::max(0, self->m_cuaPending - 1);
@@ -5172,6 +5237,9 @@ QString Backend::startCuaAction(const QString &action, const CuaCommand &c)
                 while (self->m_cuaLog.size() > 50)
                     self->m_cuaLog.removeFirst();
                 emit self->cuaActionFinished(action, target, r.ok, r.tier, r.detail);
+                if (inBatch)
+                    self->noteCuaResult(batchId, CuaStepResult{action, target, r.ok, r.ok ? r.tier : QStringLiteral("ERR"),
+                                                               r.detail, r.observation});
             },
             Qt::QueuedConnection);
     });
@@ -5216,8 +5284,83 @@ void Backend::runAnswerTags(QString *answer)
     }
     if (parsed.actions.isEmpty())
         return;
+    // Every cua_* action this answer starts joins one batch; when the last finishes, the batch
+    // may earn a follow-up turn (maybeFinishCuaBatch).
+    m_cuaBatch = CuaBatch{};
+    m_cuaBatch.open = true;
+    m_cuaBatch.streamId = m_cuaAnswerStream;
+    m_cuaBatch.projectKey = m_commandProject;
+    ++m_cuaBatchId;
     const QStringList replies = runStudioActions(parsed.actions);
+    m_cuaBatch.open = false;
     *answer = parsed.cleanText.isEmpty() ? replies.join(QLatin1Char(' ')) : parsed.cleanText;
+    maybeFinishCuaBatch();  // Mock (and an all-invalid batch) finished synchronously
+}
+
+QString Backend::runModelAnswer(const QString &answer)
+{
+    QString a = answer;
+    m_cuaAnswerStream.clear();
+    runAnswerTags(&a);
+    return a;
+}
+
+void Backend::resetCuaLoop()
+{
+    m_cuaBatch = CuaBatch{};
+    ++m_cuaBatchId;  // results of actions still running belong to nothing now
+    m_cuaLoopDepth = 0;
+    m_cuaFollowups.clear();
+}
+
+void Backend::noteCuaResult(quint64 batchId, const CuaStepResult &step)
+{
+    if (batchId != m_cuaBatchId)
+        return;  // a new prompt or a cancel came in while it ran
+    m_cuaBatch.steps << step;
+    m_cuaBatch.outstanding = std::max(0, m_cuaBatch.outstanding - 1);
+    maybeFinishCuaBatch();
+}
+
+void Backend::maybeFinishCuaBatch()
+{
+    if (m_cuaBatch.open || m_cuaBatch.outstanding > 0 || m_cuaBatch.steps.isEmpty())
+        return;
+    const QVector<CuaStepResult> steps = std::exchange(m_cuaBatch.steps, {});
+    if (studio::cua::cancelFlag.load()) {
+        resetCuaLoop();  // the user aborted computer use: stop here
+        return;
+    }
+    if (!cuaShouldContinue(steps, m_cuaLoopDepth))
+        return;
+    ++m_cuaLoopDepth;
+    const QString prompt = cuaFollowupPrompt(steps);
+    m_cuaFollowups << prompt;
+    if (m_mode != Mode::Live)
+        return;  // --test: recorded only; no model call, no network
+    QStringList heads;
+    for (const CuaStepResult &s : steps)
+        heads << cuaObservationPrompt(s.action + (s.target.isEmpty() ? QString() : QLatin1Char(':') + s.target), s.tier,
+                                      s.ok, s.detail, QStringLiteral("-"))
+                     .section(QLatin1Char('\n'), 0, 0);
+    const QString note = heads.join(QLatin1Char(' '));  // history keeps the headers, never the AX dump
+    const QString streamId = m_cuaBatch.streamId, project = m_cuaBatch.projectKey;
+    const quint64 id = m_cuaBatchId;
+    // Next event-loop turn: the answer that started this batch has been recorded by then.
+    QTimer::singleShot(0, this, [this, id, streamId, project, prompt, note] {
+        if (id != m_cuaBatchId)
+            return;  // reset (new question, cancel) in between
+        m_cuaFollowupAsk = true;
+        m_cuaFollowupNote = note;
+        if (streamId.isEmpty()) {
+            m_quickNote = note;
+            ask(project, m_quickArtifact, prompt);
+        } else {
+            startConversation(streamId, project, QString(), prompt);
+        }
+        m_cuaFollowupAsk = false;
+        m_cuaFollowupNote.clear();
+    });
 }
 
 QStringList Backend::runStudioActions(const QVector<StudioAction> &actions)

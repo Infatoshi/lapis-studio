@@ -331,6 +331,7 @@ CuaHooks defaultCuaHooks()
     h.clickAt = [](QPointF p, bool dbl) { return studio::cua::clickAt(p, dbl); };
     h.scrollAt = [](QPointF p, int dy) { return studio::cua::scrollAt(p, dy); };
     h.typeText = [](const QString &t) { return studio::cua::typeText(t); };
+    h.selectAllAndDelete = [] { return studio::cua::selectAllAndDelete(); };
     h.axPress = [](int pid, const QString &k, const QRectF &r) { return studio::cua::axPress(pid, k, r); };
     h.reticleMove = [](QPointF p, const QString &label) { runOnMainThread([&] { sharedReticle()->moveTo(p, label); }); };
     h.reticleHighlight = [](QRectF r, const QString &label) {
@@ -457,7 +458,7 @@ int bestAxMatch(const QVector<AxNode> &nodes, const QString &targetDesc)
 
 CuaExecutor::CuaExecutor(CuaHooks hooks) : m_hooks(std::move(hooks)) {}
 
-bool CuaExecutor::route(const QString &targetDesc, bool activate, Route *r, QString *err)
+bool CuaExecutor::route(const QString &targetDesc, bool activate, Route *r, QString *err, const QString &hintOverride)
 {
     *r = Route{};
     const QVector<DisplayInfo> displays = m_hooks.listDisplays ? m_hooks.listDisplays() : QVector<DisplayInfo>();
@@ -465,7 +466,7 @@ bool CuaExecutor::route(const QString &targetDesc, bool activate, Route *r, QStr
         *err = QStringLiteral("No display");
         return false;
     }
-    r->appHint = extractAppHint(targetDesc);
+    r->appHint = hintOverride.isEmpty() ? extractAppHint(targetDesc) : hintOverride;
     r->allowSelf = targetDesc.contains(QLatin1String("lapis"), Qt::CaseInsensitive);
     r->selfPid = m_hooks.selfPid ? m_hooks.selfPid() : 0;
     QVector<AppWindowInfo> windows = m_hooks.listAppWindows ? m_hooks.listAppWindows() : QVector<AppWindowInfo>();
@@ -703,7 +704,8 @@ CuaExecResult CuaExecutor::click(const QString &targetDesc, bool doubleClick, bo
         if (m_hooks.reticleHide)
             m_hooks.reticleHide();
         hudFail(target, {});
-        return {false, QStringLiteral("ERR"), {}, loc.detail};
+        // A miss shows the model what is there instead, so its next try names a real control.
+        return {false, QStringLiteral("ERR"), {}, loc.detail, observeAfterAction(rt)};
     }
     if (m_hooks.pause)
         m_hooks.pause(kGlideSettleMs);
@@ -722,12 +724,66 @@ CuaExecResult CuaExecutor::click(const QString &targetDesc, bool doubleClick, bo
         hudFail(target, QStringLiteral("Click failed · %1").arg(target));
         return {false, QStringLiteral("ERR"), loc.pt, QStringLiteral("%1: %2").arg(loc.tier, act.detail)};
     }
-    if (finish)
-        hud(QStringLiteral("Done · %1").arg(target), HudTone::Done);
-    return {true, loc.tier, loc.pt, loc.detail};
+    if (!finish)
+        return {true, loc.tier, loc.pt, loc.detail};
+    hud(QStringLiteral("Done · %1").arg(target), HudTone::Done);
+    return {true, loc.tier, loc.pt, loc.detail, observeAfterAction(rt)};
 }
 
-CuaExecResult CuaExecutor::typeIntoTarget(const QString &targetDesc, const QString &text)
+QVector<AxNode> CuaExecutor::visibleNodes(const Route &rt, uint32_t displayId) const
+{
+    if (!m_hooks.inspectDisplay || !displayId)
+        return {};
+    QVector<AxNode> nodes = m_hooks.inspectDisplay(displayId);
+    if (rt.selfPid > 0 && !rt.allowSelf)
+        nodes.erase(std::remove_if(nodes.begin(), nodes.end(), [&](const AxNode &n) { return n.pid == rt.selfPid; }),
+                    nodes.end());
+    if (!rt.appHint.isEmpty())
+        std::stable_partition(nodes.begin(), nodes.end(),
+                              [&](const AxNode &n) { return appNameMatches(n.appName, rt.appHint); });
+    return nodes;
+}
+
+QString CuaExecutor::observeAfterAction(const Route &rt)
+{
+    if (!m_hooks.inspectDisplay || rt.displays.isEmpty())
+        return {};
+    if (m_hooks.pause)
+        m_hooks.pause(kObserveSettleMs);  // let the click / keystrokes repaint before reading
+    return formatNodesForModel(visibleNodes(rt, rt.displays.first().displayId), kPostActionChars);
+}
+
+CuaExecResult CuaExecutor::observeApp(const QString &appHint)
+{
+    const QString raw = appHint.simplified();
+    QString hint = extractAppHint(raw);
+    if (hint.isEmpty())
+        hint = raw;  // an app the hint table does not list: activate it by name anyway
+    Route rt;
+    QString err;
+    if (!route(raw, !hint.isEmpty(), &rt, &err, hint)) {
+        hudFail(raw, QStringLiteral("Observe failed · %1").arg(err));
+        return {false, QStringLiteral("ERR"), {}, err};
+    }
+    hud(hudScope(rt.appHint) + QStringLiteral("Reading the screen"), HudTone::Working);
+    const DisplayInfo display = rt.displays.first();
+    const QVector<AxNode> nodes = visibleNodes(rt, display.displayId);
+    CuaExecResult r{true, QStringLiteral("L1_OBS"), display.globalPoints.center(), {}};
+    r.observation = formatNodesForModel(nodes, kObserveChars);
+    qsizetype inApp = 0;
+    if (!rt.appHint.isEmpty())
+        inApp = std::count_if(nodes.begin(), nodes.end(), [&](const AxNode &n) { return appNameMatches(n.appName, rt.appHint); });
+    r.detail = rt.appHint.isEmpty() ? QStringLiteral("%1 AX nodes on display %2").arg(nodes.size()).arg(display.displayId)
+                                    : QStringLiteral("%1 AX nodes on display %2 (%3 in %4)")
+                                          .arg(nodes.size())
+                                          .arg(display.displayId)
+                                          .arg(inApp)
+                                          .arg(rt.appHint);
+    hud(QStringLiteral("Done · Read %1").arg(rt.appHint.isEmpty() ? QStringLiteral("the screen") : rt.appHint), HudTone::Done);
+    return r;
+}
+
+CuaExecResult CuaExecutor::typeIntoTarget(const QString &targetDesc, const QString &text, bool clearFirst)
 {
     const QString typed = normalizeTypedText(text);
     if (typed.isEmpty())
@@ -739,6 +795,14 @@ CuaExecResult CuaExecutor::typeIntoTarget(const QString &targetDesc, const QStri
     hud(hudScope(rt.appHint) + QStringLiteral("Typing %1").arg(typedPreview(typed)), HudTone::Working);
     if (m_hooks.pause)
         m_hooks.pause(kPulseLeadMs);  // let the field take focus
+    if (clearFirst && m_hooks.selectAllAndDelete) {
+        // A retry ("John" after "John Gout") replaces the field instead of typing into it.
+        const ActionResult c = m_hooks.selectAllAndDelete();
+        if (!c.ok) {
+            hudFail(targetDesc, QStringLiteral("Clearing failed · %1").arg(targetDesc.simplified()));
+            return {false, QStringLiteral("ERR"), r.globalPt, QStringLiteral("Clearing failed: %1").arg(c.detail)};
+        }
+    }
     const ActionResult t = m_hooks.typeText ? m_hooks.typeText(typed) : ActionResult{false, QStringLiteral("No typist")};
     if (!t.ok) {
         hudFail(targetDesc, QStringLiteral("Typing failed · %1").arg(targetDesc.simplified()));
@@ -748,6 +812,7 @@ CuaExecResult CuaExecutor::typeIntoTarget(const QString &targetDesc, const QStri
     if (typed.contains(QLatin1Char('\n')))
         r.detail += QStringLiteral(" + Return");
     hud(QStringLiteral("Done · Typed %1").arg(typedPreview(typed)), HudTone::Done);
+    r.observation = observeAfterAction(rt);
     return r;
 }
 
@@ -791,7 +856,7 @@ CuaExecResult CuaExecutor::scrollTarget(const QString &targetDesc, int deltaY)
         return {false, QStringLiteral("ERR"), loc.pt, QStringLiteral("Scroll failed: %1").arg(s.detail)};
     }
     hud(target.isEmpty() ? QStringLiteral("Done · Scrolled") : QStringLiteral("Done · Scrolled %1").arg(target), HudTone::Done);
-    return {true, loc.tier, loc.pt, loc.detail};
+    return {true, loc.tier, loc.pt, loc.detail, observeAfterAction(rt)};
 }
 
 }  // namespace studio::cua

@@ -93,6 +93,8 @@ ActionResult scrollAt(QPointF globalPt, int deltaY);
 // '\n' (and "\r\n" / '\r') posts a real Return key (keycode 36) instead of a newline character,
 // so address bars and search fields submit.
 ActionResult typeText(const QString &text);
+// Cmd+A, ~25 ms, then Backspace: clears the focused field before typing. Honours cancelFlag.
+ActionResult selectAllAndDelete();
 // Caller latches true on abort and explicitly resets before a new operation.
 // A posted mouse/key down is always balanced by an up, even on cancellation.
 extern std::atomic<bool> cancelFlag;

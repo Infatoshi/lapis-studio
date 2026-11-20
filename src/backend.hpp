@@ -227,6 +227,23 @@ struct CuaCommand {
     bool valid = false;
 };
 CuaCommand parseCuaAction(const QString &action, const QString &arg);
+// Closed-loop computer use: one finished cua_* action as the model sees it next turn.
+struct CuaStepResult {
+    QString action;  // "cua_click", "cua_observe", ...
+    QString target;
+    bool ok = false;
+    QString tier, detail, observation;
+};
+// At most this many automatic follow-up turns per user prompt.
+constexpr int kMaxCuaLoopDepth = 4;
+// "[CUA observation after <action> (<tier>, ok=<0|1>, detail=<detail>)]:\n<observation>".
+QString cuaObservationPrompt(const QString &action, const QString &tier, bool ok, const QString &detail,
+                             const QString &observation);
+// A batch earns a follow-up turn when it read the screen (cua_observe) or an action failed,
+// and fewer than kMaxCuaLoopDepth follow-ups have run for this prompt.
+bool cuaShouldContinue(const QVector<CuaStepResult> &steps, int depth);
+// Every step's observation block, then the "Continue only if more actions are needed" line.
+QString cuaFollowupPrompt(const QVector<CuaStepResult> &steps);
 // The Constellation cluster a project sits in: "Work" (the infinity category), "Apps" (apps),
 // "Quick Qs" (a ~tab: island, a scratch-dir session, or the quick Qs category), else "Projects".
 QString mapClusterFor(const QString &key, const QString &category, const QString &dir);
@@ -670,8 +687,37 @@ public:
     // Mock mode: every cua_* action recorded instead of run ("cua_click:Send"); Live: finished ones.
     QStringList cuaLog() const { return m_cuaLog; }
     int cuaPending() const { return m_cuaPending; }
+    // Closed-loop computer use: automatic follow-up turns run for the current user prompt
+    // (<= kMaxCuaLoopDepth; every new ask, clearAnswers or a cancel resets it to 0).
+    int cuaLoopDepth() const { return m_cuaLoopDepth; }
+    // The follow-up prompts issued for the current user prompt. Mock records them and never
+    // sends: no model, no network, no screen.
+    QStringList cuaFollowups() const { return m_cuaFollowups; }
+    // Runs a finished quick answer's [[ACTION:..]] tags exactly as finishQuick does (the closed
+    // CUA loop included) and returns the cleaned answer.
+    QString runModelAnswer(const QString &answer);
 
 private:
+    // One model answer's cua_* actions, gathered until the last one finishes.
+    struct CuaBatch {
+        bool open = false;  // runAnswerTags is still dispatching it
+        QString streamId;   // the conversation stream that answered; "" = the quick ask
+        QString projectKey;
+        int outstanding = 0;
+        QVector<CuaStepResult> steps;
+    };
+    CuaBatch m_cuaBatch;
+    quint64 m_cuaBatchId = 0;  // bumped per batch and per reset: a stale action's result is dropped
+    int m_cuaLoopDepth = 0;
+    QStringList m_cuaFollowups;
+    bool m_cuaFollowupAsk = false;  // ask() / startConversation are carrying a follow-up, not the user
+    QString m_cuaFollowupNote;      // the compact user turn a follow-up leaves in the history
+    QString m_cuaAnswerStream;      // which stream runAnswerTags is handling ("" = the quick ask)
+    int m_quickArtifact = -1;       // the user ask's artifact, reused by its follow-ups
+    QString m_quickNote;            // the user turn finishQuick records (follow-ups: compact header)
+    void resetCuaLoop();
+    void noteCuaResult(quint64 batchId, const CuaStepResult &step);
+    void maybeFinishCuaBatch();
     // Live: runs a CuaExecutor on m_cuaPool (one action at a time, never the GUI thread).
     QString startCuaAction(const QString &action, const CuaCommand &c);
     QThreadPool *m_cuaPool = nullptr;
@@ -826,8 +872,9 @@ private:
         QString question;
         QString answer;
         QString projectKey;
+        QString note;  // the user turn recorded in history (a CUA follow-up's compact header)
     };
-    QHash<QString, StreamAsk> m_streamAsks;               // in-flight askStream ids
+    QHash<QString, StreamAsk> m_streamAsks;              // in-flight askStream ids
     QHash<QString, QVector<ChatTurn>> m_streamHistory;    // Tier 2 per conversation stream
     QPointer<QNetworkReply> m_suggestReply;
     QPointer<QNetworkReply> m_briefingReply;

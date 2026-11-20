@@ -5,6 +5,7 @@
 #include <QElapsedTimer>
 #include <QTimer>
 
+#import <AppKit/AppKit.h>
 #import <CoreGraphics/CoreGraphics.h>
 #import <Foundation/Foundation.h>
 #import <GameController/GameController.h>
@@ -47,6 +48,7 @@ struct Gamepad::Platform {
     GCController *pad = nil;  // the controller we read (first with an extended profile)
     QTimer poll;
     QElapsedTimer clock;
+    bool bgDpadHeld = false;  // consumes one D-pad press to summon Lapis Studio when backgrounded
 
     explicit Platform(Gamepad *owner) : q(owner)
     {
@@ -133,6 +135,20 @@ struct Gamepad::Platform {
         s.ry = g.rightThumbstick.yAxis.value;
         s.dpadX = g.dpad.right.pressed ? 1 : (g.dpad.left.pressed ? -1 : 0);
         s.dpadY = g.dpad.up.pressed ? 1 : (g.dpad.down.pressed ? -1 : 0);
+        const bool dpadDown = (s.dpadX != 0 || s.dpadY != 0);
+        if (NSApp && ![NSApp isActive]) {
+            if (dpadDown && !bgDpadHeld) {
+                bgDpadHeld = true;
+                [NSApp unhide:nil];
+                [NSApp activateIgnoringOtherApps:YES];
+            }
+            if (dpadDown || bgDpadHeld) {
+                s.dpadX = 0;
+                s.dpadY = 0;
+            }
+        }
+        if (!dpadDown)
+            bgDpadHeld = false;
         s.a = g.buttonA.pressed;
         s.b = g.buttonB.pressed;
         s.x = g.buttonX.pressed;

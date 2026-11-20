@@ -20,9 +20,13 @@ const QString kCompatSystemPrompt = QStringLiteral(
     "sort_map:category|recent|activity, move_cluster:<Work|Projects|Apps|Quick Qs>:<left|right|top|bottom>, "
     "spawn_agent:<task> to start a new coding agent, steer_agent:<message> or steer_agent:<project>|<message> to "
     "send a message directly into an existing agent's session, cua_click:<on-screen target>, "
-    "cua_type:<target>|<text>, cua_scroll:<target>|<deltaY> to operate the Mac visibly). Several tags may go in one answer. "
+    "cua_type:<target>|<text>, cua_scroll:<target>|<deltaY> to operate the Mac visibly, cua_observe:<app> or "
+    "cua_observe to read an app's live on-screen controls). Several tags may go in one answer. "
     "Name the app in every cua target and end typed text with \\n to submit a URL or search, "
-    "e.g. [[ACTION:cua_type:Chrome address bar|x.com\\n]]. "
+    "e.g. [[ACTION:cua_type:Chrome address bar|x.com\\n]]; cua_type replaces the field's text. "
+    "When you do not know an app's layout (a DM list, a search bar), emit [[ACTION:cua_observe:Discord]] first and "
+    "stop: the app's controls come back in a follow-up turn, and after a failed action you see the screen too. "
+    "Click and type only targets you saw there; when the task is done, answer without cua tags. "
     "Never say you are steering, messaging, spawning, or starting an agent unless the same answer emits "
     "[[ACTION:steer_agent:...]] or [[ACTION:spawn_agent:<task>]]; the tag is what runs it, the words alone do nothing.");
 

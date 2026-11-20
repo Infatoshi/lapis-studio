@@ -176,6 +176,7 @@ struct MockRig {
     bool clickDouble = false;
     int scrollDy = 0;
     QString typed;
+    bool clearOk = true;
     // Multi-monitor: per-display AX nodes (falls back to `nodes`), on-screen windows, activation.
     QMap<uint32_t, QVector<AxNode>> nodesByDisplay;
     QVector<AppWindowInfo> windows;
@@ -236,6 +237,7 @@ struct MockRig {
         h.clickAt = [this](QPointF p, bool dbl) { calls << "click"; clickPt = p; clickDouble = dbl; return ActionResult{true, "ok"}; };
         h.scrollAt = [this](QPointF p, int dy) { calls << "scroll"; scrollPt = p; scrollDy = dy; return ActionResult{true, "ok"}; };
         h.typeText = [this](const QString &t) { calls << "type"; typed = t; return ActionResult{true, "ok"}; };
+        h.selectAllAndDelete = [this] { calls << "clear"; return ActionResult{clearOk, clearOk ? "Cleared" : "denied"}; };
         h.axPress = [this](int, const QString &, const QRectF &) { calls << "axPress"; return ActionResult{true, "ok"}; };
         h.reticleMove = [this](QPointF p, const QString &) { calls << "reticleMove"; movePt = p; };
         h.reticleHighlight = [this](QRectF r, const QString &) { calls << "reticleHighlight"; highlightRect = r; };
@@ -261,6 +263,7 @@ struct MockRig {
 AxNode axNode(int id, const QString &role, const QString &title, QRectF rect, const QString &value = {}) {
     return AxNode{id, role, title, value, "Example", 100 + id, rect, {"AXPress"}};
 }
+MockRig dualMonitorRig();
 void executorTests() {
     // Matching.
     const QRectF r(100, 200, 80, 30);
@@ -384,11 +387,108 @@ void executorTests() {
         CuaExecutor ex(m.hooks());
         const auto res = ex.typeIntoTarget("search", "hello world");
         check(res.ok && res.tier == "L1_AX" && m.typed == "hello world", "exec type: ok, text typed");
-        check(m.effects() == QStringList({"reticleHighlight", "reticlePulse", "click", "type"}), "exec type: highlight -> pulse -> click -> type");
+        check(m.effects() == QStringList({"reticleHighlight", "reticlePulse", "click", "clear", "type"}),
+            "exec type: highlight -> pulse -> click -> clear -> type");
         MockRig f;
         f.ground.ok = false;
         CuaExecutor exf(f.hooks());
-        check(!exf.typeIntoTarget("missing", "secret").ok && !f.calls.contains("type"), "exec type: no typing after a failed click");
+        check(!exf.typeIntoTarget("missing", "secret").ok && !f.calls.contains("type") && !f.calls.contains("clear"),
+            "exec type: no clearing or typing after a failed click");
+    }
+
+    // Clear-before-type: a retry replaces "John Gout" instead of inserting "John" into it.
+    {
+        MockRig m;
+        m.nodes = {axNode(1, "AXTextField", "Search", {50, 60, 300, 28})};
+        CuaExecutor ex(m.hooks());
+        check(ex.typeIntoTarget("search", "John").ok, "clear: type ok");
+        const qsizetype clearAt = m.calls.indexOf("clear"), typeAt = m.calls.indexOf("type");
+        check(clearAt >= 0 && typeAt > clearAt && m.calls.count("clear") == 1, "clear: Cmd+A/Backspace runs once, before typing");
+        check(clearAt > m.calls.indexOf("click") && m.pauses.indexOf("60") >= 0, "clear: after the click and the focus beat");
+        MockRig n;
+        n.nodes = m.nodes;
+        CuaExecutor exn(n.hooks());
+        check(exn.typeIntoTarget("search", "John", false).ok && !n.calls.contains("clear") && n.calls.contains("type"),
+            "clear: clearFirst=false skips the clear");
+        MockRig d;
+        d.nodes = m.nodes;
+        d.clearOk = false;
+        CuaExecutor exd(d.hooks());
+        const auto bad = exd.typeIntoTarget("search", "John");
+        check(!bad.ok && !d.calls.contains("type") && bad.detail.contains("Clearing failed"),
+            "clear: a failed clear never types into a dirty field");
+        MockRig u;
+        u.nodes = m.nodes;
+        CuaHooks noClear = u.hooks();
+        noClear.selectAllAndDelete = nullptr;
+        CuaExecutor exu(noClear);
+        check(exu.typeIntoTarget("search", "John").ok && u.typed == "John", "clear: an unset hook is a no-op");
+    }
+
+    // Post-action observation: after a click, the planner sees the display's AX tree again.
+    {
+        MockRig m;
+        m.selfPid = 500;
+        m.nodes = {axNode(1, "AXButton", "Send", {400, 300, 120, 40}),
+                   AxNode{9, "AXButton", "Lapis secret", {}, "lapis_studio", 500, {10, 10, 80, 20}, {"AXPress"}}};
+        CuaExecutor ex(m.hooks());
+        const auto res = ex.clickTarget("Send");
+        check(res.ok && res.observation.contains("\"title\":\"Send\""), "observe: clickTarget fills observation");
+        check(!res.observation.contains("Lapis secret"), "observe: Lapis's own nodes are left out");
+        check(m.pauses.contains(QString::number(kObserveSettleMs)) && m.inspected().size() == 2
+                  && m.calls.lastIndexOf("inspectDisplay:7") > m.calls.indexOf("click"),
+            "observe: settles, then re-reads the display after the click");
+        check(res.observation.size() <= kPostActionChars, "observe: post-action budget");
+        const auto typed = ex.typeIntoTarget("Send", "x");
+        check(typed.ok && !typed.observation.isEmpty(), "observe: typeIntoTarget fills observation");
+        const auto scrolled = ex.scrollTarget("Send", -3);
+        check(scrolled.ok && !scrolled.observation.isEmpty(), "observe: scrollTarget fills observation");
+        MockRig f;
+        f.ground.ok = false;
+        f.nodes = {axNode(2, "AXButton", "Compose", {400, 300, 120, 40})};
+        CuaExecutor exf(f.hooks());
+        const auto miss = exf.clickTarget("Send");
+        check(!miss.ok && miss.observation.contains("Compose"), "observe: a miss still shows the model what is there");
+    }
+
+    // observeApp: activates the app, reads its display, Lapis filtered, the app's nodes first.
+    {
+        MockRig m = dualMonitorRig();
+        m.activateOk = true; m.activateDisplay = 2; m.activatePid = 700;
+        m.windowsAfterActivate = {{500, "lapis_studio", 1, {0, 0, 1920, 1080}, true},
+                                  {700, "Discord", 2, {1920, 25, 1920, 1055}, true}};
+        m.nodesByDisplay[1] = {AxNode{1, "AXTextField", "Ask Lapis", {}, "lapis_studio", 500, {10, 10, 300, 30}, {}}};
+        m.nodesByDisplay[2] = {AxNode{2, "AXButton", "Dock item", {}, "Dock", 300, {1930, 1040, 40, 40}, {"AXPress"}},
+                               AxNode{3, "AXTextField", "Find or start a conversation", {}, "Discord", 700, {1940, 40, 240, 28}, {}},
+                               AxNode{4, "AXStaticText", "John Gout", {}, "Discord", 700, {1940, 90, 200, 20}, {}},
+                               AxNode{5, "AXTextField", "Lapis overlay", {}, "lapis_studio", 500, {2000, 500, 50, 20}, {}}};
+        CuaExecutor ex(m.hooks());
+        const auto r = ex.observeApp("Discord");
+        check(r.ok && r.tier == "L1_OBS", "observeApp: ok, tier L1_OBS");
+        check(m.calls.contains("activate:Discord") && m.inspected().value(0) == "2", "observeApp: activates Discord, reads its display");
+        check(r.observation.contains("Find or start a conversation") && r.observation.contains("John Gout"),
+            "observeApp: Discord's search bar and DM list reach the model");
+        check(!r.observation.contains("lapis_studio") && !r.observation.contains("Ask Lapis"), "observeApp: selfPid filtered out");
+        check(r.observation.indexOf("Discord") < r.observation.indexOf("Dock item"), "observeApp: the app's nodes come first");
+        check(r.observation.size() <= kObserveChars && r.detail.contains("Discord"), "observeApp: budget and detail");
+        check(!m.calls.contains("click") && !m.calls.contains("type") && !m.calls.contains("capture"),
+            "observeApp: reads only, no input, no capture");
+        std::printf("observeApp detail: %s\n", qPrintable(r.detail));
+    }
+    {
+        // Naming Lapis keeps Lapis's own nodes.
+        MockRig m;
+        m.selfPid = 500;
+        m.nodes = {AxNode{1, "AXTextField", "Ask Lapis", {}, "lapis_studio", 500, {10, 10, 300, 30}, {}}};
+        CuaExecutor ex(m.hooks());
+        check(ex.observeApp("Lapis").observation.contains("Ask Lapis"), "observeApp: naming Lapis keeps its nodes");
+        MockRig e;
+        e.selfPid = 500;
+        e.nodes = m.nodes;
+        CuaExecutor exe(e.hooks());
+        const auto bare = exe.observeApp("");
+        check(bare.ok && bare.observation.isEmpty() && !e.calls.join(",").contains("activate"),
+            "observeApp: no app reads the front display without activating, Lapis filtered");
     }
 
     // scrollTarget: glide to the target, then scroll there; centre fallback when it is not found.
@@ -487,8 +587,8 @@ void multiMonitorTests() {
         check(m.typed == "x.com\n" && res.detail.contains("Return"), "multi L1: typed x.com then Return");
         check(m.calls.contains("activate:Chrome") && m.pauses.contains("220"), "multi L1: Chrome activated, 220 ms settle");
         check(m.inspected().value(0) == "2", "multi L1: the Chrome display is inspected first");
-        check(m.effects() == QStringList({"activate:Chrome", "reticleHighlight", "reticlePulse", "click", "type"}),
-            "multi L1: activate -> highlight -> pulse -> click -> type");
+        check(m.effects() == QStringList({"activate:Chrome", "reticleHighlight", "reticlePulse", "click", "clear", "type"}),
+            "multi L1: activate -> highlight -> pulse -> click -> clear -> type");
     }
     {
         // No hint: Lapis's matching node is never a candidate; the other display is searched first.

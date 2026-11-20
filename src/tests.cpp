@@ -5107,6 +5107,60 @@ void studioControlTests()
               "cua: an invalid cua arg is not dispatched");
         check(kCompatSystemPrompt.contains("cua_click:<on-screen target>"), "cua: the system prompt teaches the cua tags");
     }
+
+    // --- Closed-loop computer use: cua_observe and the bounded follow-up turns ---------------------
+    {
+        QString a = QStringLiteral("[[ACTION:cua_observe:Discord]] [[ACTION:cua_observe]] Looking.");
+        const QList<StudioCommand> tags = extractActionTags(&a);
+        check(tags.size() == 2 && tags[0].action == "cua_observe" && tags[0].arg == "Discord" && tags[1].action == "cua_observe"
+                  && tags[1].arg.isEmpty() && a == "Looking.",
+              "cua loop: [[ACTION:cua_observe:Discord]] and bare cua_observe are known tags", a);
+        const CuaCommand obs = parseCuaAction("cua_observe", " Discord ");
+        check(obs.valid && obs.kind == "observe" && obs.target == "Discord", "cua loop: cua_observe:Discord parses to observe Discord");
+        check(parseCuaAction("cua_observe", "").valid && parseCuaAction("cua_observe", "").target.isEmpty(),
+              "cua loop: bare cua_observe reads the front display");
+        check(kCompatSystemPrompt.contains("cua_observe:<app>") && kCompatSystemPrompt.contains("[[ACTION:cua_observe:Discord]]"),
+              "cua loop: the system prompt teaches cua_observe");
+
+        const CuaStepResult seen{"cua_observe", "Discord", true, "L1_OBS", "12 AX nodes", "{\"title\":\"John Gout\"}"};
+        const CuaStepResult clicked{"cua_click", "Send", true, "L1_AX", "AXButton \"Send\"", "{}"};
+        const CuaStepResult missed{"cua_click", "Ghost", false, "ERR", "No AX match", "{}"};
+        check(cuaShouldContinue({seen}, 0) && cuaShouldContinue({clicked, missed}, 3) && !cuaShouldContinue({clicked}, 0),
+              "cua loop: observe or a failure continues; a clean action batch stops");
+        check(!cuaShouldContinue({seen}, kMaxCuaLoopDepth) && !cuaShouldContinue({missed}, kMaxCuaLoopDepth + 3) && kMaxCuaLoopDepth == 4,
+              "cua loop: never past depth 4");
+        const QString p = cuaFollowupPrompt({seen});
+        check(p.startsWith("[CUA observation after cua_observe:Discord (L1_OBS, ok=1, detail=12 AX nodes)]:\n{\"title\":\"John Gout\"}")
+                  && p.endsWith("Continue only if more actions are needed; otherwise give a concise final answer without cua_* tags."),
+              "cua loop: the follow-up prompt carries the action, tier, ok, detail and observation", p);
+        check(cuaFollowupPrompt({missed}).contains("(ERR, ok=0, detail=No AX match)"), "cua loop: a failure reads ok=0");
+
+        Backend b(Backend::Mode::Mock);
+        check(b.runModelAnswer("[[ACTION:cua_click:Send button]]").contains("Clicking Send button") && b.cuaLoopDepth() == 0
+                  && b.cuaFollowups().isEmpty(),
+              "cua loop: a clean click batch earns no follow-up");
+        b.runModelAnswer("[[ACTION:cua_observe:Discord]]");
+        check(b.cuaLoopDepth() == 1 && b.cuaFollowups().size() == 1
+                  && b.cuaFollowups()[0].startsWith("[CUA observation after cua_observe:Discord (MOCK, ok=1")
+                  && b.cuaLog().contains("cua_observe:Discord"),
+              "cua loop: cua_observe earns one follow-up turn", b.cuaFollowups().join(" | "));
+        check(!b.quickBusy() && b.quickQuestion().isEmpty(), "cua loop: mock records the follow-up and never sends it");
+        int maxDepth = b.cuaLoopDepth();
+        for (int i = 0; i < 8; ++i) {
+            b.runModelAnswer("[[ACTION:cua_observe:Discord]] [[ACTION:cua_type:Discord search|John]]");
+            maxDepth = std::max(maxDepth, b.cuaLoopDepth());
+        }
+        check(maxDepth <= kMaxCuaLoopDepth && b.cuaLoopDepth() == 4 && b.cuaFollowups().size() == 4,
+              "cua loop: m_cuaLoopDepth caps at 4 follow-ups per prompt", QString::number(b.cuaLoopDepth()));
+        b.runModelAnswer("Done: John Gout's DM is open.");
+        check(b.cuaLoopDepth() == 4 && b.cuaFollowups().size() == 4, "cua loop: an answer without cua tags ends the loop");
+        b.clearAnswers();
+        check(b.cuaLoopDepth() == 0 && b.cuaFollowups().isEmpty(), "cua loop: dismissing the answer resets the depth");
+        b.runModelAnswer("[[ACTION:cua_observe:Discord]]");
+        check(b.cuaLoopDepth() == 1, "cua loop: a fresh prompt loops again");
+        b.ask(QString(), -1, QStringLiteral("what is the weather like on mars"));
+        check(b.cuaLoopDepth() == 0 && b.cuaFollowups().isEmpty(), "cua loop: a new user question resets the depth");
+    }
     check(kCompatSystemPrompt.contains("[[ACTION:") && kCompatSystemPrompt.contains("1-3 crisp sentences"),
           "studio cmd: the system prompt teaches [[ACTION:..]] and short answers");
 

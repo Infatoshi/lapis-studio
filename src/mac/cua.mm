@@ -608,4 +608,26 @@ ActionResult typeText(const QString &text) {
     }
     return cancelFlag.load() ? cancelled() : ActionResult{true, "Text posted"};
 }
+ActionResult selectAllAndDelete() {
+    if (cancelFlag.load()) return cancelled();
+    std::unique_lock lock(actuator, std::defer_lock);
+    if (!acquire(lock)) return cancelled();
+    if (!AXIsProcessTrusted()) return {false, "Accessibility permission is required"};
+    // One key press with explicit flags; the up is always posted once the down went out.
+    const auto press = [](CGKeyCode key, CGEventFlags flags) -> ActionResult {
+        CF<CGEventRef> down(CGEventCreateKeyboardEvent(nullptr, key, true));
+        CF<CGEventRef> up(CGEventCreateKeyboardEvent(nullptr, key, false));
+        if (!down || !up) return {false, "Cannot create keyboard events"};
+        CGEventSetFlags(down.get(), flags);
+        CGEventSetFlags(up.get(), flags);
+        if (!post(down.get())) return cancelled();
+        CGEventPost(kCGHIDEventTap, up.get());
+        return {true, {}};
+    };
+    if (const ActionResult a = press(CGKeyCode(0), kCGEventFlagMaskCommand); !a.ok) return a;  // Cmd+A
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    if (cancelFlag.load()) return cancelled();
+    if (const ActionResult d = press(CGKeyCode(51), CGEventFlags(0)); !d.ok) return d;  // Backspace
+    return cancelFlag.load() ? cancelled() : ActionResult{true, "Cleared"};
+}
 } // namespace studio::cua
