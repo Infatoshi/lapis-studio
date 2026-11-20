@@ -325,6 +325,17 @@ void hideCuaHud(double afterSeconds)
     runOnMainThread([&] { sharedReticle()->hideHud(afterSeconds); });
 }
 
+QVector<uint32_t> overlayWindowIds()
+{
+    QVector<uint32_t> ids;
+    runOnMainThread([&] {
+        for (const uint32_t id : {sharedReticle()->windowNumber(), sharedReticle()->hudWindowNumber()})
+            if (id)
+                ids.push_back(id);
+    });
+    return ids;
+}
+
 CuaHooks defaultCuaHooks()
 {
     CuaHooks h;

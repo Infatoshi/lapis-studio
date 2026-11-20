@@ -1,6 +1,7 @@
 #include "mac/cua.hpp"
 #include "mac/cua_reticle.hpp"
 #include "mac/cua_executor.hpp"
+#include "mac/cua_shadow.hpp"
 #include <QCoreApplication>
 #include <QDateTime>
 #include <QDir>
@@ -1066,9 +1067,151 @@ void traceTests() {
             "trace cap: keeps the newest 2 steps (4 frames), deletes the rest");
     }
 }
+// Human-click shadow recorder: recordClickSample against fake displays / AX / capture.
+struct ShadowRig {
+    QVector<DisplayInfo> displays{{7, "primary", {0, 0, 1440, 900}, 2, true}, {9, "side", {1440, 0, 1920, 1080}, 1, false}};
+    // Chrome / Electron shape: empty AXTitle, the name in AXDescription.
+    ShadowAxHit hit{true, "AXButton", "", "", "Send", "Example", 321, {400, 300, 120, 40}};
+    QByteArray jpeg = "fake-jpeg";
+    int captures = 0;
+    uint32_t capturedDisplay = 0;
+    int capturedWidth = 0;
+    ShadowHooks hooks() {
+        ShadowHooks h;
+        h.listDisplays = [this] { return displays; };
+        h.elementAt = [this](QPointF) { return hit; };
+        h.captureJpeg = [this](uint32_t id, int w) { ++captures; capturedDisplay = id; capturedWidth = w; return jpeg; };
+        h.selfPid = 999;
+        return h;
+    }
+};
+QVector<QJsonObject> humanLines(const QString &dir) {
+    QFile f(dir + "/human_traces.jsonl");
+    QVector<QJsonObject> out;
+    if (!f.open(QIODevice::ReadOnly)) return out;
+    for (const QByteArray &l : f.readAll().split('\n'))
+        if (!l.trimmed().isEmpty()) out << QJsonDocument::fromJson(l).object();
+    return out;
+}
+void shadowTests() {
+    const qint64 t0 = 1763600000000;  // fixed ms, so frame names are deterministic
+    // Left click on the primary Retina display: one line, point_1000 + bbox_1000, one frame.
+    {
+        QTemporaryDir tmp;
+        ShadowRig r;
+        const auto res = recordClickSample(tmp.path(), {{460, 320}, false, t0}, r.hooks());
+        const auto lines = humanLines(tmp.path());
+        check(res.outcome == ShadowOutcome::Recorded && lines.size() == 1, "shadow left: one JSONL line");
+        check(r.captures == 1 && r.capturedDisplay == 7 && r.capturedWidth == 1280, "shadow left: one 1280-wide capture of the click's display");
+        if (lines.size() == 1) {
+            const QJsonObject o = lines[0];
+            check(o["source"] == "human_click" && o["button"] == "left" && o["app"] == "Example" && o["role"] == "AXButton"
+                      && o["title"] == "" && o["description"] == "Send",
+                "shadow left: source, button, app, role, title, description");
+            check(o["display_w"].toDouble() == 1440 && o["display_h"].toDouble() == 900, "shadow left: display size in points");
+            check(intArray(o["point_1000"], {319, 356}), "shadow left: point_1000 normalized (460,320 on 1440x900)");
+            check(intArray(o["bbox_1000"], {278, 333, 361, 378}), "shadow left: bbox_1000 from the AX rect");
+            check(o["image"] == QString("human_frames/%1.jpg").arg(t0), "shadow left: image is human_frames/<ts_ms>.jpg");
+            QFile jf(tmp.path() + "/" + o["image"].toString());
+            check(jf.open(QIODevice::ReadOnly) && jf.readAll() == r.jpeg, "shadow left: frame bytes on disk");
+            check(QDateTime::fromString(o["ts"].toString(), Qt::ISODateWithMs).toMSecsSinceEpoch() == t0
+                      && o["ts"].toString().endsWith("Z"),
+                "shadow left: ts is ISO 8601 UTC of the click");
+            check(o.keys().size() == 12, "shadow left: exactly the 12 documented fields");
+        }
+        check(res.line == QJsonDocument(lines.value(0)).toJson(QJsonDocument::Compact), "shadow left: result carries the compact line");
+    }
+    // Right click on the 1x side display (negative of nothing: origin x=1440), element half off it.
+    {
+        QTemporaryDir tmp;
+        ShadowRig r;
+        r.hit.globalRect = {1340, 540, 200, 108};  // straddles the left edge of the side display
+        const auto res = recordClickSample(tmp.path(), {{1440 + 960, 540}, true, t0}, r.hooks());
+        const auto lines = humanLines(tmp.path());
+        check(res.outcome == ShadowOutcome::Recorded && r.capturedDisplay == 9 && lines.size() == 1, "shadow right: side display captured");
+        if (lines.size() == 1) {
+            check(lines[0]["button"] == "right" && lines[0]["display_w"].toDouble() == 1920, "shadow right: button right, side display size");
+            check(intArray(lines[0]["point_1000"], {500, 500}), "shadow right: point_1000 relative to its own display");
+            check(intArray(lines[0]["bbox_1000"], {0, 500, 52, 600}), "shadow right: bbox_1000 clipped to the display");
+        }
+    }
+    // No AX rect: bbox_1000 is null, the point is still kept.
+    {
+        QTemporaryDir tmp;
+        ShadowRig r;
+        r.hit.globalRect = {};
+        recordClickSample(tmp.path(), {{0, 0}, false, t0}, r.hooks());
+        const auto lines = humanLines(tmp.path());
+        check(lines.size() == 1 && lines[0]["bbox_1000"].isNull() && intArray(lines[0]["point_1000"], {0, 0}), "shadow: no rect -> bbox_1000 null");
+    }
+    // Privacy: skipped BEFORE any capture, nothing on disk.
+    {
+        struct Case { const char *name; ShadowAxHit hit; };
+        const QVector<Case> cases{
+            {"shadow skip: role AXSecureTextField", {true, "AXSecureTextField", "", "Password", "", "Safari", 5, {10, 10, 100, 20}}},
+            {"shadow skip: subrole AXSecureTextField (real macOS shape)", {true, "AXTextField", "AXSecureTextField", "", "", "Safari", 5, {10, 10, 100, 20}}},
+            {"shadow skip: 'infinity' in app", {true, "AXButton", "", "Send", "", "Infinity Slack", 5, {}}},
+            {"shadow skip: 'INFINITY' in title", {true, "AXStaticText", "", "#infinity-ops", "", "Slack", 5, {}}},
+            {"shadow skip: '1Password' app", {true, "AXButton", "", "Unlock", "", "1Password 8", 5, {}}},
+            {"shadow skip: 'keychain' in description", {true, "AXButton", "", "", "Keychain Access item", "Safari", 5, {}}},
+            {"shadow skip: 'bitwarden' in title", {true, "AXButton", "", "Bitwarden vault", "", "Chrome", 5, {}}},
+            {"shadow skip: unknown app", {false, "", "", "", "", "", 0, {}}},
+            {"shadow skip: Lapis itself", {true, "AXButton", "", "Send", "", "lapis_studio", 999, {}}},
+        };
+        for (const Case &c : cases) {
+            QTemporaryDir tmp;
+            ShadowRig r;
+            r.hit = c.hit;
+            const auto res = recordClickSample(tmp.path(), {{100, 100}, false, t0}, r.hooks());
+            check(res.outcome == ShadowOutcome::SkippedSensitive && r.captures == 0 && QDir(tmp.path()).entryList(QDir::NoDotAndDotDot | QDir::AllEntries).isEmpty(),
+                c.name);
+        }
+        check(!shadowSensitive({true, "AXButton", "", "Send", "Compose", "Mail", 5, {}}), "shadow: ordinary target is not sensitive");
+    }
+    // Off-display point and a failed capture write nothing.
+    {
+        QTemporaryDir tmp;
+        ShadowRig r;
+        check(recordClickSample(tmp.path(), {{-5000, -5000}, false, t0}, r.hooks()).outcome == ShadowOutcome::SkippedNoDisplay && r.captures == 0,
+            "shadow: off-display click skipped without capture");
+        r.jpeg.clear();
+        check(recordClickSample(tmp.path(), {{10, 10}, false, t0}, r.hooks()).outcome == ShadowOutcome::SkippedNoFrame
+                  && !QFile::exists(tmp.path() + "/human_traces.jsonl"),
+            "shadow: capture denied -> no line");
+    }
+    // Rate limit: 350 ms between captures.
+    check(shadowRateAllows(0, t0) && !shadowRateAllows(t0, t0 + 349) && shadowRateAllows(t0, t0 + 350) && shadowRateAllows(t0, t0 - 10),
+        "shadow: rate limit 1 per 350 ms (first always, clock step back allowed)");
+    // Disk cap: 10 steps cap -> trims to 10 newest once past 11, deleting unreferenced frames.
+    {
+        QTemporaryDir tmp;
+        ShadowRig r;
+        const int cap = 10;
+        for (int i = 0; i < 11; ++i) recordClickSample(tmp.path(), {{100, 100}, false, t0 + i * 1000}, r.hooks(), cap);
+        check(humanLines(tmp.path()).size() == 11, "shadow cap: within 10% slack nothing is trimmed");
+        QFile orphan(tmp.path() + "/human_frames/orphan.jpg");
+        check(orphan.open(QIODevice::WriteOnly) && orphan.write("x") == 1, "shadow cap: orphan frame planted");
+        orphan.close();
+        recordClickSample(tmp.path(), {{100, 100}, false, t0 + 11 * 1000}, r.hooks(), cap);
+        const auto lines = humanLines(tmp.path());
+        bool ok = lines.size() == cap && lines.first()["image"] == QString("human_frames/%1.jpg").arg(t0 + 2 * 1000)
+                  && lines.last()["image"] == QString("human_frames/%1.jpg").arg(t0 + 11 * 1000);
+        for (const QJsonObject &o : lines) ok = ok && QFile::exists(tmp.path() + "/" + o["image"].toString());
+        check(ok && QDir(tmp.path() + "/human_frames").entryList(QDir::Files).size() == cap,
+            "shadow cap: keeps the newest 10 lines + frames, deletes the oldest and orphans");
+    }
+    // The recorder object: never running before start, start refuses an empty dir, stop is idempotent.
+    {
+        CuaShadowRecorder rec;
+        check(!rec.isRunning() && rec.recordedCount() == 0 && !rec.start(QString()), "shadow recorder: idle, empty dir refused");
+        rec.stop();
+        check(!rec.isRunning(), "shadow recorder: stop without start is a no-op");
+    }
+}
 int main(int argc, char **argv) {
     QCoreApplication app(argc, argv);
     traceTests();
+    shadowTests();
     geometryTests(); leaseTests(); formattingTests(); cancellationTests(); liveTests();
     reticleGeometryTests(); reticleOffscreenTests(); hudTests(); executorTests(); multiMonitorTests();
     spaceSwitchTests();

@@ -111,6 +111,9 @@ void runOnMainThread(const std::function<void()> &fn);
 // Live app only: these open a real window.
 void showCuaHud(const QString &status, HudTone tone);
 void hideCuaHud(double afterSeconds = 0);
+// The shared overlay's window numbers (reticle, HUD bar), zeros dropped. Call on the main thread
+// (it would block a worker on it); the ids stay fixed once a window exists.
+QVector<uint32_t> overlayWindowIds();
 
 // Space-switch timing: after activation, poll the frontmost app every 40 ms for up to 900 ms
 // (2.5 s for a cold launch), then give the Space slide 180 ms to finish.

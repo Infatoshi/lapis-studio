@@ -67,6 +67,7 @@ add_library(lapis_mac STATIC
   src/mac/cua.hpp src/mac/cua.mm
   src/mac/cua_reticle.hpp src/mac/cua_reticle.mm
   src/mac/cua_executor.hpp src/mac/cua_executor.cpp
+  src/mac/cua_shadow.hpp src/mac/cua_shadow.mm
 )
 target_include_directories(lapis_mac PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(lapis_mac PUBLIC lapis_core Qt6::Core Qt6::Gui Qt6::Quick

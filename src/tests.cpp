@@ -5137,6 +5137,8 @@ void studioControlTests()
         check(cuaFollowupPrompt({missed}).contains("(ERR, ok=0, detail=No AX match)"), "cua loop: a failure reads ok=0");
 
         Backend b(Backend::Mode::Mock);
+        b.setShadowRecordEnabled(true);
+        check(!b.shadowRecordEnabled() && !b.shadowRecording(), "shadow recorder: always off in Mode::Mock, setter is a no-op");
         check(b.runModelAnswer("[[ACTION:cua_click:Send button]]").contains("Clicking Send button") && b.cuaLoopDepth() == 1
                   && b.cuaFollowups().size() == 1
                   && b.cuaFollowups()[0].startsWith("[CUA observation after cua_click:Send button (MOCK, ok=1"),

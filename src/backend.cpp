@@ -1192,6 +1192,20 @@ Backend::Backend(Mode mode, QObject *parent, bool warmHelpers)
                 studio::cua::hideCuaHud(studio::cua::kHudLingerSec);
         });
         m_cuaHud = true;
+        // Human-click shadow recorder: the real window only (warm helpers), never Mock or an
+        // offscreen mode. setPrefsPath (right after construction) and this timer start it.
+        {
+            const QString env = qEnvironmentVariable("LAPIS_SHADOW_RECORD").trimmed().toLower();
+            m_shadowAllowed = !(env == QLatin1String("0") || env == QLatin1String("off") || env == QLatin1String("false")
+                                || env == QLatin1String("no"));
+        }
+        QTimer::singleShot(1500, this, [this] {
+            syncShadowRecorder();
+            refreshShadowExcludes();
+        });
+        // The overlay windows (reticle, HUD bar) appear lazily: refresh what frames exclude.
+        connect(&m_gamepad, &Gamepad::voiceActiveChanged, this, &Backend::refreshShadowExcludes);
+        connect(this, &Backend::cuaActionFinished, this, &Backend::refreshShadowExcludes);
         // The default model's daemon is the one the first Enter will use; every other provider
         // channel starts lazily the first time the picker sends to it, then stays up.
         QTimer::singleShot(400, this, &Backend::warmChannel);
@@ -1201,6 +1215,8 @@ Backend::Backend(Mode mode, QObject *parent, bool warmHelpers)
 
 Backend::~Backend()
 {
+    if (m_shadow)
+        m_shadow->stop();  // removes the tap, joins the worker (a capture is bounded to 5 s)
     if (m_cuaPool) {
         // A running action may be blocked on a reticle call queued to this (main) thread: cancel
         // its input, keep serving the event loop until it returns, then drop the latch.
@@ -1591,6 +1607,7 @@ void Backend::setPrefsPath(const QString &path)
     m_firstLaunch = !path.isEmpty() && !QFileInfo::exists(path);
     loadPrefs();
     emit prefsChanged();
+    syncShadowRecorder();  // the prefs toggle is known now
 }
 
 namespace {
@@ -1642,6 +1659,10 @@ void Backend::loadPrefs()
     m_viewState = normalizedViewState(o.value(QLatin1String("viewState")).toObject().toVariantMap());
     emit viewStateChanged();
     m_showCodeDiffs = o.value(QLatin1String("showCodeDiffs")).toBool(false);
+    if (m_shadowPref != o.value(QLatin1String("shadowRecordEnabled")).toBool(true)) {
+        m_shadowPref = !m_shadowPref;
+        emit shadowRecordChanged();
+    }
     m_windowState = WindowState::fromJson(o.value(QLatin1String("windowState")).toObject());
     m_cardPositions.clear();
     const QJsonObject cards = o.value(QLatin1String("cardPositions")).toObject();
@@ -1725,6 +1746,47 @@ void Backend::pollPhonon()
         emit phononTailChanged();
         feedAmbientTail(snap.tail);
     }
+}
+
+// --- Human-click shadow recorder -------------------------------------------------------------
+
+void Backend::setShadowRecordEnabled(bool on)
+{
+    if (!m_shadowAllowed || on == m_shadowPref)
+        return;  // Mock / offscreen / LAPIS_SHADOW_RECORD=0: stays false
+    m_shadowPref = on;
+    syncShadowRecorder();
+    emit shadowRecordChanged();
+    if (!m_prefsPath.isEmpty())
+        m_prefsSave.start();
+}
+
+bool Backend::shadowRecording() const
+{
+    return m_shadow && m_shadow->isRunning();
+}
+
+void Backend::syncShadowRecorder()
+{
+    const bool want = m_mode == Mode::Live && shadowRecordEnabled();
+    if (!want) {
+        if (m_shadow)
+            m_shadow->stop();
+        return;
+    }
+    if (shadowRecording())
+        return;
+    if (!m_shadow)
+        m_shadow = std::make_unique<studio::cua::CuaShadowRecorder>();
+    const QString dir = home() + QStringLiteral("/.lapis-next/cua_traces");
+    if (m_shadow->start(dir))
+        std::fprintf(stderr, "lapis_studio: shadow recorder on (%s/human_traces.jsonl)\n", qPrintable(dir));
+}
+
+void Backend::refreshShadowExcludes()
+{
+    if (shadowRecording())
+        m_shadow->setExcludeWindowIds(studio::cua::overlayWindowIds());
 }
 
 // --- Ambient voice -----------------------------------------------------------------------------
@@ -1878,7 +1940,7 @@ bool Backend::savePrefs()
             o = QJsonDocument::fromJson(old.read(256 * 1024)).object();
     }
     static const char *const kOwnedOptional[] = {"windowState", "cardPositions", "gamepadBindings", "openaiCompatModel",
-                                                 "mapSort", "clusterOrder", "viewState"};
+                                                 "mapSort", "clusterOrder", "viewState", "shadowRecordEnabled"};
     for (const char *k : kOwnedOptional)
         o.remove(QLatin1String(k));
     if (m_compatUrlCleared)
@@ -1897,6 +1959,8 @@ bool Backend::savePrefs()
     if (!m_openaiCompatKey.isEmpty())
         o.insert(QStringLiteral("openaiCompatKey"), m_openaiCompatKey);
     o.insert(QStringLiteral("showCodeDiffs"), m_showCodeDiffs);
+    if (!m_shadowPref)
+        o.insert(QStringLiteral("shadowRecordEnabled"), false);
     if (m_windowState.hasGeometry() || m_windowState.fullscreen || m_windowState.maximized)
         o.insert(QStringLiteral("windowState"), m_windowState.toJson());
     if (!m_cardPositions.isEmpty()) {

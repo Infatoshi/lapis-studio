@@ -28,6 +28,8 @@
 #include <QTimer>
 #include <QVariantList>
 #include <QVariantMap>
+#include <memory>
+#include "mac/cua_shadow.hpp"
 
 namespace studio {
 
@@ -323,6 +325,10 @@ class Backend : public QObject {
     // debounce): [[IGNORE]] stays silent, action tags run, a short answer lands in ambientAnswer.
     Q_PROPERTY(bool ambientVoiceEnabled READ ambientVoiceEnabled WRITE setAmbientVoiceEnabled NOTIFY ambientChanged)
     Q_PROPERTY(bool ambientBusy READ ambientBusy NOTIFY ambientChanged)
+    // Passive human-click shadow recorder (~/.lapis-next/cua_traces/human_traces.jsonl): on in the
+    // real live window unless LAPIS_SHADOW_RECORD=0 or "shadowRecordEnabled": false in prefs;
+    // always false in Mode::Mock and every offscreen mode (--test, --demo, --bench).
+    Q_PROPERTY(bool shadowRecordEnabled READ shadowRecordEnabled WRITE setShadowRecordEnabled NOTIFY shadowRecordChanged)
     Q_PROPERTY(QString ambientAnswer READ ambientAnswer NOTIFY ambientChanged)
     Q_PROPERTY(QString ambientHeard READ ambientHeard NOTIFY ambientChanged)
     // Ambient action tags are proposed, not run: they wait here (and on the all-Spaces HUD bar)
@@ -529,6 +535,9 @@ public:
     // tail; tests call it directly. flushAmbient skips the 800 ms debounce.
     bool ambientVoiceEnabled() const { return m_ambientEnabled; }
     void setAmbientVoiceEnabled(bool on);
+    bool shadowRecordEnabled() const { return m_shadowAllowed && m_shadowPref; }
+    void setShadowRecordEnabled(bool on);
+    bool shadowRecording() const;  // the tap is actually installed (permission granted)
     Q_INVOKABLE void toggleAmbientVoice() { setAmbientVoiceEnabled(!m_ambientEnabled); }
     bool ambientBusy() const { return m_ambientBusy; }
     QString ambientAnswer() const { return m_ambientAnswer; }
@@ -672,6 +681,7 @@ signals:
     void tasteRulesChanged();
     void phononTailChanged();
     void ambientChanged();
+    void shadowRecordChanged();
     void pendingProposalChanged();
     void sessionStarted(const QString &projectKey);
     void quickTick();
@@ -727,6 +737,13 @@ private:
     QStringList m_cuaLog;
     int m_cuaPending = 0;
     bool m_cuaHud = false;  // the real app: voice and cua_* actions drive the floating HUD bar
+    // Human-click shadow recorder: allowed only in the real live window (warm helpers) without
+    // LAPIS_SHADOW_RECORD=0; m_shadowPref is the prefs toggle. syncShadowRecorder starts / stops it.
+    std::unique_ptr<studio::cua::CuaShadowRecorder> m_shadow;
+    bool m_shadowAllowed = false;
+    bool m_shadowPref = true;
+    void syncShadowRecorder();
+    void refreshShadowExcludes();
     // tryHandleStudioCommand for a known project (spawn_agent runs in its folder).
     bool handleStudioCommand(const QString &text, const QString &projectKey, QString *reply);
     QString spawnAgent(const QString &projectKey, const QString &task, bool steerLive);
