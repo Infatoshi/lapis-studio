@@ -1,6 +1,7 @@
 #pragma once
 
 #include "mac/cua.hpp"
+#include "mac/cua_reticle.hpp"
 #include <QByteArray>
 #include <QPointF>
 #include <QRectF>
@@ -37,12 +38,22 @@ GroundResult httpGroundPixel(const QByteArray &jpeg, const QString &instruction,
 // The pixel size captureDisplayJpeg(display, maxWidth) produces (same rounding as cua.mm).
 QSizeF expectedCaptureSize(const DisplayInfo &display, int maxWidth);
 
+// What activating (or launching) an app gave: its pid, the display of its largest window (0 when
+// none is on screen yet), and whether it had to be launched.
+struct AppActivation {
+    bool ok = false;
+    uint32_t displayId = 0;
+    int pid = 0;
+    bool launched = false;
+};
+
 // Every side effect the executor has, injectable. defaultCuaHooks() wires the real
 // studio::cua::* calls, a shared CuaReticle (always touched on the main thread) and libcurl.
 struct CuaHooks {
     std::function<QVector<DisplayInfo>()> listDisplays;
     std::function<QVector<AxNode>(uint32_t displayId)> inspectDisplay;
-    std::function<QByteArray(uint32_t displayId, int maxWidth, uint32_t excludeWindowId, QString *err)> captureDisplayJpeg;
+    std::function<QByteArray(uint32_t displayId, int maxWidth, const QVector<uint32_t> &excludeWindowIds, QString *err)>
+        captureDisplayJpeg;
     std::function<GroundResult(const QByteArray &jpeg, const QString &instruction, bool refineCrop)> groundPixel;
     std::function<ActionResult(QPointF globalPt, bool doubleClick)> clickAt;
     std::function<ActionResult(QPointF globalPt, int deltaY)> scrollAt;
@@ -53,20 +64,37 @@ struct CuaHooks {
     std::function<void(QPointF globalPt, const QString &label)> reticlePulse;
     std::function<void()> reticleHide;
     std::function<uint32_t()> reticleWindowId;  // excluded from captures; 0 when none
+    std::function<uint32_t()> hudWindowId;      // the HUD bar, also excluded; 0 when none
+    // The floating HUD bar's status line ("Chrome · Clicking address bar"); Done/Error fade out.
+    std::function<void(const QString &status, HudTone tone)> reticleHud;
     std::function<void(int ms)> pause;          // lets a glide land before the click; no-op in tests
     // Multi-monitor routing; every one is optional. Unset listAppWindows means "no window info",
     // unset activateApp means no activation, unset selfPid means no self filtering, unset
     // lapisDisplayId is derived from listAppWindows (largest selfPid window).
     std::function<QVector<AppWindowInfo>()> listAppWindows;
-    std::function<bool(const QString &appHint, uint32_t *outDisplayId)> activateApp;
+    std::function<AppActivation(const QString &appHint)> activateApp;  // activates, else launches
     std::function<int()> selfPid;
     std::function<uint32_t()> lapisDisplayId;  // 0 when Lapis has no on-screen window
+    // Space switching. Unset frontmostPid means a fixed 220 ms settle after activation instead of
+    // waiting for the app to come to the front; unset hideSelf means Lapis is never hidden.
+    std::function<int()> frontmostPid;  // 0 when unknown
+    std::function<bool()> hideSelf;     // hides Lapis so its fullscreen Space slides away
 };
 CuaHooks defaultCuaHooks();
 
 // Runs fn on the Qt main thread: directly when already there, else via
 // QMetaObject::invokeMethod(qApp, fn, Qt::BlockingQueuedConnection). No-op without a qApp.
 void runOnMainThread(const std::function<void()> &fn);
+
+// The app-wide HUD bar on the shared overlay (the one defaultCuaHooks drives), from any thread.
+// Live app only: these open a real window.
+void showCuaHud(const QString &status, HudTone tone);
+void hideCuaHud(double afterSeconds = 0);
+
+// Space-switch timing: after activation, poll the frontmost app every 40 ms for up to 900 ms
+// (2.5 s for a cold launch), then give the Space slide 180 ms to finish.
+constexpr int kFrontPollMs = 40, kFrontWaitMs = 900, kLaunchWaitMs = 2500, kSpaceSlideMs = 180;
+constexpr int kActivateSettleMs = 220;  // the fixed fallback when there is no frontmost signal
 
 struct CuaExecResult {
     bool ok = false;
@@ -124,9 +152,18 @@ private:
         int selfPid = 0;
         bool allowSelf = false;
     };
-    // Activates the hinted app (with a settle pause) when activate is true.
+    // Activates the hinted app (waiting for it to come to the front) when activate is true; on a
+    // single display, hides Lapis when it is still frontmost and the target does not name it.
     bool route(const QString &targetDesc, bool activate, Route *out, QString *err);
-    Located locate(const QString &targetDesc, bool refineCrop, const QString &label, Route *routeOut = nullptr);
+    // `verb` ("Clicking") builds the HUD status once the route is known.
+    Located locate(const QString &targetDesc, bool refineCrop, const QString &label, const QString &verb,
+                   Route *routeOut = nullptr);
+    // Polls frontmostPid until pid (else anything but Lapis) is in front, then lets the Space
+    // slide finish. False on timeout.
+    bool waitFrontmost(int pid, bool launched, int selfPid);
+    CuaExecResult click(const QString &targetDesc, bool doubleClick, bool refineCrop, bool finish, Route *routeOut);
+    void hud(const QString &status, HudTone tone) const;
+    void hudFail(const QString &targetDesc, const QString &why) const;
 
     CuaHooks m_hooks;
     bool m_preferAxPress = false;

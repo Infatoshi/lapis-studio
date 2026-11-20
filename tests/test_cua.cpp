@@ -165,8 +165,9 @@ struct MockRig {
     QVector<AxNode> nodes;
     QByteArray jpeg = "not-a-real-jpeg";
     GroundResult ground;
-    uint32_t windowId = 4242;
-    uint32_t capturedDisplay = 0, capturedExclude = 0;
+    uint32_t windowId = 4242, hudId = 5151;
+    uint32_t capturedDisplay = 0;
+    QVector<uint32_t> capturedExclude;
     int capturedWidth = 0;
     QString groundInstruction;
     bool groundRefine = false;
@@ -181,7 +182,17 @@ struct MockRig {
     int selfPid = 0;
     bool activateOk = false;
     uint32_t activateDisplay = 0;
+    int activatePid = 0;
+    bool activateLaunched = false;
+    QVector<AppWindowInfo> windowsAfterActivate;  // replaces `windows` once activation succeeds
     QStringList pauses;
+    // Space switching: frontmostPid answers frontSeq in order, then repeats the last entry.
+    bool frontmostHook = false;
+    QVector<int> frontSeq;
+    int frontPolls = 0;
+    bool hideSelfOk = true;
+    // HUD statuses, "<tone>|<status>" (kept out of `calls` so effect orderings stay focused).
+    QStringList huds;
     CuaHooks hooks() {
         CuaHooks h;
         h.listDisplays = [this] { calls << "listDisplays"; return displays; };
@@ -190,13 +201,30 @@ struct MockRig {
             return nodesByDisplay.isEmpty() ? nodes : nodesByDisplay.value(id);
         };
         h.listAppWindows = [this] { calls << "listAppWindows"; return windows; };
-        h.activateApp = [this](const QString &hint, uint32_t *out) {
+        h.activateApp = [this](const QString &hint) {
             calls << QString("activate:%1").arg(hint);
-            if (out) *out = activateOk ? activateDisplay : 0;
-            return activateOk;
+            AppActivation a;
+            a.ok = activateOk;
+            if (activateOk) {
+                a.displayId = activateDisplay; a.pid = activatePid; a.launched = activateLaunched;
+                if (!windowsAfterActivate.isEmpty()) windows = windowsAfterActivate;
+            }
+            return a;
         };
+        if (frontmostHook) {
+            h.frontmostPid = [this] {
+                const int i = std::min<int>(frontPolls++, int(frontSeq.size()) - 1);
+                return i >= 0 ? frontSeq[i] : 0;
+            };
+            h.hideSelf = [this] { calls << "hideSelf"; return hideSelfOk; };
+        }
+        h.reticleHud = [this](const QString &status, HudTone tone) {
+            static const char *names[] = {"listening", "working", "done", "error"};
+            huds << QString("%1|%2").arg(names[int(tone)], status);
+        };
+        h.hudWindowId = [this] { return hudId; };
         h.selfPid = [this] { return selfPid; };
-        h.captureDisplayJpeg = [this](uint32_t id, int w, uint32_t ex, QString *err) {
+        h.captureDisplayJpeg = [this](uint32_t id, int w, const QVector<uint32_t> &ex, QString *err) {
             calls << "capture";
             capturedDisplay = id; capturedWidth = w; capturedExclude = ex;
             if (jpeg.isEmpty() && err) *err = "denied";
@@ -279,8 +307,8 @@ void executorTests() {
         CuaExecutor ex(m.hooks());
         const auto res = ex.clickTarget("the gear icon", false, true);
         check(res.ok && res.tier == "L3_VLM", "exec L3: ok via VLM");
-        check(m.capturedDisplay == 7 && m.capturedWidth == 1280 && m.capturedExclude == 4242,
-            "exec L3: captures the primary display at 1280 px, excluding the reticle window");
+        check(m.capturedDisplay == 7 && m.capturedWidth == 1280 && m.capturedExclude == QVector<uint32_t>({4242, 5151}),
+            "exec L3: captures the primary display at 1280 px, excluding the reticle and HUD windows");
         check(m.groundInstruction == "the gear icon" && m.groundRefine, "exec L3: instruction and refine_crop forwarded");
         // 1440x900 pt at 2x = 2880x1800 px, captured at 1280x800: 250/1000 -> 360 pt, 500/1000 -> 450 pt.
         check(close(res.globalPt, {360, 450}) && close(m.clickPt, {360, 450}), "exec L3: point_1000 -> Quartz global points");
@@ -521,6 +549,194 @@ void multiMonitorTests() {
         check(exc.scrollTarget("", 3).ok && close(c.scrollPt, {2880, 540}), "multi scroll: centre of the non-Lapis display");
     }
 }
+void hudTests() {
+    // Pure placement: centred, 44 pt above the bottom edge, on any display origin.
+    check(cuaHudRect({0, 0, 1440, 900}) == QRectF(550, 818, 340, 38), "hud: bottom-centre of a 1440x900 display");
+    check(cuaHudRect({1440, -200, 1920, 1080}) == QRectF(2230, 798, 340, 38), "hud: offset secondary display");
+    check(cuaHudRect({}).isEmpty(), "hud: no display, no rect");
+
+    // Offscreen lifecycle: never a window, time moves only through advanceClock.
+    const QRectF disp(0, 0, 1440, 900);
+    CuaReticle r(CuaReticle::Mode::Offscreen, disp);
+    check(r.hudWindowNumber() == 0 && !r.state().hudVisible, "hud: offscreen has no window, starts hidden");
+    r.showHud(QStringLiteral("Listening…"), true);
+    auto st = r.state();
+    check(st.hudVisible && st.hudTone == HudTone::Listening && st.hudStatus == QStringLiteral("Listening…")
+              && st.hudRect == QRectF(550, 818, 340, 38) && st.hudAlpha < 0.01,
+        "hud: showHud(listening) appears bottom-centre, fading in");
+    check(!st.visible, "hud: the cursor stays hidden while only the HUD shows");
+    r.advanceClock(0.3);
+    check(std::abs(r.state().hudAlpha - 1) < 1e-9, "hud: fully in after 0.3 s");
+    r.advanceClock(60);
+    check(r.state().hudVisible, "hud: listening never times out on its own");
+    // Status updates keep the same pinned rect, even when the cursor moves to the far corner.
+    r.moveTo({1400, 40}, "Gliding");
+    r.showHud(QStringLiteral("Chrome · Clicking address bar"), HudTone::Working);
+    st = r.state();
+    check(st.hudTone == HudTone::Working && st.hudRect == QRectF(550, 818, 340, 38) && std::abs(st.hudAlpha - 1) < 1e-9,
+        "hud: a new status updates in place, no re-fade");
+    // Rendered: frosted obsidian body with a sapphire dot in the capsule, nothing above it.
+    const QImage img = r.render(2);
+    int body = 0, dot = 0, strayAbove = 0;
+    for (int y = 0; y < img.height(); ++y)
+        for (int x = 0; x < img.width(); x += 2) {
+            const QColor c = img.pixelColor(x, y);
+            const QPointF pt(x / 2.0, y / 2.0);
+            if (QRectF(560, 822, 320, 30).contains(pt)) {
+                body += c.alpha() > 200 && c.red() < 40 && c.blue() < 50;
+                dot += c.alpha() > 150 && c.blue() > 180 && c.blue() > c.red() + 60 && pt.x() < 580;
+            } else if (QRectF(400, 600, 640, 180).contains(pt)) {
+                strayAbove += c.alpha() > 0;
+            }
+        }
+    check(body > 1000 && dot > 4 && strayAbove == 0, "hud: render draws the capsule and sapphire dot, only there");
+    std::printf("hud render: body=%d dot=%d stray=%d\n", body, dot, strayAbove);
+    // Hiding the cursor leaves the HUD alone.
+    r.hide();
+    check(!r.state().visible && r.state().hudVisible, "hud: cursor hide() keeps the HUD up");
+    // Done: holds 2.5 s, then fades out over 0.4 s.
+    r.showHud(QStringLiteral("Done · Chrome address bar"), HudTone::Done);
+    r.advanceClock(2.4);
+    st = r.state();
+    check(st.hudVisible && st.hudTone == HudTone::Done && std::abs(st.hudAlpha - 1) < 1e-9, "hud: done holds for 2.5 s");
+    r.advanceClock(0.3);
+    st = r.state();
+    check(st.hudVisible && st.hudAlpha > 0 && st.hudAlpha < 1, "hud: done fades out after 2.5 s");
+    // A new action mid fade-out takes the HUD back without a pop.
+    r.showHud(QStringLiteral("Switching to Discord…"), HudTone::Working);
+    const double resumed = r.state().hudAlpha;
+    r.advanceClock(5);
+    check(resumed > 0.05 && r.state().hudVisible && std::abs(r.state().hudAlpha - 1) < 1e-9,
+        "hud: a new status mid fade-out resumes and stays");
+    r.hideHud();
+    r.advanceClock(0.2);
+    check(r.state().hudVisible && r.state().hudAlpha < 1, "hud: hideHud fades out");
+    r.advanceClock(0.25);
+    st = r.state();
+    check(!st.hudVisible && st.hudRect.isEmpty() && st.hudStatus.isEmpty(), "hud: gone after the fade");
+    r.hideHud();  // hiding a hidden HUD is a no-op
+    r.showHud(QStringLiteral("Error"), HudTone::Error);
+    r.hideHud(1.0);
+    r.advanceClock(0.9);
+    check(r.state().hudVisible, "hud: hideHud(1 s) waits");
+    r.advanceClock(0.6);
+    check(!r.state().hudVisible, "hud: delayed hide completes");
+    // Error lingers 2.5 s like Done.
+    r.showHud(QStringLiteral("Couldn't find Send"), HudTone::Error);
+    r.advanceClock(2.45);
+    check(r.state().hudVisible && r.state().hudTone == HudTone::Error, "hud: error holds");
+    r.advanceClock(0.5);
+    check(!r.state().hudVisible, "hud: error fades out on its own");
+}
+// Lapis fullscreen on the only display; Chrome comes forward after a few polls.
+MockRig singleScreenRig() {
+    MockRig m;
+    m.displays = {{1, "only", {0, 0, 1512, 982}, 2, true}};
+    m.selfPid = 500;
+    m.windows = {{500, "lapis_studio", 1, {0, 0, 1512, 982}, true}};
+    m.frontmostHook = true;
+    return m;
+}
+int pauseTotal(const QStringList &pauses, const QString &ms) { return int(pauses.count(ms)) * ms.toInt(); }
+void spaceSwitchTests() {
+    {
+        // Activation waits for Chrome to be frontmost (3 polls), then the 180 ms slide, then looks.
+        MockRig m = singleScreenRig();
+        m.activateOk = true; m.activatePid = 600; m.activateDisplay = 0;
+        m.windowsAfterActivate = {{600, "Google Chrome", 1, {0, 25, 1512, 957}, true}};
+        m.frontSeq = {500, 500, 500, 600};
+        m.ground.ok = true; m.ground.hasPoint1000 = true; m.ground.point1000 = {300, 60};
+        CuaExecutor ex(m.hooks());
+        const auto res = ex.typeIntoTarget("Chrome address bar", "x.com\\n");
+        check(res.ok && res.tier == "L3_VLM" && m.capturedDisplay == 1, "space: single screen types into Chrome via L3");
+        check(m.pauses.count("40") == 3 && m.pauses.contains("180") && !m.pauses.contains("220"),
+            "space: polls frontmost every 40 ms, then 180 ms for the slide (no fixed 220 ms)");
+        const int settled = int(m.pauses.indexOf("180"));
+        check(settled >= 3 && m.pauses.mid(0, settled) == QStringList({"40", "40", "40"}),
+            "space: the slide settle follows the frontmost polls");
+        check(!m.calls.contains("hideSelf"), "space: Chrome in front, Lapis is not hidden");
+        check(m.capturedExclude == QVector<uint32_t>({4242, 5151}), "space: capture excludes the cursor and the HUD bar");
+        check(m.huds == QStringList({"working|Switching to Chrome…", "working|Chrome · Clicking address bar",
+                                     "working|Chrome · Typing x.com ↩", "done|Done · Typed x.com ↩"}),
+            "space: HUD lifecycle switch -> click -> type -> done");
+        std::printf("hud statuses: %s\n", qPrintable(m.huds.join(" / ")));
+    }
+    {
+        // Chrome never comes forward: bounded at 900 ms, no slide settle, still proceeds.
+        MockRig m = singleScreenRig();
+        m.activateOk = true; m.activatePid = 600;
+        m.frontSeq = {500};
+        m.hideSelfOk = false;
+        m.ground.ok = true; m.ground.hasPoint1000 = true; m.ground.point1000 = {500, 500};
+        CuaExecutor ex(m.hooks());
+        ex.clickTarget("Chrome address bar");
+        const int polled = pauseTotal(m.pauses, "40");
+        check(polled >= 860 && polled <= 900, "space: frontmost wait is bounded at 900 ms");
+        std::printf("space: frontmost timeout after %d ms of polling\n", polled);
+        // Lapis still frontmost after a failed bring-forward: it hides itself (here refused).
+        check(m.calls.contains("hideSelf"), "space: Lapis still in front after activation -> hide Lapis");
+        MockRig l = singleScreenRig();
+        l.activateOk = true; l.activatePid = 600; l.activateLaunched = true;
+        l.frontSeq = {0};
+        l.hideSelfOk = false;
+        CuaExecutor exl(l.hooks());
+        exl.clickTarget("Chrome address bar");
+        const int launchPolled = pauseTotal(l.pauses, "40");
+        check(launchPolled >= 2400 && launchPolled <= 2600, "space: a cold launch waits up to 2.5 s");
+    }
+    {
+        // No hint, Lapis frontmost on the only screen: hide Lapis, wait for another app, then look.
+        MockRig m = singleScreenRig();
+        m.frontSeq = {500, 500, 700};  // check, then two polls after hideSelf
+        m.ground.ok = true; m.ground.hasPoint1000 = true; m.ground.point1000 = {500, 500};
+        CuaExecutor ex(m.hooks());
+        const auto res = ex.clickTarget("the gear icon");
+        check(res.ok && m.calls.contains("hideSelf") && m.calls.indexOf("hideSelf") < m.calls.indexOf("capture"),
+            "space: single screen hides fullscreen Lapis before capturing");
+        check(m.pauses.contains("180") && m.huds.value(0) == "working|Switching to the desktop…",
+            "space: waits for the slide and says so on the HUD");
+        check(m.huds.last() == "done|Done · the gear icon", "space: HUD ends on done");
+        // Another app already in front: nothing hidden.
+        MockRig o = singleScreenRig();
+        o.frontSeq = {700};
+        o.ground = m.ground;
+        CuaExecutor exo(o.hooks());
+        check(exo.clickTarget("the gear icon").ok && !o.calls.contains("hideSelf"), "space: Lapis not frontmost, not hidden");
+        // A target naming Lapis keeps it.
+        MockRig s = singleScreenRig();
+        s.frontSeq = {500};
+        s.nodes = {AxNode{1, "AXButton", "Lapis settings", {}, "lapis_studio", 500, {10, 10, 80, 20}, {"AXPress"}}};
+        CuaExecutor exs(s.hooks());
+        check(exs.clickTarget("Lapis settings").ok && !s.calls.contains("hideSelf"), "space: a target naming Lapis never hides it");
+        // Two displays: never hides (routing already avoids Lapis's display).
+        MockRig d = dualMonitorRig();
+        d.frontmostHook = true;
+        d.frontSeq = {500};
+        d.ground = m.ground;
+        CuaExecutor exd(d.hooks());
+        check(exd.clickTarget("the gear icon").ok && !d.calls.contains("hideSelf"), "space: multi-monitor never hides Lapis");
+    }
+    {
+        // Failure reaches the HUD as an error.
+        MockRig m;
+        m.ground.ok = false; m.ground.detail = "Grounder offline";
+        CuaExecutor ex(m.hooks());
+        ex.clickTarget("unlabeled icon");
+        check(m.huds.value(0) == "working|Clicking unlabeled icon" && m.huds.last() == "error|Couldn't find unlabeled icon",
+            "hud: a miss ends on an error status");
+        MockRig sc;
+        CuaExecutor exs(sc.hooks());
+        exs.scrollTarget("", -3);
+        check(sc.huds.last() == "done|Done · Scrolled", "hud: scroll ends on done");
+    }
+    // Launch support: known bundle ids, and canonical names for the aliases.
+    check(knownBundleId("Google Chrome") == "com.google.Chrome" && knownBundleId("discord") == "com.hnc.Discord"
+              && knownBundleId("Nonexistent App").isEmpty(),
+        "launch: known bundle ids");
+    check(canonicalAppName("safari") == "Safari" && canonicalAppName("slack") == "Slack" && canonicalAppName("terminal") == "Terminal"
+              && canonicalAppName("spotify") == "Spotify" && canonicalAppName("finder") == "Finder",
+        "launch: aliases map to the installed app names");
+}
 void liveTests() {
     const auto displays = listDisplays();
     check(!displays.isEmpty(), "live display enumeration");
@@ -595,7 +811,8 @@ void captureSmokeTest() {
 int main(int argc, char **argv) {
     QCoreApplication app(argc, argv);
     geometryTests(); leaseTests(); formattingTests(); cancellationTests(); liveTests();
-    reticleGeometryTests(); reticleOffscreenTests(); executorTests(); multiMonitorTests();
+    reticleGeometryTests(); reticleOffscreenTests(); hudTests(); executorTests(); multiMonitorTests();
+    spaceSwitchTests();
     if (app.arguments().contains("--capture-smoke")) captureSmokeTest();
     std::printf("test_cua: %d passed, %d failed\n", passed, failed);
     return failed ? 1 : 0;

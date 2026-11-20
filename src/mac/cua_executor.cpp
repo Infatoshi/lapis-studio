@@ -105,7 +105,6 @@ CuaReticle *sharedReticle()
 
 constexpr int kGlideSettleMs = 170;  // the reticle glide (140 ms) plus a beat, so the click lands visibly
 constexpr int kPulseLeadMs = 60;
-constexpr int kActivateSettleMs = 220;  // the activated app comes forward on its own monitor
 
 // Apps a target may name, with the short hint each maps to. Bare generic words ("code",
 // "cursor", "edge", "notes") are left out on purpose: they name UI more often than apps.
@@ -277,6 +276,28 @@ QSizeF expectedCaptureSize(const DisplayInfo &d, int maxWidth)
     return {w, h};
 }
 
+namespace {
+
+// "Chrome · " when the route names an app, else nothing: the HUD status prefix.
+QString hudScope(const QString &appHint)
+{
+    return appHint.isEmpty() ? QString() : appHint + QStringLiteral(" \u00B7 ");
+}
+
+// What a typed string looks like on the HUD: one line, short, a return arrow for Return.
+QString typedPreview(const QString &typed)
+{
+    const bool submits = typed.contains(QLatin1Char('\n'));
+    QString t = typed;
+    t.replace(QLatin1Char('\n'), QLatin1Char(' '));
+    t = t.simplified();
+    if (t.size() > 40)
+        t = t.left(39) + QChar(0x2026);
+    return submits ? t + QStringLiteral(" \u21A9") : t;
+}
+
+}  // namespace
+
 void runOnMainThread(const std::function<void()> &fn)
 {
     QCoreApplication *app = QCoreApplication::instance();
@@ -288,12 +309,22 @@ void runOnMainThread(const std::function<void()> &fn)
         QMetaObject::invokeMethod(app, [&fn] { fn(); }, Qt::BlockingQueuedConnection);
 }
 
+void showCuaHud(const QString &status, HudTone tone)
+{
+    runOnMainThread([&] { sharedReticle()->showHud(status, tone); });
+}
+
+void hideCuaHud(double afterSeconds)
+{
+    runOnMainThread([&] { sharedReticle()->hideHud(afterSeconds); });
+}
+
 CuaHooks defaultCuaHooks()
 {
     CuaHooks h;
     h.listDisplays = [] { return studio::cua::listDisplays(); };
     h.inspectDisplay = [](uint32_t id) { return studio::cua::inspectDisplay(id, 400, 0.4); };
-    h.captureDisplayJpeg = [](uint32_t id, int w, uint32_t exclude, QString *err) {
+    h.captureDisplayJpeg = [](uint32_t id, int w, const QVector<uint32_t> &exclude, QString *err) {
         return studio::cua::captureDisplayJpeg(id, w, exclude, err);
     };
     h.groundPixel = &httpGroundPixel;
@@ -314,17 +345,34 @@ CuaHooks defaultCuaHooks()
         runOnMainThread([&] { id = sharedReticle()->windowNumber(); });
         return id;
     };
+    h.hudWindowId = [] {
+        uint32_t id = 0;
+        runOnMainThread([&] { id = sharedReticle()->hudWindowNumber(); });
+        return id;
+    };
+    h.reticleHud = [](const QString &status, HudTone tone) { showCuaHud(status, tone); };
     h.pause = [](int ms) {
         if (ms > 0)
             QThread::msleep(static_cast<unsigned long>(ms));
     };
     h.listAppWindows = [] { return studio::cua::listAppWindows(); };
-    h.activateApp = [](const QString &hint, uint32_t *outDisplayId) {
-        bool ok = false;
-        runOnMainThread([&] { ok = activateAppByName(hint, outDisplayId); });
-        return ok;
+    h.activateApp = [](const QString &hint) {
+        AppActivation a;
+        runOnMainThread([&] { a.ok = activateAppByName(hint, &a.displayId, &a.pid, &a.launched); });
+        return a;
     };
     h.selfPid = [] { return int(getpid()); };
+    // Read on the main thread, whose run loop is free between polls, so NSWorkspace stays current.
+    h.frontmostPid = [] {
+        int pid = 0;
+        runOnMainThread([&] { pid = frontmostAppPid(); });
+        return pid;
+    };
+    h.hideSelf = [] {
+        bool ok = false;
+        runOnMainThread([&] { ok = hideSelfApp(); });
+        return ok;
+    };
     // lapisDisplayId stays unset: the executor derives it from the listAppWindows it already has.
     return h;
 }
@@ -439,15 +487,37 @@ bool CuaExecutor::route(const QString &targetDesc, bool activate, Route *r, QStr
 
     if (!r->appHint.isEmpty()) {
         uint32_t id = 0;
-        if (activate && m_hooks.activateApp && m_hooks.activateApp(r->appHint, &id)) {
-            if (m_hooks.pause)
-                m_hooks.pause(kActivateSettleMs);
-            if (!id && m_hooks.listAppWindows)
-                windows = m_hooks.listAppWindows();  // a window may only just have come on screen
+        if (activate && m_hooks.activateApp) {
+            hud(QStringLiteral("Switching to %1\u2026").arg(r->appHint), HudTone::Working);
+            const AppActivation a = m_hooks.activateApp(r->appHint);
+            if (a.ok) {
+                id = a.displayId;
+                // On one screen this is the fullscreen Space slide: wait for the app to be in
+                // front and the slide to finish before anything is inspected or captured.
+                waitFrontmost(a.pid, a.launched, r->selfPid);
+                if (m_hooks.listAppWindows)
+                    windows = m_hooks.listAppWindows();  // its windows may only just have come on screen
+                if (a.pid > 0)
+                    if (const uint32_t fresh = largestOn([&](const AppWindowInfo &w) { return w.pid == a.pid; }))
+                        id = fresh;
+            }
         }
         if (!id)
             id = largestOn([&](const AppWindowInfo &w) { return w.pid != r->selfPid && appNameMatches(w.appName, r->appHint); });
         r->targetDisplayId = id;
+    }
+
+    // One screen and Lapis still in front (no hint, or the app could not be brought forward):
+    // hide Lapis so the AX scan and the capture see the desktop, never fullscreen Lapis itself.
+    if (displays.size() == 1 && !r->allowSelf && r->selfPid > 0 && m_hooks.frontmostPid && m_hooks.hideSelf
+        && m_hooks.frontmostPid() == r->selfPid) {
+        hud(QStringLiteral("Switching to the desktop\u2026"), HudTone::Working);
+        if (m_hooks.hideSelf()) {
+            waitFrontmost(0, false, r->selfPid);
+            if (m_hooks.listAppWindows)
+                windows = m_hooks.listAppWindows();
+            r->lapisDisplayId = 0;
+        }
     }
 
     // Search order: hinted app's display, (Lapis's own when the target names Lapis), displays
@@ -476,7 +546,42 @@ bool CuaExecutor::route(const QString &targetDesc, bool activate, Route *r, QStr
     return true;
 }
 
-CuaExecutor::Located CuaExecutor::locate(const QString &targetDesc, bool refineCrop, const QString &label, Route *routeOut)
+bool CuaExecutor::waitFrontmost(int pid, bool launched, int selfPid)
+{
+    const auto pause = [&](int ms) {
+        if (m_hooks.pause)
+            m_hooks.pause(ms);
+    };
+    if (!m_hooks.frontmostPid) {
+        pause(kActivateSettleMs);  // no front-app signal: a fixed beat
+        return true;
+    }
+    const int timeout = launched ? kLaunchWaitMs : kFrontWaitMs;
+    for (int waited = 0;; waited += kFrontPollMs) {
+        const int front = m_hooks.frontmostPid();
+        if (pid > 0 ? front == pid : (front > 0 && front != selfPid)) {
+            pause(kSpaceSlideMs);
+            return true;
+        }
+        if (waited + kFrontPollMs > timeout)
+            return false;
+        pause(kFrontPollMs);
+    }
+}
+
+void CuaExecutor::hud(const QString &status, HudTone tone) const
+{
+    if (m_hooks.reticleHud)
+        m_hooks.reticleHud(status, tone);
+}
+
+void CuaExecutor::hudFail(const QString &targetDesc, const QString &why) const
+{
+    hud(why.isEmpty() ? QStringLiteral("Couldn't find %1").arg(targetDesc) : why, HudTone::Error);
+}
+
+CuaExecutor::Located CuaExecutor::locate(const QString &targetDesc, bool refineCrop, const QString &label,
+                                         const QString &verb, Route *routeOut)
 {
     Located loc;
     Route rt;
@@ -485,6 +590,9 @@ CuaExecutor::Located CuaExecutor::locate(const QString &targetDesc, bool refineC
     if (routeOut)
         *routeOut = rt;
     const DisplayInfo display = rt.displays.first();
+    hud(hudScope(rt.appHint) + verb + QLatin1Char(' ')
+            + (rt.appHint.isEmpty() ? targetDesc : stripAppHint(targetDesc, rt.appHint)),
+        HudTone::Working);
 
     // L1: Accessibility trees of every display in route order, never Lapis's own nodes unless
     // the target names Lapis. With an app hint, a hit inside that app beats any other hit.
@@ -538,7 +646,11 @@ CuaExecutor::Located CuaExecutor::locate(const QString &targetDesc, bool refineC
         return loc;
     }
     constexpr int kMaxWidth = 1280;
-    const uint32_t exclude = m_hooks.reticleWindowId ? m_hooks.reticleWindowId() : 0;
+    QVector<uint32_t> exclude;  // our own overlays: the cursor and the HUD bar
+    for (const uint32_t id : {m_hooks.reticleWindowId ? m_hooks.reticleWindowId() : 0u,
+                              m_hooks.hudWindowId ? m_hooks.hudWindowId() : 0u})
+        if (id)
+            exclude.push_back(id);
     QString err;
     const QByteArray jpeg = m_hooks.captureDisplayJpeg(display.displayId, kMaxWidth, exclude, &err);
     if (jpeg.isEmpty()) {
@@ -574,14 +686,23 @@ CuaExecutor::Located CuaExecutor::locate(const QString &targetDesc, bool refineC
 
 CuaExecResult CuaExecutor::clickTarget(const QString &targetDesc, bool doubleClick, bool refineCrop)
 {
+    return click(targetDesc, doubleClick, refineCrop, true, nullptr);
+}
+
+CuaExecResult CuaExecutor::click(const QString &targetDesc, bool doubleClick, bool refineCrop, bool finish, Route *routeOut)
+{
     const QString target = targetDesc.simplified();
     if (target.isEmpty())
         return {false, QStringLiteral("ERR"), {}, QStringLiteral("Empty target")};
     const QString label = QStringLiteral("Clicking %1").arg(target);
-    const Located loc = locate(target, refineCrop, label);
+    Route rt;
+    const Located loc = locate(target, refineCrop, label, QStringLiteral("Clicking"), &rt);
+    if (routeOut)
+        *routeOut = rt;
     if (!loc.ok) {
         if (m_hooks.reticleHide)
             m_hooks.reticleHide();
+        hudFail(target, {});
         return {false, QStringLiteral("ERR"), {}, loc.detail};
     }
     if (m_hooks.pause)
@@ -597,8 +718,12 @@ CuaExecResult CuaExecutor::clickTarget(const QString &targetDesc, bool doubleCli
     } else if (m_hooks.clickAt) {
         act = m_hooks.clickAt(loc.pt, doubleClick);
     }
-    if (!act.ok)
+    if (!act.ok) {
+        hudFail(target, QStringLiteral("Click failed · %1").arg(target));
         return {false, QStringLiteral("ERR"), loc.pt, QStringLiteral("%1: %2").arg(loc.tier, act.detail)};
+    }
+    if (finish)
+        hud(QStringLiteral("Done · %1").arg(target), HudTone::Done);
     return {true, loc.tier, loc.pt, loc.detail};
 }
 
@@ -607,17 +732,22 @@ CuaExecResult CuaExecutor::typeIntoTarget(const QString &targetDesc, const QStri
     const QString typed = normalizeTypedText(text);
     if (typed.isEmpty())
         return {false, QStringLiteral("ERR"), {}, QStringLiteral("Nothing to type")};
-    CuaExecResult r = clickTarget(targetDesc);
+    Route rt;
+    CuaExecResult r = click(targetDesc, false, false, false, &rt);
     if (!r.ok)
         return r;
+    hud(hudScope(rt.appHint) + QStringLiteral("Typing %1").arg(typedPreview(typed)), HudTone::Working);
     if (m_hooks.pause)
         m_hooks.pause(kPulseLeadMs);  // let the field take focus
     const ActionResult t = m_hooks.typeText ? m_hooks.typeText(typed) : ActionResult{false, QStringLiteral("No typist")};
-    if (!t.ok)
+    if (!t.ok) {
+        hudFail(targetDesc, QStringLiteral("Typing failed · %1").arg(targetDesc.simplified()));
         return {false, QStringLiteral("ERR"), r.globalPt, QStringLiteral("Typing failed: %1").arg(t.detail)};
+    }
     r.detail += QStringLiteral("; typed %1 chars").arg(typed.size());
     if (typed.contains(QLatin1Char('\n')))
         r.detail += QStringLiteral(" + Return");
+    hud(QStringLiteral("Done · Typed %1").arg(typedPreview(typed)), HudTone::Done);
     return r;
 }
 
@@ -630,13 +760,17 @@ CuaExecResult CuaExecutor::scrollTarget(const QString &targetDesc, int deltaY)
     Located loc;
     Route rt;
     if (!target.isEmpty())
-        loc = locate(target, false, label, &rt);
+        loc = locate(target, false, label, QStringLiteral("Scrolling"), &rt);
     if (!loc.ok) {
         // No target, or it was not found: scroll the middle of the routed display (never
         // fullscreen Lapis when another monitor has the user's apps).
         QString err;
-        if (rt.displays.isEmpty() && !route(target, !target.isEmpty(), &rt, &err))
+        if (rt.displays.isEmpty() && !route(target, !target.isEmpty(), &rt, &err)) {
+            hudFail(target, QStringLiteral("Scroll failed · %1").arg(err));
             return {false, QStringLiteral("ERR"), {}, err};
+        }
+        if (target.isEmpty())
+            hud(hudScope(rt.appHint) + QStringLiteral("Scrolling"), HudTone::Working);
         const DisplayInfo display = rt.displays.first();
         const QString why = loc.detail;
         loc = Located{};
@@ -652,8 +786,11 @@ CuaExecResult CuaExecutor::scrollTarget(const QString &targetDesc, int deltaY)
     if (m_hooks.pause)
         m_hooks.pause(kGlideSettleMs);
     const ActionResult s = m_hooks.scrollAt ? m_hooks.scrollAt(loc.pt, deltaY) : ActionResult{false, QStringLiteral("No scroller")};
-    if (!s.ok)
+    if (!s.ok) {
+        hudFail(target, QStringLiteral("Scroll failed · %1").arg(s.detail));
         return {false, QStringLiteral("ERR"), loc.pt, QStringLiteral("Scroll failed: %1").arg(s.detail)};
+    }
+    hud(target.isEmpty() ? QStringLiteral("Done · Scrolled") : QStringLiteral("Done · Scrolled %1").arg(target), HudTone::Done);
     return {true, loc.tier, loc.pt, loc.detail};
 }
 

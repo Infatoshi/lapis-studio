@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <utility>
 
 // ---- Pure geometry -----------------------------------------------------------------------------
 
@@ -56,6 +57,14 @@ QRectF reticlePillRect(const QRectF &anchor, QSizeF pill, const QRectF &display)
     return QRectF(x, y, w, h);
 }
 
+QRectF cuaHudRect(const QRectF &display)
+{
+    if (!display.isValid() || display.isEmpty())
+        return {};
+    return QRectF(std::round(display.center().x() - kHudWidth / 2), display.bottom() - kHudBottomGap - kHudHeight,
+                  kHudWidth, kHudHeight);
+}
+
 } // namespace studio::cua
 
 // ---- Scene: everything the overlay draws, as a pure function of time ---------------------------
@@ -64,7 +73,8 @@ namespace studio::cua::detail {
 
 constexpr double kGlide = 0.14, kTailDecay = 0.20, kRipple = 0.28, kRippleStagger = 0.07;
 constexpr double kFocusIn = 0.18, kIdle = 1.8, kFade = 0.45;
-constexpr double kNever = -1e9;
+constexpr double kNever = -1e9, kForever = 1e18;
+constexpr double kHudIn = 0.22, kHudOut = 0.40, kHudLinger = studio::cua::kHudLingerSec, kHudPad = 30;
 
 double clamp01(double t) { return std::max(0.0, std::min(1.0, t)); }
 double easeInOutCubic(double t) { return t < 0.5 ? 4 * t * t * t : 1 - std::pow(-2 * t + 2, 3) / 2; }
@@ -84,6 +94,12 @@ struct Scene {
     double rippleStart = kNever;
     QString label;
     double lastActivity = kNever;
+    // HUD bar.
+    QString hudStatus;
+    studio::cua::HudTone hudTone = studio::cua::HudTone::Working;
+    QRectF hudDisplay;
+    double hudShownAt = kNever;
+    double hudHideAt = kForever;  // when the fade-out starts
 
     double now() const { return offscreen ? manualNow : [[NSProcessInfo processInfo] systemUptime]; }
     double glideP(double t) const { return easeInOutCubic(clamp01((t - moveStart) / kGlide)); }
@@ -105,6 +121,24 @@ struct Scene {
                || (idle >= kIdle && idle <= kIdle + kFade);
     }
     bool animating(double t) const { return visible && (dynamic(t) || t - lastActivity < kIdle + kFade); }
+
+    double hudIn(double t) const { return easeOutCubic(clamp01((t - hudShownAt) / kHudIn)); }
+    bool hudGone(double t) const { return hudShownAt == kNever || t >= hudHideAt + kHudOut; }
+    double hudAlpha(double t) const {
+        if (hudGone(t))
+            return 0;
+        return hudIn(t) * (t < hudHideAt ? 1 : clamp01(1 - (t - hudHideAt) / kHudOut));
+    }
+    bool hudPulsing() const {
+        return hudTone == studio::cua::HudTone::Listening || hudTone == studio::cua::HudTone::Working;
+    }
+    // HUD pixels change this frame (dot pulse, fade in, fade out).
+    bool hudDynamic(double t) const {
+        return !hudGone(t) && (hudPulsing() || t - hudShownAt < kHudIn || t >= hudHideAt);
+    }
+    // The timer must keep running: animating, or waiting for a scheduled fade-out.
+    bool hudAnimating(double t) const { return !hudGone(t) && (hudDynamic(t) || hudHideAt < kForever); }
+    QRectF hudRect() const { return hudShownAt == kNever ? QRectF() : studio::cua::cuaHudRect(hudDisplay); }
 
     static NSDictionary *labelAttrs() {
         NSMutableParagraphStyle *style = [[[NSMutableParagraphStyle alloc] init] autorelease];
@@ -402,6 +436,137 @@ static CGPathRef arrowPath()
 }
 @end
 
+// ---- HUD bar -----------------------------------------------------------------------------------
+
+namespace {
+CGColorRef hudToneColor(studio::cua::HudTone tone, double a)
+{
+    using studio::cua::HudTone;
+    switch (tone) {
+    case HudTone::Listening: return rgba(0xF5, 0xC4, 0x51, a);  // gold
+    case HudTone::Done: return rgba(0x4A, 0xDE, 0x80, a);       // green
+    case HudTone::Error: return rgba(0xFF, 0x6B, 0x6B, a);      // coral
+    case HudTone::Working: break;
+    }
+    return sapphire(a);
+}
+
+NSFont *hudFont() { return [NSFont systemFontOfSize:13 weight:NSFontWeightMedium]; }
+
+// The capsule in global points (the caller's CTM maps global points to its surface).
+void paintHud(CGContextRef ctx, const Scene &s, double now, double shadowScale)
+{
+    using namespace studio::cua::detail;
+    using studio::cua::HudTone;
+    const double alpha = s.hudAlpha(now);
+    if (alpha <= 0 || s.hudShownAt == kNever)
+        return;
+    const auto shadow = [&](CGColorRef color, double blur, double dy) {
+        CGContextSetShadowWithColor(ctx, CGSizeMake(0, dy * shadowScale), blur * shadowScale, color);
+    };
+    const CGRect r = s.hudRect().translated(0, 6 * (1 - s.hudIn(now))).toCGRect();  // rises 6 pt as it fades in
+    const double radius = r.size.height / 2;
+    CGContextSaveGState(ctx);
+    CGContextSetAlpha(ctx, alpha);
+    CGContextBeginTransparencyLayer(ctx, nullptr);
+    CGPathRef body = CGPathCreateWithRoundedRect(r, radius, radius, nullptr);
+    // Soft Gaussian drop shadow under frosted obsidian glass.
+    CGContextSaveGState(ctx);
+    shadow(rgba(0, 0, 0, 0.55), 18, -6);
+    CGContextAddPath(ctx, body);
+    CGContextSetFillColorWithColor(ctx, rgba(0x12, 0x14, 0x1A, 0xE0 / 255.0));
+    CGContextFillPath(ctx);
+    CGContextRestoreGState(ctx);
+    // A faint top sheen, then the 1 pt white-14% rim.
+    CGContextSaveGState(ctx);
+    CGContextAddPath(ctx, body);
+    CGContextClip(ctx);
+    NSGradient *sheen = [[[NSGradient alloc] initWithStartingColor:[NSColor colorWithWhite:1 alpha:0.07]
+                                                       endingColor:[NSColor colorWithWhite:1 alpha:0]] autorelease];
+    [sheen drawFromPoint:NSMakePoint(r.origin.x, r.origin.y) toPoint:NSMakePoint(r.origin.x, r.origin.y + r.size.height * 0.65)
+                 options:0];
+    CGContextRestoreGState(ctx);
+    CGPathRef rim = CGPathCreateWithRoundedRect(CGRectInset(r, 0.5, 0.5), radius - 0.5, radius - 0.5, nullptr);
+    CGContextAddPath(ctx, rim);
+    CGContextSetLineWidth(ctx, 1);
+    CGContextSetStrokeColorWithColor(ctx, rgba(255, 255, 255, 0.14));
+    CGContextStrokePath(ctx);
+    CGPathRelease(rim);
+    CGPathRelease(body);
+
+    // The status dot.
+    const CGPoint dot = CGPointMake(r.origin.x + 20, r.origin.y + r.size.height / 2);
+    const double since = std::max(0.0, now - s.hudShownAt);
+    CGContextSaveGState(ctx);
+    if (s.hudTone == HudTone::Done) {
+        shadow(hudToneColor(s.hudTone, 0.7), 6, 0);
+        CGContextSetLineWidth(ctx, 1.9);
+        CGContextSetLineCap(ctx, kCGLineCapRound);
+        CGContextSetLineJoin(ctx, kCGLineJoinRound);
+        CGContextSetStrokeColorWithColor(ctx, hudToneColor(s.hudTone, 1));
+        CGContextMoveToPoint(ctx, dot.x - 4.6, dot.y + 0.2);
+        CGContextAddLineToPoint(ctx, dot.x - 1.4, dot.y + 3.4);
+        CGContextAddLineToPoint(ctx, dot.x + 4.8, dot.y - 3.6);
+        CGContextStrokePath(ctx);
+    } else {
+        const bool pulsing = s.hudPulsing();
+        const double period = s.hudTone == HudTone::Listening ? 1.2 : 0.9;
+        const double phase = std::fmod(since, period) / period;
+        const double breathe = pulsing ? 0.5 + 0.5 * std::cos(2 * M_PI * phase) : 1;
+        if (pulsing) {
+            // An expanding halo ring, once per period.
+            const double hr = 4 + 7 * easeOutCubic(phase);
+            CGContextSetLineWidth(ctx, 1.2);
+            CGContextSetStrokeColorWithColor(ctx, hudToneColor(s.hudTone, 0.55 * (1 - phase)));
+            CGContextStrokeEllipseInRect(ctx, CGRectMake(dot.x - hr, dot.y - hr, 2 * hr, 2 * hr));
+        }
+        shadow(hudToneColor(s.hudTone, 0.5 + 0.45 * breathe), 4 + 5 * breathe, 0);
+        const double dr = 4;
+        CGContextSetFillColorWithColor(ctx, hudToneColor(s.hudTone, 0.85 + 0.15 * breathe));
+        CGContextFillEllipseInRect(ctx, CGRectMake(dot.x - dr, dot.y - dr, 2 * dr, 2 * dr));
+    }
+    CGContextRestoreGState(ctx);
+
+    // Status text, SF Pro 13 pt, truncated at the right padding.
+    NSMutableParagraphStyle *style = [[[NSMutableParagraphStyle alloc] init] autorelease];
+    style.lineBreakMode = NSLineBreakByTruncatingTail;
+    NSFont *font = hudFont();
+    NSDictionary *attrs = @{NSFontAttributeName: font, NSForegroundColorAttributeName: [NSColor colorWithWhite:1 alpha:0.93],
+                            NSParagraphStyleAttributeName: style};
+    const double textH = std::ceil(font.ascender - font.descender);
+    const double textX = r.origin.x + 36;
+    [s.hudStatus.toNSString() drawInRect:NSMakeRect(textX, r.origin.y + (r.size.height - textH) / 2,
+                                                    r.origin.x + r.size.width - 18 - textX, textH)
+                          withAttributes:attrs];
+    CGContextEndTransparencyLayer(ctx);
+    CGContextRestoreGState(ctx);
+}
+}
+
+@interface LapisCuaHudView : NSView {
+@public
+    const Scene *_scene;
+    QPointF _origin;  // global point at the view's top left
+}
+@end
+
+@implementation LapisCuaHudView
+- (BOOL)isFlipped { return YES; }
+- (BOOL)isOpaque { return NO; }
+- (NSView *)hitTest:(NSPoint)point { (void)point; return nil; }
+- (void)drawRect:(NSRect)dirtyRect
+{
+    CGContextRef ctx = [NSGraphicsContext currentContext].CGContext;
+    CGContextClearRect(ctx, dirtyRect);
+    if (!_scene)
+        return;
+    CGContextSaveGState(ctx);
+    CGContextTranslateCTM(ctx, -_origin.x(), -_origin.y());
+    paintHud(ctx, *_scene, _scene->now(), 1);
+    CGContextRestoreGState(ctx);
+}
+@end
+
 // ---- CuaReticle --------------------------------------------------------------------------------
 
 namespace studio::cua {
@@ -414,8 +579,64 @@ struct CuaReticle::Impl {
     Scene scene;
     LapisCuaPanel *panel = nil;
     LapisCuaReticleView *view = nil;
+    LapisCuaPanel *hudPanel = nil;
+    LapisCuaHudView *hudView = nil;
     NSTimer *timer = nil;
     QRectF lastBounds;
+
+    static QRectF primaryDisplay() {
+        for (const auto &d : listDisplays())
+            if (d.primary)
+                return d.globalPoints;
+        return {};
+    }
+    // The display the HUD pins to when it first appears: the cursor overlay's display while it is
+    // up, else the one under the mouse, else the primary.
+    QRectF hudHomeDisplay() const {
+        if (scene.offscreen || scene.visible)
+            return scene.display;
+        const QRectF primary = primaryDisplay();
+        if (primary.isValid()) {
+            const NSPoint m = [NSEvent mouseLocation];  // AppKit: y up from the primary's bottom
+            const QPointF global(m.x, primary.y() + primary.height() - m.y);
+            for (const auto &d : listDisplays())
+                if (d.globalPoints.adjusted(0, 0, 1, 1).contains(global))
+                    return d.globalPoints;
+        }
+        return primary;
+    }
+    void placeHud() {
+        if (!hudPanel)
+            return;
+        const QRectF primary = primaryDisplay();
+        const QRectF frame = scene.hudRect().adjusted(-detail::kHudPad, -detail::kHudPad, detail::kHudPad, detail::kHudPad);
+        if (!primary.isValid() || frame.isEmpty())
+            return;
+        const QPointF bl = globalPointToAppKit(QPointF(frame.left(), frame.bottom()), primary);
+        [hudPanel setFrame:NSMakeRect(bl.x(), bl.y(), frame.width(), frame.height()) display:NO];
+        hudView.frame = NSMakeRect(0, 0, frame.width(), frame.height());
+        hudView->_origin = frame.topLeft();
+        [hudView setNeedsDisplay:YES];
+    }
+    void ensureTimer() {
+        if (scene.offscreen || timer)
+            return;
+        Impl *owner = this;  // the timer is invalidated in ~CuaReticle, before Impl dies
+        timer = [[NSTimer timerWithTimeInterval:1.0 / 120 repeats:YES block:^(NSTimer *t) { (void)t; owner->tick(); }] retain];
+        timer.tolerance = 0;
+        [[NSRunLoop mainRunLoop] addTimer:timer forMode:NSRunLoopCommonModes];
+    }
+    void hudTick(double now) {
+        if (!hudPanel)
+            return;
+        if (scene.hudGone(now)) {
+            if (hudPanel.visible)
+                [hudPanel orderOut:nil];
+            return;
+        }
+        if (scene.hudDynamic(now))
+            [hudView setNeedsDisplay:YES];
+    }
 
     // The display (global points) under `p`, or an empty rect.
     QRectF displayAt(QPointF p) const {
@@ -468,12 +689,7 @@ struct CuaReticle::Impl {
         if (!wasVisible)
             [panel orderFrontRegardless];
         invalidate(now, true);
-        if (!timer) {
-            Impl *owner = this;  // the timer is invalidated in ~CuaReticle, before Impl dies
-            timer = [[NSTimer timerWithTimeInterval:1.0 / 120 repeats:YES block:^(NSTimer *t) { (void)t; owner->tick(); }] retain];
-            timer.tolerance = 0;
-            [[NSRunLoop mainRunLoop] addTimer:timer forMode:NSRunLoopCommonModes];
-        }
+        ensureTimer();
     }
     void invalidate(double now, bool force) {
         if (!view)
@@ -489,8 +705,10 @@ struct CuaReticle::Impl {
     }
     void tick() {
         const double now = scene.now();
-        invalidate(now, false);
-        if (!scene.animating(now))
+        if (scene.visible)
+            invalidate(now, false);
+        hudTick(now);
+        if (!scene.animating(now) && !scene.hudAnimating(now))
             stopTimer();
     }
     void stopTimer() {
@@ -534,6 +752,26 @@ CuaReticle::CuaReticle(Mode mode, const QRectF &virtualDisplay) : impl(std::make
         for (const auto &d : listDisplays())
             if (d.primary)
                 impl->place(d.globalPoints);
+
+        // The HUD bar: its own small panel, so it can stay pinned while the cursor overlay
+        // follows the target onto another display.
+        impl->hudView = [[LapisCuaHudView alloc] initWithFrame:NSMakeRect(0, 0, kHudWidth, kHudHeight)];
+        impl->hudView->_scene = &impl->scene;
+        impl->hudPanel = [[LapisCuaPanel alloc] initWithContentRect:NSMakeRect(0, 0, kHudWidth, kHudHeight)
+            styleMask:NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel
+            backing:NSBackingStoreBuffered defer:NO];
+        impl->hudPanel.opaque = NO;
+        impl->hudPanel.backgroundColor = [NSColor clearColor];
+        impl->hudPanel.hasShadow = NO;  // drawn soft in the view
+        impl->hudPanel.ignoresMouseEvents = YES;  // click-through: never blocks the desktop under it
+        impl->hudPanel.hidesOnDeactivate = NO;
+        impl->hudPanel.releasedWhenClosed = NO;
+        impl->hudPanel.level = NSStatusWindowLevel;
+        impl->hudPanel.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces |
+            NSWindowCollectionBehaviorFullScreenAuxiliary | NSWindowCollectionBehaviorStationary |
+            NSWindowCollectionBehaviorIgnoresCycle;
+        impl->hudPanel.sharingType = NSWindowSharingNone;  // and excluded from captures by window id
+        impl->hudPanel.contentView = impl->hudView;
     }
 }
 
@@ -548,6 +786,14 @@ CuaReticle::~CuaReticle()
         [impl->panel release];
     }
     [impl->view release];
+    if (impl->hudView)
+        impl->hudView->_scene = nullptr;
+    if (impl->hudPanel) {
+        [impl->hudPanel orderOut:nil];
+        [impl->hudPanel close];
+        [impl->hudPanel release];
+    }
+    [impl->hudView release];
 }
 
 void CuaReticle::moveTo(QPointF point, const QString &label)
@@ -617,7 +863,8 @@ void CuaReticle::hide()
     impl->scene.visible = false;
     impl->scene.focus = {};
     impl->scene.rippleStart = detail::kNever;
-    impl->stopTimer();
+    if (!impl->scene.hudAnimating(impl->scene.now()))
+        impl->stopTimer();  // the HUD keeps its own animation and fade going
     if (impl->panel) {
         [impl->panel orderOut:nil];
         [impl->view setNeedsDisplay:YES];
@@ -628,6 +875,54 @@ uint32_t CuaReticle::windowNumber() const
 {
     requireMainThread();
     return impl->panel ? uint32_t(impl->panel.windowNumber) : 0;
+}
+
+void CuaReticle::showHud(const QString &status, HudTone tone)
+{
+    requireMainThread();
+    @autoreleasepool {
+        Scene &s = impl->scene;
+        const double now = s.now();
+        const bool wasUp = !s.hudGone(now);
+        if (!wasUp) {
+            s.hudDisplay = impl->hudHomeDisplay();
+            s.hudShownAt = now;
+        } else if (now >= s.hudHideAt) {
+            // Caught mid fade-out: resume from the current alpha instead of popping.
+            s.hudShownAt = now - detail::kHudIn * s.hudAlpha(now);
+        }
+        if (s.hudDisplay.isEmpty())
+            return;
+        s.hudStatus = status.simplified().left(160);
+        s.hudTone = tone;
+        s.hudHideAt = tone == HudTone::Done || tone == HudTone::Error ? now + detail::kHudLinger : detail::kForever;
+        if (impl->hudPanel) {
+            if (!wasUp)
+                impl->placeHud();  // pinned: the frame only moves when the HUD reappears
+            [impl->hudView setNeedsDisplay:YES];
+            if (!impl->hudPanel.visible)
+                [impl->hudPanel orderFrontRegardless];
+            impl->ensureTimer();
+        }
+    }
+}
+
+void CuaReticle::hideHud(double afterSeconds)
+{
+    requireMainThread();
+    Scene &s = impl->scene;
+    const double now = s.now();
+    if (s.hudGone(now))
+        return;
+    const double at = now + (std::isfinite(afterSeconds) ? std::max(0.0, afterSeconds) : 0.0);
+    s.hudHideAt = std::min(s.hudHideAt, at);
+    impl->ensureTimer();
+}
+
+uint32_t CuaReticle::hudWindowNumber() const
+{
+    requireMainThread();
+    return impl->hudPanel ? uint32_t(impl->hudPanel.windowNumber) : 0;
 }
 
 ReticleState CuaReticle::state() const
@@ -646,6 +941,11 @@ ReticleState CuaReticle::state() const
         st.label = s.label;
         st.pillRect = s.visible ? s.pillRect(now) : QRectF();
         st.overlayFrame = s.display;
+        st.hudVisible = !s.hudGone(now);
+        st.hudStatus = st.hudVisible ? s.hudStatus : QString();
+        st.hudTone = s.hudTone;
+        st.hudRect = st.hudVisible ? s.hudRect() : QRectF();
+        st.hudAlpha = s.hudAlpha(now);
     }
     return st;
 }
@@ -682,6 +982,12 @@ QImage CuaReticle::render(double scale, const QColor &background) const
         impl->view->_shadowScale = scale;
         [impl->view paintScene:ctx now:impl->scene.now()];
         impl->view->_shadowScale = 1;
+        if (impl->scene.hudDisplay == d) {
+            CGContextSaveGState(ctx);
+            CGContextTranslateCTM(ctx, -d.x(), -d.y());
+            paintHud(ctx, impl->scene, impl->scene.now(), scale);
+            CGContextRestoreGState(ctx);
+        }
         [NSGraphicsContext setCurrentContext:previous];
         [previous release];
         CGContextRelease(ctx);
@@ -728,13 +1034,15 @@ int snapCursor(const QString &outPath)
 {
     requireMainThread();
     const QRectF frame(0, 0, 640, 400);
-    const QRectF button(420, 268, 112, 36);
-    const QPointF start(150, 120), click = button.center() + QPointF(-6, 2);
+    const QRectF button(420, 220, 112, 36);
+    const QPointF start(150, 110), click = button.center() + QPointF(-6, 2);
     const QString label = QStringLiteral("Clicking Send in Mail");
     QImage frames[2];
     {
-        // Mid-glide: curved tail behind the pointer, ring and pill already on the target.
+        // Mid-glide: curved tail behind the pointer, ring and pill already on the target; the HUD
+        // bar pinned bottom-centre shows the working step.
         CuaReticle r(CuaReticle::Mode::Offscreen, frame);
+        r.showHud(QStringLiteral("Mail · Clicking Send"), HudTone::Working);
         r.moveTo(start);
         r.advanceClock(1.0);
         r.highlightRect(button, label);
@@ -744,22 +1052,35 @@ int snapCursor(const QString &outPath)
         frames[0] = r.render(2);
     }
     {
-        // Click: pointer landed, ripple expanding, pill holding.
+        // Click: pointer landed, ripple expanding, pill holding; the HUD bar reports done.
         CuaReticle r(CuaReticle::Mode::Offscreen, frame);
         r.moveTo(start);
         r.advanceClock(1.0);
         r.highlightRect(button, label);
+        r.showHud(QStringLiteral("Done · Send in Mail"), HudTone::Done);
         r.advanceClock(0.2);
         r.pulseClick(click, label);
         r.advanceClock(detail::kGlide + 0.11);
         frames[1] = r.render(2);
     }
-    if (frames[0].isNull() || frames[1].isNull()) {
+    // The other two HUD tones on their own strip.
+    const QRectF stripFrame(0, 0, 640, 110);
+    QImage strip[2];
+    const std::pair<QString, HudTone> tones[2] = {{QStringLiteral("Listening…"), HudTone::Listening},
+                                                  {QStringLiteral("Couldn't find Send in Mail"), HudTone::Error}};
+    for (int i = 0; i < 2; ++i) {
+        CuaReticle r(CuaReticle::Mode::Offscreen, stripFrame);
+        r.showHud(tones[i].first, tones[i].second);
+        r.advanceClock(0.5);
+        strip[i] = r.render(2);
+    }
+    if (frames[0].isNull() || frames[1].isNull() || strip[0].isNull() || strip[1].isNull()) {
         std::fprintf(stderr, "snap-cursor: render failed\n");
         return 2;
     }
     const double scale = 2, gutter = 16;
-    QImage out(int((frame.width() * 2 + gutter) * scale), int(frame.height() * scale), QImage::Format_ARGB32_Premultiplied);
+    QImage out(int((frame.width() * 2 + gutter) * scale), int((frame.height() + stripFrame.height()) * scale),
+               QImage::Format_ARGB32_Premultiplied);
     out.fill(QColor("#050608"));
     QPainter p(&out);
     p.setRenderHint(QPainter::Antialiasing);
@@ -772,6 +1093,10 @@ int snapCursor(const QString &outPath)
         p.restore();
         frames[i].setDevicePixelRatio(scale);
         p.drawImage(at, frames[i]);
+        const QRectF stripAt = stripFrame.translated(i * (frame.width() + gutter), frame.height());
+        p.fillRect(stripAt, QColor("#0B0D11"));
+        strip[i].setDevicePixelRatio(scale);
+        p.drawImage(stripAt, strip[i]);
     }
     p.end();
     QDir().mkpath(QFileInfo(outPath).absolutePath());

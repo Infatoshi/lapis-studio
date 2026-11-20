@@ -1171,6 +1171,22 @@ Backend::Backend(Mode mode, QObject *parent, bool warmHelpers)
     m_memoryTimer.start();
     QTimer::singleShot(1500, this, &Backend::refreshMemory);
     if (warmHelpers) {
+        // The all-Spaces HUD bar (real app only: it opens a window). Holding voice shows
+        // "Listening…"; on release it says "Thinking…" and fades unless a cua_* action takes over.
+        // The executor drives it during actions; a finished queue always fades it out.
+        connect(&m_gamepad, &Gamepad::voiceActiveChanged, this, [this] {
+            if (m_gamepad.voiceActive()) {
+                studio::cua::showCuaHud(QStringLiteral("Listening\u2026"), studio::cua::HudTone::Listening);
+            } else if (!m_cuaPending) {
+                studio::cua::showCuaHud(QStringLiteral("Thinking\u2026"), studio::cua::HudTone::Working);
+                studio::cua::hideCuaHud(4.0);
+            }
+        });
+        connect(this, &Backend::cuaActionFinished, this, [this] {
+            if (!m_cuaPending && !m_gamepad.voiceActive())
+                studio::cua::hideCuaHud(studio::cua::kHudLingerSec);
+        });
+        m_cuaHud = true;
         // The default model's daemon is the one the first Enter will use; every other provider
         // channel starts lazily the first time the picker sends to it, then stays up.
         QTimer::singleShot(400, this, &Backend::warmChannel);
@@ -5116,6 +5132,8 @@ QString Backend::startCuaAction(const QString &action, const CuaCommand &c)
         m_cuaPool->setMaxThreadCount(1);  // one visible action at a time, in order
     }
     ++m_cuaPending;
+    if (m_cuaHud)
+        studio::cua::showCuaHud(verb + QStringLiteral("\u2026"), studio::cua::HudTone::Working);
     QPointer<Backend> self(this);
     m_cuaPool->start([self, action, c, logLine] {
         studio::cua::CuaExecutor ex;

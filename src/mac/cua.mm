@@ -3,6 +3,8 @@
 #import <AppKit/AppKit.h>
 #import <ApplicationServices/ApplicationServices.h>
 #import <ScreenCaptureKit/ScreenCaptureKit.h>
+#include <QDir>
+#include <QFileInfo>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -272,6 +274,12 @@ QString canonicalAppName(const QString &hint) {
         {{"brave", "brave browser"}, "Brave Browser"},
         {{"settings", "system settings", "system preferences"}, "System Settings"},
         {{"whatsapp"}, "WhatsApp"},
+        {{"safari"}, "Safari"},
+        {{"finder"}, "Finder"},
+        {{"discord"}, "Discord"},
+        {{"slack"}, "Slack"},
+        {{"spotify"}, "Spotify"},
+        {{"terminal"}, "Terminal"},
     };
     for (const auto &[keys, name] : aliases) if (keys.contains(k)) return name;
     return h;
@@ -283,8 +291,54 @@ bool appNameMatches(const QString &appName, const QString &hint) {
     return (canon.size() >= 3 && name.contains(canon, Qt::CaseInsensitive)) ||
         (name.size() >= 3 && canon.contains(name, Qt::CaseInsensitive));
 }
-bool activateAppByName(const QString &hint, uint32_t *outDisplayId) {
+QString knownBundleId(const QString &name) {
+    static const QList<std::pair<QString, QString>> ids{
+        {"Google Chrome", "com.google.Chrome"}, {"Visual Studio Code", "com.microsoft.VSCode"},
+        {"Safari", "com.apple.Safari"}, {"Finder", "com.apple.finder"}, {"Discord", "com.hnc.Discord"},
+        {"Slack", "com.tinyspeck.slackmacgap"}, {"Spotify", "com.spotify.client"}, {"Terminal", "com.apple.Terminal"},
+        {"System Settings", "com.apple.systempreferences"}, {"iTerm2", "com.googlecode.iterm2"},
+        {"Microsoft Edge", "com.microsoft.edgemac"}, {"Brave Browser", "com.brave.Browser"},
+        {"Firefox", "org.mozilla.firefox"}, {"Xcode", "com.apple.dt.Xcode"},
+    };
+    for (const auto &[n, id] : ids) if (n.compare(name, Qt::CaseInsensitive) == 0) return id;
+    return {};
+}
+namespace {
+// The installed .app for a canonical name: its bundle id first, then the usual app folders.
+NSURL *installedAppUrl(const QString &canon) {
+    const QString bundle = knownBundleId(canon);
+    if (!bundle.isEmpty())
+        if (NSURL *u = [NSWorkspace.sharedWorkspace URLForApplicationWithBundleIdentifier:bundle.toNSString()]) return u;
+    if (canon.contains('/') || canon.startsWith('.')) return nil;  // a name, never a path
+    const QString file = canon + ".app";
+    for (const QString &dir : {QStringLiteral("/Applications"), QStringLiteral("/System/Applications"),
+                               QStringLiteral("/System/Applications/Utilities"), QDir::homePath() + "/Applications"}) {
+        const QString path = dir + '/' + file;
+        if (QFileInfo(path).isDir()) return [NSURL fileURLWithPath:path.toNSString() isDirectory:YES];
+    }
+    return nil;
+}
+// Launches and activates an installed app; waits (bounded, 4 s) for the process to exist.
+NSRunningApplication *launchApp(NSURL *url) {
+    __block NSRunningApplication *launched = nil;
+    dispatch_semaphore_t done = dispatch_semaphore_create(0);
+    NSWorkspaceOpenConfiguration *config = [NSWorkspaceOpenConfiguration configuration];
+    config.activates = YES;
+    // The completion handler runs on a concurrent queue, so waiting here cannot deadlock.
+    [NSWorkspace.sharedWorkspace openApplicationAtURL:url configuration:config
+                                    completionHandler:^(NSRunningApplication *app, NSError *error) {
+        if (app && !error) launched = [app retain];
+        dispatch_semaphore_signal(done);
+    }];
+    const bool finished = dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, 4 * NSEC_PER_SEC)) == 0;
+    dispatch_release(done);
+    return finished ? [launched autorelease] : nil;  // on timeout the late handler's retain leaks one object, never crashes
+}
+}
+bool activateAppByName(const QString &hint, uint32_t *outDisplayId, int *outPid, bool *outLaunched) {
     if (outDisplayId) *outDisplayId = 0;
+    if (outPid) *outPid = 0;
+    if (outLaunched) *outLaunched = false;
     const QString canon = canonicalAppName(hint);
     if (canon.isEmpty()) return false;
     @autoreleasepool {
@@ -297,17 +351,28 @@ bool activateAppByName(const QString &hint, uint32_t *outDisplayId) {
             if (!loose && appNameMatches(name, canon)) loose = app;
         }
         NSRunningApplication *app = exact ?: loose;
-        if (!app) return false;
         bool activated = false;
-        if (@available(macOS 14.0, *)) {
-            // Cooperative activation: we are usually frontmost, so hand activation over first.
-            if (NSApp) [NSApp yieldActivationToApplication:app];
-            activated = [app activateFromApplication:NSRunningApplication.currentApplication options:NSApplicationActivateAllWindows]
-                || [app activateWithOptions:NSApplicationActivateAllWindows];
-        } else {
-            activated = [app activateWithOptions:NSApplicationActivateAllWindows];
+        if (app) {
+            if (@available(macOS 14.0, *)) {
+                // Cooperative activation: we are usually frontmost, so hand activation over first.
+                if (NSApp) [NSApp yieldActivationToApplication:app];
+                activated = [app activateFromApplication:NSRunningApplication.currentApplication options:NSApplicationActivateAllWindows]
+                    || [app activateWithOptions:NSApplicationActivateAllWindows];
+            } else {
+                activated = [app activateWithOptions:NSApplicationActivateAllWindows];
+            }
+        } else if (NSURL *url = installedAppUrl(canon)) {
+            // Not running: launch it ("open x.com in Chrome" works with Chrome closed).
+            if (@available(macOS 14.0, *)) {
+                NSString *bundle = [NSBundle bundleWithURL:url].bundleIdentifier;
+                if (NSApp && bundle) [NSApp yieldActivationToApplicationWithBundleIdentifier:bundle];
+            }
+            app = launchApp(url);
+            activated = app != nil;
+            if (activated && outLaunched) *outLaunched = true;
         }
         if (!activated) return false;
+        if (outPid) *outPid = app.processIdentifier;
         if (outDisplayId) {
             double bestArea = 0;
             for (const auto &w : listAppWindows())
@@ -318,6 +383,17 @@ bool activateAppByName(const QString &hint, uint32_t *outDisplayId) {
         }
         return true;
     }
+}
+int frontmostAppPid() {
+    @autoreleasepool {
+        NSRunningApplication *front = NSWorkspace.sharedWorkspace.frontmostApplication;
+        return front ? int(front.processIdentifier) : 0;
+    }
+}
+bool hideSelfApp() {
+    if (!NSApp) return false;
+    [NSApp hide:nil];
+    return true;
 }
 QPointF capturePixelToGlobalPoint(QPointF p, const DisplayInfo &d, QSizeF size) {
     size = pixels(d, size);
@@ -385,6 +461,9 @@ QString formatNodesForModel(const QVector<AxNode> &nodes, int maxChars) {
 }
 
 QByteArray captureDisplayJpeg(uint32_t displayId, int maxWidth, uint32_t excludeWindowId, QString *errOut) {
+    return captureDisplayJpeg(displayId, maxWidth, excludeWindowId ? QVector<uint32_t>{excludeWindowId} : QVector<uint32_t>{}, errOut);
+}
+QByteArray captureDisplayJpeg(uint32_t displayId, int maxWidth, const QVector<uint32_t> &excludeIds, QString *errOut) {
     if (errOut) errOut->clear();
     auto fail = [errOut](const QString &s) { if (errOut) *errOut = s; return QByteArray(); };
     if (cancelFlag.load()) return fail("Cancelled");
@@ -399,6 +478,7 @@ QByteArray captureDisplayJpeg(uint32_t displayId, int maxWidth, uint32_t exclude
             void finish(QByteArray b, QString e) { std::lock_guard lock(mutex); bytes = std::move(b); error = std::move(e); done = true; ready.notify_all(); }
         };
         auto state = std::make_shared<State>();
+        const QVector<uint32_t> exclude = excludeIds;  // the block may outlive this call (timeout)
         @autoreleasepool {
             [SCShareableContent getShareableContentWithCompletionHandler:^(SCShareableContent *content, NSError *error) {
                 @autoreleasepool {
@@ -408,7 +488,7 @@ QByteArray captureDisplayJpeg(uint32_t displayId, int maxWidth, uint32_t exclude
                     for (SCDisplay *d in content.displays) if (d.displayID == displayId) { display = d; break; }
                     if (!display) { state->finish({}, "Display not found"); return; }
                     NSMutableArray<SCWindow *> *excluded = [NSMutableArray array];
-                    for (SCWindow *w in content.windows) if (excludeWindowId && w.windowID == excludeWindowId) [excluded addObject:w];
+                    for (SCWindow *w in content.windows) if (w.windowID && exclude.contains(uint32_t(w.windowID))) [excluded addObject:w];
                     SCContentFilter *filter = [[SCContentFilter alloc] initWithDisplay:display excludingWindows:excluded];
                     SCStreamConfiguration *config = [[SCStreamConfiguration alloc] init];
                     const double scale = filter.pointPixelScale;

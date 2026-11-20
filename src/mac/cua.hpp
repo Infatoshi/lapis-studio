@@ -46,10 +46,21 @@ QString canonicalAppName(const QString &appHint);
 // Pure: true when a running app's localized name matches a hint (canonical name equality, else
 // case-insensitive substring either way of the canonical name).
 bool appNameMatches(const QString &appName, const QString &appHint);
-// Activates the regular running app matching appHint (never this process). On success,
-// *outDisplayId is the display of its largest on-screen window, or 0 when none is on screen yet.
+// The installed-app bundle id for a canonical app name ("Google Chrome" -> "com.google.Chrome");
+// empty when unknown. Pure.
+QString knownBundleId(const QString &canonicalName);
+// Activates the regular running app matching appHint (never this process); when none runs, it
+// launches the installed app (known bundle id, else /Applications/<Name>.app and the system app
+// folders). Returns at once: it does not wait for the Space slide (see frontmostAppPid). On
+// success, *outDisplayId is the display of its largest on-screen window (0 when none is on screen
+// yet), *outPid the app's pid, *outLaunched true when it had to be launched.
 // Call on the main thread (AppKit activation).
-bool activateAppByName(const QString &appHint, uint32_t *outDisplayId = nullptr);
+bool activateAppByName(const QString &appHint, uint32_t *outDisplayId = nullptr, int *outPid = nullptr,
+                       bool *outLaunched = nullptr);
+// NSWorkspace's frontmost app pid, 0 when none. Main thread (the value updates on its run loop).
+int frontmostAppPid();
+// Hides this app (NSApp hide:), so a single-screen fullscreen Lapis slides away. Main thread.
+bool hideSelfApp();
 
 struct AxNode {
     int id = 0;
@@ -67,6 +78,9 @@ QString formatNodesForModel(const QVector<AxNode> &nodes, int maxChars = 6000);
 // Always pass the reticle windowNumber: modern ScreenCaptureKit may ignore sharingType.
 QByteArray captureDisplayJpeg(uint32_t displayId, int maxWidth = 1280,
                             uint32_t excludeWindowId = 0, QString *errOut = nullptr);
+// Same, excluding every listed window (the reticle and the HUD bar); zero ids are ignored.
+QByteArray captureDisplayJpeg(uint32_t displayId, int maxWidth, const QVector<uint32_t> &excludeWindowIds,
+                            QString *errOut = nullptr);
 
 struct ActionResult { bool ok; QString detail; };
 ActionResult axPress(int pid, const QString &titleOrRole, const QRectF &nearRect);

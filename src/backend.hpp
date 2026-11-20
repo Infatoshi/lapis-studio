@@ -666,6 +666,7 @@ private:
     QThreadPool *m_cuaPool = nullptr;
     QStringList m_cuaLog;
     int m_cuaPending = 0;
+    bool m_cuaHud = false;  // the real app: voice and cua_* actions drive the floating HUD bar
     // tryHandleStudioCommand for a known project (spawn_agent runs in its folder).
     bool handleStudioCommand(const QString &text, const QString &projectKey, QString *reply);
     QString spawnAgent(const QString &projectKey, const QString &task, bool steerLive);

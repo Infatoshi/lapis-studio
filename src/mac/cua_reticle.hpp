@@ -21,6 +21,14 @@ QPointF quadBezier(QPointF a, QPointF c, QPointF b, double t);
 // else pinned inside; x starts at the anchor's left and is clamped 8 pt inside the display.
 QRectF reticlePillRect(const QRectF &anchor, QSizeF pill, const QRectF &display);
 
+// The floating HUD bar's dot: gold pulse while listening, sapphire pulse while gliding or
+// clicking, a green check when done, coral on error.
+enum class HudTone { Listening, Working, Done, Error };
+constexpr double kHudWidth = 340, kHudHeight = 38, kHudBottomGap = 44;
+constexpr double kHudLingerSec = 2.5;  // Done / Error hold this long, then fade out
+// Where the HUD capsule sits on `display` (global points): centred, 44 pt above the bottom edge.
+QRectF cuaHudRect(const QRectF &display);
+
 // What the overlay is showing right now (tests, snapshots).
 struct ReticleState {
     bool visible = false;
@@ -32,6 +40,12 @@ struct ReticleState {
     QString label;
     QRectF pillRect;          // empty when no pill is shown
     QRectF overlayFrame;      // the display the overlay covers, global points
+    // The all-Spaces HUD bar (independent of the cursor: it stays up while the cursor hides).
+    bool hudVisible = false;  // any alpha, including mid fade-out
+    QString hudStatus;
+    HudTone hudTone = HudTone::Working;
+    QRectF hudRect;           // global points; empty when hidden
+    double hudAlpha = 0;
 };
 
 // The agent's visible cursor: a matte obsidian arrow with a sapphire rim that glides along a
@@ -61,6 +75,18 @@ public:
     void hide();
     uint32_t windowNumber() const;  // 0 in Offscreen mode
 
+    // The floating HUD bar: a frosted obsidian capsule pinned bottom-centre of the display it
+    // first appears on, on every Space (so it stays put while fullscreen Lapis slides away), click-
+    // through, never activating, excluded from captures. A new status while it is up updates it in
+    // place. Done and Error fade out on their own after 2.5 s.
+    void showHud(const QString &status, HudTone tone);
+    void showHud(const QString &status, bool listening = false) {
+        showHud(status, listening ? HudTone::Listening : HudTone::Working);
+    }
+    // Fades the HUD out, starting `afterSeconds` from now (0: at once).
+    void hideHud(double afterSeconds = 0);
+    uint32_t hudWindowNumber() const;  // 0 in Offscreen mode
+
     ReticleState state() const;
     void advanceClock(double seconds);  // Offscreen mode only
     // Renders the real overlay view (the overlay display's top-left at the image origin) over a
@@ -73,7 +99,8 @@ private:
 };
 
 // --snap-cursor OUT.png: two frames side by side on a dark desktop (mid-glide with the motion
-// tail toward a focused button; then the click ripple with the status pill). 0 on success.
+// tail toward a focused button; then the click ripple with the status pill), each with the HUD
+// bar at bottom-centre, over a strip of the remaining HUD tones. 0 on success.
 int snapCursor(const QString &outPath);
 
 } // namespace studio::cua
