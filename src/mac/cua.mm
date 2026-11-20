@@ -86,6 +86,8 @@ QVector<Entry> scan(int pid, int maxNodes, int maxDepth, const Budget &budget, b
     if (app) {
         // Unlock full DOM accessibility trees in Electron/Chromium apps (Discord, Slack, VS Code).
         AXUIElementSetAttributeValue(app.get(), CFSTR("AXManualAccessibility"), kCFBooleanTrue);
+        // Google Chrome only exposes its live web DOM tree (buttons, inputs, sliders, links) with this flag.
+        AXUIElementSetAttributeValue(app.get(), CFSTR("AXEnhancedUserInterface"), kCFBooleanTrue);
         pending.push_back({std::move(app), 0});
     }
     CF<CFMutableSetRef> visited(CFSetCreateMutable(nullptr, 0, &kCFTypeSetCallBacks));
@@ -117,7 +119,8 @@ QVector<Entry> scan(int pid, int maxNodes, int maxDepth, const Budget &budget, b
         if (actions) for (CFIndex i = 0; i < std::min<CFIndex>(CFArrayGetCount(actions), 32); ++i)
             n.actions.push_back(stringValue(CFArrayGetValueAtIndex(actions, i)));
         result.push_back({n, e});
-        if (depth >= maxDepth || !budget.prepare(e.get())) continue;
+        // Never descend into AXMenuBar: hundreds of hidden pull-down menu items starve the visible window DOM.
+        if (depth >= maxDepth || n.role == "AXMenuBar" || !budget.prepare(e.get())) continue;
         // Bounded array fetch: do not materialize an unbounded AXChildren attribute.
         CFArrayRef children = nullptr;
         const auto capacity = maxNodes - result.size() - qsizetype(pending.size());
@@ -427,18 +430,31 @@ QVector<AxNode> inspectDisplay(uint32_t displayId, int maxNodes, double timeoutS
     maxNodes = std::min(maxNodes, 2000);
     CF<CFArrayRef> windows(CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements, kCGNullWindowID));
     if (!windows) return result;
-    QVector<int> seen;
-    for (CFIndex i = 0; i < CFArrayGetCount(windows.get()) && result.size() < maxNodes && budget.left() > 0 && !cancelFlag.load(); ++i) {
+    // Candidate PIDs with a normal-layer window on this display, in front-to-back z-order.
+    QVector<int> pids;
+    for (CFIndex i = 0; i < CFArrayGetCount(windows.get()); ++i) {
         auto info = (CFDictionaryRef)CFArrayGetValueAtIndex(windows.get(), i);
-        CGRect rect{}; int pid = 0;
+        CGRect rect{}; int pid = 0, layer = 0;
         auto rawBounds = (CFDictionaryRef)CFDictionaryGetValue(info, kCGWindowBounds);
         auto rawPid = (CFNumberRef)CFDictionaryGetValue(info, kCGWindowOwnerPID);
+        auto rawLayer = (CFNumberRef)CFDictionaryGetValue(info, kCGWindowLayer);
         if (!rawBounds || !rawPid || !CGRectMakeWithDictionaryRepresentation(rawBounds, &rect)) continue;
+        if (rawLayer) CFNumberGetValue(rawLayer, kCFNumberIntType, &layer);
+        if (layer != 0) continue;  // menu bar, Dock, WindowServer and overlays must not starve app windows
         if (!bounds.intersects({rect.origin.x, rect.origin.y, rect.size.width, rect.size.height})) continue;
         CFNumberGetValue(rawPid, kCFNumberIntType, &pid);
-        if (seen.contains(pid)) continue;
-        seen.push_back(pid);
-        for (const auto &e : scan(pid, maxNodes - int(result.size()), 8, budget, true)) {
+        if (pid > 0 && !pids.contains(pid)) pids.push_back(pid);
+    }
+    // The frontmost app is scanned first with the full budget; Lapis itself only when frontmost or alone.
+    const int front = frontmostAppPid();
+    if (front > 0 && pids.removeAll(front) > 0) pids.prepend(front);
+    const int self = int(getpid());
+    if (self != front && pids.size() > 1) pids.removeAll(self);
+    for (int pid : pids) {
+        if (result.size() >= maxNodes || budget.left() <= 0 || cancelFlag.load()) break;
+        // Background apps get a capped slice so they can never burn the timeout.
+        const Budget appBudget = pid == front ? budget : Budget(std::min(budget.left(), 0.35));
+        for (const auto &e : scan(pid, maxNodes - int(result.size()), 14, appBudget, true)) {
             if (!e.node.globalRect.intersects(bounds)) continue;
             auto n = e.node; n.id = int(result.size()) + 1; result.push_back(n);
         }

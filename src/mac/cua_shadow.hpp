@@ -18,7 +18,7 @@
 namespace studio::cua {
 
 constexpr int kShadowMinGapMs = 350;       // at most one capture per 350 ms
-constexpr int kShadowFrameWidth = 1280;    // same width as the CUA L3 / trace frames
+constexpr int kShadowFrameWidth = 1536;    // same width as the CUA L3 / trace frames
 constexpr int kShadowDefaultMaxSteps = 3000;
 constexpr const char *kShadowLog = "human_traces.jsonl";
 constexpr const char *kShadowFrames = "human_frames";

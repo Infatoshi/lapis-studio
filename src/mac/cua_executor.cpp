@@ -431,7 +431,7 @@ QRectF toDisplay1000(const QRectF &globalRect, const DisplayInfo &display)
 
 namespace {
 
-constexpr int kTraceFrameWidth = 1280;  // the L3 capture width, so a reused L3 frame matches
+constexpr int kTraceFrameWidth = 1536;  // the L3 capture width, so a reused L3 frame matches
 constexpr const char *kTraceLog = "traces.jsonl";
 
 QString frameName(const QJsonValue &v)
@@ -862,7 +862,7 @@ CuaExecutor::Located CuaExecutor::locate(const QString &targetDesc, bool refineC
         loc.detail = QStringLiteral("No AX match and no grounder");
         return loc;
     }
-    constexpr int kMaxWidth = 1280;
+    constexpr int kMaxWidth = 1536;
     QVector<uint32_t> exclude;  // our own overlays: the cursor and the HUD bar
     for (const uint32_t id : {m_hooks.reticleWindowId ? m_hooks.reticleWindowId() : 0u,
                               m_hooks.hudWindowId ? m_hooks.hudWindowId() : 0u})

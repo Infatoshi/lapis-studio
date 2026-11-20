@@ -324,15 +324,15 @@ void executorTests() {
         CuaExecutor ex(m.hooks());
         const auto res = ex.clickTarget("the gear icon", false, true);
         check(res.ok && res.tier == "L3_VLM", "exec L3: ok via VLM");
-        check(m.capturedDisplay == 7 && m.capturedWidth == 1280 && m.capturedExclude == QVector<uint32_t>({4242, 5151}),
-            "exec L3: captures the primary display at 1280 px, excluding the reticle and HUD windows");
+        check(m.capturedDisplay == 7 && m.capturedWidth == 1536 && m.capturedExclude == QVector<uint32_t>({4242, 5151}),
+            "exec L3: captures the primary display at 1536 px, excluding the reticle and HUD windows");
         check(m.groundInstruction == "the gear icon" && m.groundRefine, "exec L3: instruction and refine_crop forwarded");
-        // 1440x900 pt at 2x = 2880x1800 px, captured at 1280x800: 250/1000 -> 360 pt, 500/1000 -> 450 pt.
+        // 1440x900 pt at 2x = 2880x1800 px, captured at 1536x960: 250/1000 -> 360 pt, 500/1000 -> 450 pt.
         check(close(res.globalPt, {360, 450}) && close(m.clickPt, {360, 450}), "exec L3: point_1000 -> Quartz global points");
         check(m.effects() == QStringList({"capture", "ground", "reticleMove", "reticlePulse", "click"}),
             "exec L3: capture -> ground -> move -> pulse -> click");
         check(close(m.movePt, {360, 450}) && close(m.pulsePt, {360, 450}), "exec L3: reticle lands on the click point");
-        check(expectedCaptureSize(m.displays[0], 1280) == QSizeF(1280, 800), "exec L3: expected capture size 1280x800");
+        check(expectedCaptureSize(m.displays[0], 1536) == QSizeF(1536, 960), "exec L3: expected capture size 1536x960");
     }
     {
         // point_px on the capture with a grounder-reported image size.
@@ -634,7 +634,7 @@ void multiMonitorTests() {
         const auto res = ex.typeIntoTarget("Chrome address bar", "x.com\\n");
         check(res.ok && res.tier == "L3_VLM", "multi L3: ok via VLM");
         check(m.capturedDisplay == 2, "multi L3: captures display 2 (Chrome), not display 1 (Lapis)");
-        // 1920x1080 at 1x captured at 1280x720: 500/1000 -> 960 pt, 50/1000 -> 54 pt, offset by x=1920.
+        // 1920x1080 at 1x captured at 1536x864: 500/1000 -> 960 pt, 50/1000 -> 54 pt, offset by x=1920.
         check(close(res.globalPt, {2880, 54}) && m.clickPt.x() >= 1920 && close(m.movePt, {2880, 54}),
             "multi L3: point maps onto display 2's global rect");
         check(m.groundInstruction == "Chrome address bar" && m.typed == "x.com\n", "multi L3: full target grounded, Return typed");
@@ -959,8 +959,8 @@ void traceTests() {
         const auto res = ex.clickTarget("Send");
         const auto lines = traceLines(tmp.path());
         check(res.ok && lines.size() == 1, "trace L1 click: one JSONL line");
-        check(m.calls.count("capture") == 2 && m.capturedWidth == 1280 && m.capturedExclude == QVector<uint32_t>({4242, 5151}),
-            "trace L1 click: two 1280-wide captures excluding reticle + HUD");
+        check(m.calls.count("capture") == 2 && m.capturedWidth == 1536 && m.capturedExclude == QVector<uint32_t>({4242, 5151}),
+            "trace L1 click: two 1536-wide captures excluding reticle + HUD");
         check(m.effects().indexOf("capture") < m.effects().indexOf("click") && m.effects().lastIndexOf("capture") > m.effects().indexOf("click"),
             "trace L1 click: before frame precedes the click, after frame follows it");
         if (lines.size() == 1) {
@@ -1307,7 +1307,7 @@ void shadowTests() {
         const auto res = recordClickSample(tmp.path(), {{460, 320}, false, t0}, r.hooks());
         const auto lines = humanLines(tmp.path());
         check(res.outcome == ShadowOutcome::Recorded && lines.size() == 1, "shadow left: one JSONL line");
-        check(r.captures == 1 && r.capturedDisplay == 7 && r.capturedWidth == 1280, "shadow left: one 1280-wide capture of the click's display");
+        check(r.captures == 1 && r.capturedDisplay == 7 && r.capturedWidth == 1536, "shadow left: one 1536-wide capture of the click's display");
         if (lines.size() == 1) {
             const QJsonObject o = lines[0];
             check(o["source"] == "human_click" && o["button"] == "left" && o["app"] == "Example" && o["role"] == "AXButton"
