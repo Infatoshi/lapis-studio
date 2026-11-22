@@ -136,11 +136,18 @@ struct Gamepad::Platform {
         s.dpadX = g.dpad.right.pressed ? 1 : (g.dpad.left.pressed ? -1 : 0);
         s.dpadY = g.dpad.up.pressed ? 1 : (g.dpad.down.pressed ? -1 : 0);
         const bool dpadDown = (s.dpadX != 0 || s.dpadY != 0);
-        if (NSApp && ![NSApp isActive]) {
+        // Background (another app is frontmost, or only the Spotlight bar is up over it): a
+        // d-pad press summons full Studio instead of navigating a window nobody is looking at.
+        const bool overlay = q->m_overlayActive && q->m_overlayActive();
+        if (NSApp && (![NSApp isActive] || overlay)) {
             if (dpadDown && !bgDpadHeld) {
                 bgDpadHeld = true;
-                [NSApp unhide:nil];
-                [NSApp activateIgnoringOtherApps:YES];
+                if (q->m_summonStudio) {
+                    q->m_summonStudio();
+                } else {
+                    [NSApp unhide:nil];
+                    [NSApp activateIgnoringOtherApps:YES];
+                }
             }
             if (dpadDown || bgDpadHeld) {
                 s.dpadX = 0;
@@ -199,6 +206,10 @@ void Gamepad::setEnabled(bool on)
 
 void Gamepad::triggerVoiceKey(bool down)
 {
+    if (m_voiceKeySink) {
+        m_voiceKeySink(down);
+        return;
+    }
     if (!m_enabled)
         return;
     ++g_platformCalls;

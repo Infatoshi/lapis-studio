@@ -3,6 +3,7 @@
 #include "demo.hpp"
 #include "fixtures.hpp"
 #include "gamepad.hpp"
+#include "mac/cua_spotlight.hpp"
 #include "pdfrender.hpp"
 #include "qml_host.hpp"
 #include "transcript.hpp"
@@ -6805,6 +6806,227 @@ void polishTests()
     }
 }
 
+// L2 (Phonon push-to-talk) -> R2 (send), turn after turn: the in-Studio ask card and the
+// MacBook-wide Spotlight bar (Offscreen here: a pure state machine, no window, no keys posted).
+void voiceSpotlightTests()
+{
+    using S = GamepadSnapshot;
+    auto l2 = [](double v) { S s; s.l2 = v; return s; };
+    // Gamepad alone: the prepare hook and voiceHold both run before the fn key goes out.
+    {
+        Gamepad g;
+        QStringList ev;
+        int delay = 0;
+        g.setPrepareVoiceTarget([&](bool on) { ev << QStringLiteral("prepare:%1").arg(on); return on ? delay : 0; });
+        g.setVoiceKeySinkForTest([&](bool down) { ev << QStringLiteral("key:%1").arg(down); });
+        QObject::connect(&g, &Gamepad::voiceHold, &g, [&](bool on) { ev << QStringLiteral("hold:%1").arg(on); });
+        g.processSnapshot(l2(1.0), 0);
+        g.processSnapshot(S(), 40);
+        check(ev == QStringList({"prepare:1", "hold:1", "key:1", "prepare:0", "hold:0", "key:0"}),
+              "voice order: prepare -> voiceHold -> fn key, on press and release", ev.join(' '));
+        ev.clear();
+        delay = 45;
+        g.processSnapshot(l2(1.0), 100);
+        check(ev == QStringList({"prepare:1", "hold:1"}) && !g.voiceKeySent(),
+              "voice delay: a 45 ms prepare holds the fn key-down back", ev.join(' '));
+        QElapsedTimer t;
+        t.start();
+        while (!g.voiceKeySent() && t.elapsed() < 1000)
+            settle(5);
+        check(g.voiceKeySent() && ev.last() == "key:1" && t.elapsed() >= 30,
+              "voice delay: the key-down goes out once the timer fires", QString::number(t.elapsed()) + " ms");
+        g.processSnapshot(S(), 300);
+        check(ev.last() == "key:0" && ev.count("key:0") == 1, "voice delay: release after the delayed down sends the up");
+        ev.clear();
+        g.processSnapshot(l2(1.0), 400);
+        g.processSnapshot(S(), 410);  // released inside the 45 ms window
+        settle(80);
+        check(!ev.contains("key:1") && !ev.contains("key:0") && !g.voiceKeySent(),
+              "voice delay: a release before the timer cancels it (no key-down, no orphan key-up)", ev.join(' '));
+    }
+
+    // Outside Studio: L2 opens the Spotlight bar over the frontmost app; R2 sends; turns persist.
+    {
+        Backend b(Backend::Mode::Mock);
+        b.setTestStreamCapture(true);
+        bool studioActive = false;
+        b.setStudioActiveProbeForTest([&] { return studioActive; });
+        Gamepad *pad = b.gamepad();
+        QStringList keys;
+        pad->setVoiceKeySinkForTest([&](bool down) { keys << (down ? "down" : "up"); });
+        studio::cua::CuaSpotlight *sp = b.spotlight();
+        sp->setFrontmostProbe([](int *pid, QString *name) { *pid = 4242; *name = QStringLiteral("Google Chrome"); });
+        int openChanges = 0;
+        QObject::connect(&b, &Backend::spotlightOpenChanged, &b, [&] { ++openChanges; });
+        qint64 t = 1000;
+        auto tap = [&](auto set) {
+            S s;
+            set(s);
+            pad->processSnapshot(s, t);
+            pad->processSnapshot(S(), t + 16);
+            t += 40;
+            settle(10);  // the Backend's pad routes are queued
+        };
+        check(!b.spotlightOpen() && b.property("spotlightOpen").toBool() == false, "spotlight: closed at start");
+        pad->processSnapshot(l2(1.0), t += 20);
+        studio::cua::SpotlightState st = sp->state();
+        check(b.spotlightOpen() && openChanges == 1 && st.listening && st.targetApp == "Google Chrome" && st.targetPid == 4242,
+              "spotlight: L2 outside Studio opens the bar over Chrome, listening");
+        check(keys.isEmpty() && !pad->voiceKeySent(), "spotlight: the fn key waits 45 ms for the bar to take focus");
+        settle(80);
+        check(keys == QStringList({"down"}), "spotlight: ...then goes down", keys.join(' '));
+        sp->setInputText(QStringLiteral("summarize this page"));  // what Phonon pasted
+        pad->processSnapshot(S(), t += 20);
+        check(keys == QStringList({"down", "up"}) && !sp->state().listening && b.spotlightOpen(),
+              "spotlight: L2 release lifts the key, stops listening, bar stays up", keys.join(' '));
+        tap([](S &s) { s.r2 = 1.0; });
+        check(b.testStreamStarts().value(0) == "spotlight|summarize this page"
+                  && b.testLastSlice().startsWith("Active macOS app behind Spotlight: Google Chrome")
+                  && sp->state().busy && sp->state().lastQuestion == "summarize this page" && sp->inputText().isEmpty(),
+              "spotlight: R2 sends the prompt with the app behind as the slice", b.testStreamStarts().join(';'));
+        b.testStreamDelta(QStringLiteral("spotlight"), QStringLiteral("It is a pricing page "));
+        b.testStreamDelta(QStringLiteral("spotlight"), QStringLiteral("with three tiers. [[ACTION:go_ho"));
+        check(sp->state().answer == "It is a pricing page with three tiers.",
+              "spotlight: streaming answer, a half-streamed tag never shows", sp->state().answer);
+        b.testStreamFinish(QStringLiteral("spotlight"));
+        st = sp->state();
+        check(st.open && !st.busy && st.actionRuns == 0 && st.answer.startsWith("It is a pricing page") && b.spotlightOpen(),
+              "spotlight: a pure Q&A turn keeps the bar up showing the answer", st.answer);
+
+        // Turn 2 (L2 again while open: focus is already there, no delay) acts on Chrome.
+        keys.clear();
+        pad->processSnapshot(l2(1.0), t += 20);
+        check(keys == QStringList({"down"}) && sp->state().lastQuestion == "summarize this page",
+              "spotlight: L2 on the open bar sends the key at once, previous turn still shown", keys.join(' '));
+        sp->setInputText(QStringLiteral("click sign in"));
+        pad->processSnapshot(S(), t += 20);
+        tap([](S &s) { s.r2 = 1.0; });
+        check(b.testStreamStarts().size() == 2 && b.testStreamStarts().value(1) == "spotlight|click sign in",
+              "spotlight: the second prompt goes out on the same stream", b.testStreamStarts().join(';'));
+        b.testStreamDelta(QStringLiteral("spotlight"), QStringLiteral("Clicking it. [[ACTION:cua_click:Sign In]]"));
+        b.testStreamFinish(QStringLiteral("spotlight"));
+        st = sp->state();
+        check(st.actionRuns == 1 && !st.open && !b.spotlightOpen() && b.cuaLog().contains("cua_click:Sign In")
+                  && st.lastQuestion == "click sign in" && st.answer == "Clicking it." && st.statusLine.startsWith("Done"),
+              "spotlight: a cua_* turn ghosts the bar, runs, then closes keeping the exchange",
+              st.statusLine + " | " + b.cuaLog().join(';'));
+        check(b.streamHistory(QStringLiteral("spotlight")).size() == 4, "spotlight: both turns are in the stream's Tier 2");
+
+        // Still in Chrome: the next L2 pops the bar back with that exchange in its drawer.
+        keys.clear();
+        pad->processSnapshot(l2(1.0), t += 20);
+        st = sp->state();
+        check(b.spotlightOpen() && st.open && st.drawerVisible && st.lastQuestion == "click sign in" && st.opens == 2
+                  && keys.isEmpty(),
+              "spotlight: the next L2 reopens it with the previous Q&A (key waits for focus)");
+        settle(80);
+        pad->processSnapshot(S(), t += 20);
+        check(keys == QStringList({"down", "up"}), "spotlight: ...and dictation runs normally", keys.join(' '));
+        tap([](S &s) { s.b = true; });
+        check(!b.spotlightOpen() && !sp->isOpen(), "spotlight: ○ dismisses the bar");
+
+        // Inside Studio: L2 never opens the bar.
+        studioActive = true;
+        keys.clear();
+        pad->processSnapshot(l2(1.0), t += 20);
+        check(!b.spotlightOpen() && keys == QStringList({"down"}), "spotlight: L2 inside Studio leaves the bar closed, key at once");
+        pad->processSnapshot(S(), t += 20);
+    }
+
+    // In-Studio: L2 -> R2 -> answer -> focus moves away -> L2 again refocuses the same card.
+    {
+        Backend backend(Backend::Mode::Mock);
+        backend.setTestStreamCapture(true);
+        Gamepad *pad = backend.gamepad();
+        QStringList ev;
+        pad->setVoiceKeySinkForTest([&](bool down) { ev << (down ? "key:down" : "key:up"); });
+        QObject::connect(pad, &Gamepad::voiceHold, pad, [&](bool on) { ev << (on ? "hold:1" : "hold:0"); });
+        QQmlApplicationEngine engine;
+        QQuickWindow *win = createStudioWindow(engine, &backend, false, QSize(1920, 1080));
+        check(win != nullptr, "studio voice: QML loads");
+        if (!win)
+            return;
+        QObject *app = win->findChild<QObject *>("studioApp");
+        QQuickItem *omni = firstItem(win, "floatingOmnibar");
+        QQuickItem *card = firstItem(win, "omnibarCard");
+        QQuickItem *input = firstItem(win, "omnibarInput");
+        if (!app || !omni || !card || !input) {
+            check(false, "studio voice: omnibar present");
+            return;
+        }
+        settle(450);
+        backend.setNavMode(QStringLiteral("controller"));
+        pad->setConnected(true, QStringLiteral("DualShock 4"));
+        settle(100);
+        auto focusName = [&] {
+            QQuickItem *f = win->activeFocusItem();
+            return f ? f->objectName() : QString();
+        };
+        qint64 t = 0;
+        // Raycast position: opened with no target, the card sits upper centre.
+        if (QObject *reg = backend.targets())
+            QMetaObject::invokeMethod(reg, "clearHoverTarget", Q_ARG(QString, QString()));
+        QMetaObject::invokeMethod(omni, "openAt", Q_ARG(QVariant, -1), Q_ARG(QVariant, -1));
+        settle(30);
+        check(std::abs(card->x() - (1920 - card->width()) / 2) < 1 && std::abs(card->y() - 173) < 1 && card->width() == 620,
+              "studio voice: openAt(-1, -1) with no target sits upper centre (Raycast), 620 wide",
+              QStringLiteral("%1,%2 %3").arg(card->x()).arg(card->y()).arg(card->width()));
+        QMetaObject::invokeMethod(omni, "close");
+        settle(30);
+
+        pad->processSnapshot(l2(1.0), t += 20);
+        settle(30);
+        QQuickItem *hint = firstItem(win, "omnibarVoiceHint");
+        check(omni->property("open").toBool() && focusName() == "omnibarInput" && omni->property("voiceListening").toBool()
+                  && hint && hint->isVisible() && hint->property("text").toString().contains("Listening"),
+              "studio voice: L2 opens the ask card, prompt focused, Listening pill", focusName());
+        check(ev.mid(0, 2) == QStringList({"hold:1", "key:down"}), "studio voice: the card is focused before the fn key",
+              ev.join(' '));
+        input->setProperty("text", QStringLiteral("what changed in this run"));
+        pad->processSnapshot(S(), t += 20);
+        settle(20);
+        check(hint && hint->property("text").toString() == QStringLiteral("R2 ⏎"), "studio voice: typed text shows the R2 hint",
+              hint ? hint->property("text").toString() : QString());
+        pad->processSnapshot([] { S s; s.r2 = 1.0; return s; }(), t += 20);
+        pad->processSnapshot(S(), t += 20);
+        settle(30);
+        const QString sid = omni->property("streamId").toString();
+        check(backend.testStreamStarts().value(0) == sid + "|what changed in this run" && omni->property("busy").toBool(),
+              "studio voice: R2 sends turn 1", backend.testStreamStarts().join(';'));
+        backend.testStreamDelta(sid, QStringLiteral("The loss dropped to 2.5."));
+        backend.testStreamFinish(sid);
+        settle(30);
+        check(omni->property("open").toBool() && !omni->property("busy").toBool() && focusName() == "omnibarInput"
+                  && omni->property("answer").toString() == "The loss dropped to 2.5.",
+              "studio voice: turn 1 answered, card stays open, prompt refocused", focusName());
+        QMetaObject::invokeMethod(app, "takeFocus");  // focus wanders off the card
+        settle(30);
+        check(focusName() != "omnibarInput" && omni->property("open").toBool(), "studio voice: focus moved away, card still open",
+              focusName());
+        ev.clear();
+        pad->processSnapshot(l2(1.0), t += 20);
+        settle(30);
+        check(omni->property("open").toBool() && focusName() == "omnibarInput"
+                  && omni->property("question").toString() == "what changed in this run"
+                  && omni->property("answer").toString() == "The loss dropped to 2.5." && ev.value(1) == "key:down",
+              "studio voice: the second L2 refocuses the open card, turn 1 still shown (the old !omnibar.open bug)",
+              focusName() + " " + ev.join(' '));
+        input->setProperty("text", QStringLiteral("and the step before"));
+        pad->processSnapshot(S(), t += 20);
+        pad->processSnapshot([] { S s; s.r2 = 1.0; return s; }(), t += 20);
+        pad->processSnapshot(S(), t += 20);
+        settle(30);
+        check(backend.testStreamStarts().value(1) == sid + "|and the step before" && omni->property("sends").toInt() == 2,
+              "studio voice: R2 sends turn 2 on the same card", backend.testStreamStarts().join(';'));
+        check(!backend.spotlightOpen(), "studio voice: the Spotlight bar never opened inside Studio");
+        backend.testStreamFinish(sid);
+        settle(20);
+        QMetaObject::invokeMethod(omni, "close");
+        pad->setConnected(false, QString());
+        settle(30);
+    }
+}
+
 int runTests()
 {
     unitTests();
@@ -6826,6 +7048,7 @@ int runTests()
     hotReloadTests();
     uiTests();
     gamepadUiTests();
+    voiceSpotlightTests();
     std::printf("%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

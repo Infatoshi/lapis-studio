@@ -16,7 +16,10 @@
 #include <QVariantList>
 #include <QVariantMap>
 
+#include <functional>
 #include <memory>
+
+class QTimer;
 
 namespace studio {
 
@@ -204,6 +207,23 @@ public:
     // Calls into GameController.framework so far (process-wide). Stays 0 in every offscreen mode.
     static int platformCalls();
 
+    // Backend (live window): called on every L2 edge after voiceActive updates and before the
+    // Phonon fn key goes out. It moves focus to the right text field (the in-Studio ask card, or
+    // the MacBook-wide Spotlight bar) and returns how long the key-down should wait for that focus
+    // to land (ms; <= 0 sends at once). Only consulted while the voice key is armed.
+    void setPrepareVoiceTarget(std::function<int(bool active)> fn) { m_prepareVoiceTarget = std::move(fn); }
+    // Tests: replaces the CGEvent post with a sink and arms the voice key without
+    // GameController.framework (platformCalls stays 0).
+    void setVoiceKeySinkForTest(std::function<void(bool down)> sink) { m_voiceKeySink = std::move(sink); }
+    // Platform layer: a background d-pad press summons Studio through this when set (Backend
+    // closes the Spotlight bar and restores ordered-out windows); unset, it just activates NSApp.
+    void setSummonStudio(std::function<void()> fn) { m_summonStudio = std::move(fn); }
+    // Platform layer: true while an overlay panel (the Spotlight bar) has NSApp active but the
+    // Studio window is not what the user is looking at, so the d-pad still summons Studio.
+    void setOverlayActive(std::function<bool()> fn) { m_overlayActive = std::move(fn); }
+    // The fn key-down went out for the current hold (false while a delayed down is pending).
+    bool voiceKeySent() const { return m_voiceKeySent; }
+
 signals:
     void connectedChanged();
     void enabledChanged();
@@ -246,7 +266,15 @@ signals:
 
 private:
     void triggerVoiceKey(bool down);
+    void setVoiceActive(bool active);
+    bool voiceKeyArmed() const { return m_enabled || bool(m_voiceKeySink); }
     struct Platform;
+    std::function<int(bool)> m_prepareVoiceTarget;
+    std::function<void(bool)> m_voiceKeySink;
+    std::function<void()> m_summonStudio;
+    std::function<bool()> m_overlayActive;
+    QTimer *m_voiceKeyTimer = nullptr;  // a delayed fn key-down (focus still landing)
+    bool m_voiceKeySent = false;
     GamepadState m_state;
     bool m_connected = false;
     bool m_enabled = false;

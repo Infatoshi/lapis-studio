@@ -1,5 +1,6 @@
 #include "mac/cua_executor.hpp"
 #include "mac/cua_reticle.hpp"
+#include "mac/cua_spotlight.hpp"
 
 #include <QBuffer>
 #include <QCoreApplication>
@@ -329,7 +330,7 @@ QVector<uint32_t> overlayWindowIds()
 {
     QVector<uint32_t> ids;
     runOnMainThread([&] {
-        for (const uint32_t id : {sharedReticle()->windowNumber(), sharedReticle()->hudWindowNumber()})
+        for (const uint32_t id : {sharedReticle()->windowNumber(), sharedReticle()->hudWindowNumber(), spotlightWindowNumber()})
             if (id)
                 ids.push_back(id);
     });
@@ -682,6 +683,12 @@ bool CuaExecutor::route(const QString &targetDesc, bool activate, Route *r, QStr
     }
     r->appHint = hintOverride.isEmpty() ? extractAppHint(targetDesc) : hintOverride;
     r->allowSelf = targetDesc.contains(QLatin1String("lapis"), Qt::CaseInsensitive);
+    // No app named: the default (the app behind the Spotlight bar) is where "click Sign In" or
+    // "press cmd+t" means to act, so it is activated like a named one.
+    if (r->appHint.isEmpty() && !r->allowSelf && !m_defaultAppHint.isEmpty()) {
+        r->appHint = m_defaultAppHint;
+        activate = true;
+    }
     r->selfPid = m_hooks.selfPid ? m_hooks.selfPid() : 0;
     QVector<AppWindowInfo> windows = m_hooks.listAppWindows ? m_hooks.listAppWindows() : QVector<AppWindowInfo>();
     // The display holding the largest window matching pred; 0 when none.

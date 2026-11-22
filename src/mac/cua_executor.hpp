@@ -182,9 +182,13 @@ public:
     void setPreferAxPress(bool on) { m_preferAxPress = on; }
     // Goal and privacy for the trace log; a redacted context never writes a trace.
     void setTraceContext(TraceContext ctx) { m_trace = std::move(ctx); }
+    // The app a step acts on when its target names none (the Spotlight bar's target app).
+    void setDefaultAppHint(const QString &app) { m_defaultAppHint = app.trimmed(); }
+    QString defaultAppHint() const { return m_defaultAppHint; }
     const CuaHooks &hooks() const { return m_hooks; }
 
 private:
+    QString m_defaultAppHint;
     // One public call's trace material, all in memory until the privacy check passes.
     struct StepTrace {
         QByteArray before;  // JPEG captured before the action (the L3 capture when there was one)

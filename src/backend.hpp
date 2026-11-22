@@ -31,6 +31,12 @@
 #include <memory>
 #include "mac/cua_shadow.hpp"
 
+#include <functional>
+
+namespace studio::cua {
+class CuaSpotlight;
+}
+
 namespace studio {
 
 struct SessionInfo {
@@ -359,6 +365,8 @@ class Backend : public QObject {
     Q_PROPERTY(QString reflectionSource READ reflectionSource NOTIFY reflectionChanged)
     // Saved taste rules (rating > 0), newest last; they ride along in the fast-model filter prompt.
     Q_PROPERTY(QStringList tasteRules READ tasteRules NOTIFY tasteRulesChanged)
+    // The MacBook-wide Spotlight bar (studio::cua::CuaSpotlight) is up: it owns L2 / R2 / ✕ / ○.
+    Q_PROPERTY(bool spotlightOpen READ spotlightOpen NOTIFY spotlightOpenChanged)
 
 public:
     enum class Mode { Live, Mock };
@@ -398,6 +406,33 @@ public:
     QString focusedProject() const { return m_focusedProject; }
     Gamepad *gamepad() { return &m_gamepad; }
     QObject *gamepadObject() { return &m_gamepad; }
+
+    // --- L2 routing and the MacBook-wide Spotlight bar ---------------------------------------
+    // Studio's window is the active app (and the bar is down): L2 dictates into the in-Studio
+    // ask card. Anywhere else, L2 pops the Spotlight bar over the frontmost app.
+    bool spotlightOpen() const;
+    // The bar, created on first use: a real panel in the interactive live window, Offscreen in
+    // every other mode (tests drive it as a pure state machine).
+    studio::cua::CuaSpotlight *spotlight();
+    // Gamepad's prepare hook: focuses the right text field for this L2 edge and returns how long
+    // the Phonon key-down should wait for focus to land (45 ms when the bar had to activate us).
+    int prepareVoiceTarget(bool active);
+    // R2 / ✕ / Return: sends the bar's prompt with the app behind it as the Tier 3 slice.
+    Q_INVOKABLE void submitSpotlight();
+    // ○ / Esc: closes the bar (re-activating the app it was opened over) and stops its stream.
+    Q_INVOKABLE void dismissSpotlight(bool restoreTarget = true);
+    // Background d-pad: close the bar and bring full Studio forward.
+    void summonStudio();
+    // Tests: what counts as "Studio is the active app" (default: [NSApp isActive] in the real
+    // window, true in every offscreen mode).
+    void setStudioActiveProbeForTest(std::function<bool()> probe) { m_studioActiveProbe = std::move(probe); }
+    // Tests: with no router, startConversation registers the ask (instead of failing) so
+    // testStreamDelta / testStreamFinish can play the model's reply through the real paths.
+    void setTestStreamCapture(bool on) { m_testStreamCapture = on; }
+    QStringList testStreamStarts() const { return m_testStreamStarts; }  // "streamId|question"
+    QString testLastSlice() const { return m_testLastSlice; }
+    void testStreamDelta(const QString &streamId, const QString &text) { onRouterDelta(streamId, text, QString()); }
+    void testStreamFinish(const QString &streamId, const QString &error = {}) { onRouterFinished(streamId, error); }
     void setFocusedProject(const QString &key);
     int freshTurns(const QString &key) const { return m_fresh.value(key); }
     // Mock only: append one turn to a fixture project's transcript and re-extract it, as if the
@@ -685,6 +720,7 @@ signals:
     void ambientChanged();
     void shadowRecordChanged();
     void pendingProposalChanged();
+    void spotlightOpenChanged();
     void sessionStarted(const QString &projectKey);
     void quickTick();
     void streamDelta(const QString &streamId, const QString &textDelta, const QString &thinkingDelta);
@@ -731,6 +767,25 @@ private:
     int m_quickArtifact = -1;       // the user ask's artifact, reused by its follow-ups
     QString m_quickNote;            // the user turn finishQuick records (follow-ups: compact header)
     void resetCuaLoop();
+    // Spotlight bar turn bookkeeping (stream "spotlight").
+    std::unique_ptr<studio::cua::CuaSpotlight> m_spotlight;
+    bool m_spotlightOpenSeen = false;   // last spotlightOpen() announced
+    bool m_spotlightTurn = false;       // a prompt is streaming / acting
+    bool m_spotlightTurnRanCua = false; // ...and it ran cua_* steps on the app behind
+    QString m_spotlightRaw;             // the current model reply, tags included
+    QString m_spotlightLastAction;      // "Done · Clicked Sign In" for the closed bar
+    bool m_cuaFollowupScheduled = false;  // maybeFinishCuaBatch queued a follow-up turn
+    enum class VoiceTarget { None, Studio, Spotlight };
+    VoiceTarget m_voiceTarget = VoiceTarget::None;
+    std::function<bool()> m_studioActiveProbe;
+    bool m_testStreamCapture = false;
+    QStringList m_testStreamStarts;
+    QString m_testLastSlice;
+    void syncSpotlightOpen();
+    void syncSpotlightTurn();
+    void onSpotlightDelta();
+    void onSpotlightFinished(const QString &error);
+    void noteSpotlightAction(bool ok, const QString &detail);
     void noteCuaResult(quint64 batchId, const CuaStepResult &step);
     void maybeFinishCuaBatch();
     // Live: runs a CuaExecutor on m_cuaPool (one action at a time, never the GUI thread).

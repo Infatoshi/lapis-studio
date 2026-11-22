@@ -3,6 +3,7 @@
 #include "fixtures.hpp"
 #include "ingest/ambient.hpp"
 #include "mac/cua_executor.hpp"
+#include "mac/cua_spotlight.hpp"
 #include "pdfrender.hpp"
 
 #include <QDateTime>
@@ -41,6 +42,11 @@ QString workspacePath() { return home() + QStringLiteral("/.lapis/runtime/worksp
 constexpr char kQuickStreamId[] = "__quick__";
 constexpr char kReflectionStreamId[] = "reflection:1";
 constexpr char kAmbientStreamId[] = "__ambient__";
+// The MacBook-wide Spotlight bar's conversation stream (multi-turn: Tier 2 history per stream).
+constexpr char kSpotlightStreamId[] = "spotlight";
+// How long the Phonon fn key-down waits after the bar had to activate this app, so Phonon's
+// frontmost-app / focused-field snapshot lands on the bar's prompt, not the app behind it.
+constexpr int kSpotlightVoiceDelayMs = 45;
 // Tier 2 cap per conversation stream, in messages (user + assistant pairs).
 constexpr int kMaxStreamHistory = 24;
 
@@ -1115,6 +1121,25 @@ Backend::Backend(Mode mode, QObject *parent, bool warmHelpers)
     connect(&m_proposalTimer, &QTimer::timeout, this, &Backend::dismissPendingProposal);
     // L3 + R3 anywhere (background monitoring is on) runs the staged Ambient proposal.
     connect(&m_gamepad, &Gamepad::confirmProposalRequested, this, [this] { confirmPendingProposal(); });
+    // L2 routing (in-Studio ask card vs the MacBook-wide Spotlight bar) runs before the Phonon
+    // key goes out. While the bar is up it owns R2 / ✕ (send) and ○ (close); queued, so QML's
+    // handlers for the same press still see spotlightOpen and stand aside.
+    m_gamepad.setPrepareVoiceTarget([this](bool active) { return prepareVoiceTarget(active); });
+    m_gamepad.setOverlayActive([this] { return spotlightOpen(); });
+    m_gamepad.setSummonStudio([this] { summonStudio(); });
+    connect(&m_gamepad, &Gamepad::sendPressed, this, [this] { if (spotlightOpen()) submitSpotlight(); }, Qt::QueuedConnection);
+    connect(&m_gamepad, &Gamepad::confirm, this, [this] { if (spotlightOpen()) submitSpotlight(); }, Qt::QueuedConnection);
+    connect(&m_gamepad, &Gamepad::back, this, [this] { if (spotlightOpen()) dismissSpotlight(true); }, Qt::QueuedConnection);
+    connect(this, &Backend::streamDelta, this, [this](const QString &id, const QString &text, const QString &) {
+        if (id == QLatin1String(kSpotlightStreamId)) {
+            m_spotlightRaw += text;
+            onSpotlightDelta();
+        }
+    });
+    connect(this, &Backend::streamFinished, this, [this](const QString &id, const QString &err) {
+        if (id == QLatin1String(kSpotlightStreamId))
+            onSpotlightFinished(err);
+    });
     if (m_mode == Mode::Mock) {
         ensureFixtureFiles();
         const QString clips = ensureSlowmixFixture();
@@ -1180,6 +1205,9 @@ Backend::Backend(Mode mode, QObject *parent, bool warmHelpers)
         // "Listening…"; on release it says "Thinking…" and fades unless a cua_* action takes over.
         // The executor drives it during actions; a finished queue always fades it out.
         connect(&m_gamepad, &Gamepad::voiceActiveChanged, this, [this] {
+            // The in-Studio ask card and the Spotlight bar show their own "Listening…".
+            if (m_voiceTarget != VoiceTarget::None)
+                return;
             if (m_gamepad.voiceActive()) {
                 studio::cua::showCuaHud(QStringLiteral("Listening\u2026"), studio::cua::HudTone::Listening);
             } else if (!m_cuaPending) {
@@ -1215,6 +1243,7 @@ Backend::Backend(Mode mode, QObject *parent, bool warmHelpers)
 
 Backend::~Backend()
 {
+    m_spotlight.reset();
     if (m_shadow)
         m_shadow->stop();  // removes the tap, joins the worker (a capture is bounded to 5 s)
     if (m_cuaPool) {
@@ -3169,6 +3198,16 @@ void Backend::startConversation(const QString &streamId, const QString &projectK
         return;
     }
     LlmRouter *router = llmRouter();
+    if (streamId == QLatin1String(kSpotlightStreamId))
+        m_spotlightRaw.clear();  // each model reply (a follow-up's too) replaces the shown one
+    if (!router && m_testStreamCapture) {
+        // Tests: register the ask exactly as a real stream would; the test plays the reply.
+        m_streamAsks.insert(streamId, StreamAsk{q, QString(), projectKey, followup ? m_cuaFollowupNote : QString(),
+                                                followup ? m_cuaFollowupGoal : q});
+        m_testStreamStarts << streamId + QLatin1Char('|') + q;
+        m_testLastSlice = slice;
+        return;
+    }
     if (!router) {
         emit streamFinished(streamId, QStringLiteral("no LLM router (mock mode)"));
         return;
@@ -5292,10 +5331,21 @@ QString Backend::startCuaAction(const QString &action, const CuaCommand &c)
     const quint64 batchId = m_cuaBatchId;
     if (inBatch)
         ++m_cuaBatch.outstanding;
+    // A Spotlight turn acts on the app behind the bar: the bar ghosts out while it runs, and a
+    // step naming no app goes to that app.
+    const bool spot = inBatch && m_cuaBatch.streamId == QLatin1String(kSpotlightStreamId) && m_spotlight;
+    const QString defaultApp = spot ? m_spotlight->targetApp() : QString();
+    if (spot) {
+        m_spotlightTurnRanCua = true;
+        m_spotlight->setActionRunning(true, (defaultApp.isEmpty() ? QString() : defaultApp + QStringLiteral(" \u00B7 "))
+                                                + verb + QStringLiteral("\u2026"));
+    }
     if (m_mode != Mode::Live) {
         // --test and every mock backend: record only, never capture, click or type.
         m_cuaLog << logLine;
         emit cuaActionFinished(action, shownTarget, true, QStringLiteral("MOCK"), QStringLiteral("recorded, not run"));
+        if (spot)
+            noteSpotlightAction(true, verb);
         if (inBatch)
             noteCuaResult(batchId, CuaStepResult{action, shownTarget, true, QStringLiteral("MOCK"), QStringLiteral("recorded, not run"),
                                                  c.kind == QLatin1String("observe") ? QStringLiteral("(mock: no screen in --test)")
@@ -5318,9 +5368,10 @@ QString Backend::startCuaAction(const QString &action, const CuaCommand &c)
         trace.redacted = std::any_of(p->sessions.cbegin(), p->sessions.cend(), [](const SessionInfo &s) { return s.redacted; })
                          || studio::cua::traceBlocked(false, {p->name, p->dir});
     QPointer<Backend> self(this);
-    m_cuaPool->start([self, action, c, shownTarget, logLine, inBatch, batchId, trace] {
+    m_cuaPool->start([self, action, c, shownTarget, logLine, inBatch, batchId, trace, spot, defaultApp, verb] {
         studio::cua::CuaExecutor ex;
         ex.setTraceContext(trace);
+        ex.setDefaultAppHint(defaultApp);
         const studio::cua::CuaExecResult r = c.kind == QLatin1String("type")      ? ex.typeIntoTarget(c.target, c.text)
                                              : c.kind == QLatin1String("scroll")  ? ex.scrollTarget(c.target, c.deltaY)
                                              : c.kind == QLatin1String("observe") ? ex.observeApp(c.target)
@@ -5329,7 +5380,7 @@ QString Backend::startCuaAction(const QString &action, const CuaCommand &c)
                                                                                   : ex.clickTarget(c.target);
         QMetaObject::invokeMethod(
             QCoreApplication::instance(),
-            [self, action, target = shownTarget, logLine, r, inBatch, batchId] {
+            [self, action, target = shownTarget, logLine, r, inBatch, batchId, spot, verb] {
                 if (!self)
                     return;
                 self->m_cuaPending = std::max(0, self->m_cuaPending - 1);
@@ -5337,9 +5388,13 @@ QString Backend::startCuaAction(const QString &action, const CuaCommand &c)
                 while (self->m_cuaLog.size() > 50)
                     self->m_cuaLog.removeFirst();
                 emit self->cuaActionFinished(action, target, r.ok, r.tier, r.detail);
+                if (spot)
+                    self->noteSpotlightAction(r.ok, r.ok ? verb : r.detail);
                 if (inBatch)
                     self->noteCuaResult(batchId, CuaStepResult{action, target, r.ok, r.ok ? r.tier : QStringLiteral("ERR"),
                                                                r.detail, r.observation});
+                if (spot)
+                    self->syncSpotlightTurn();  // the last step of a turn closes the bar
             },
             Qt::QueuedConnection);
     });
@@ -5447,10 +5502,14 @@ void Backend::maybeFinishCuaBatch()
     const QString note = heads.join(QLatin1Char(' '));  // history keeps the headers, never the AX dump
     const QString streamId = m_cuaBatch.streamId, project = m_cuaBatch.projectKey, goal = m_cuaBatch.goal;
     const quint64 id = m_cuaBatchId;
+    m_cuaFollowupScheduled = true;
     // Next event-loop turn: the answer that started this batch has been recorded by then.
     QTimer::singleShot(0, this, [this, id, streamId, project, prompt, note, goal] {
-        if (id != m_cuaBatchId)
+        m_cuaFollowupScheduled = false;
+        if (id != m_cuaBatchId) {
+            syncSpotlightTurn();
             return;  // reset (new question, cancel) in between
+        }
         m_cuaFollowupAsk = true;
         m_cuaFollowupNote = note;
         m_cuaFollowupGoal = goal;
@@ -5463,7 +5522,166 @@ void Backend::maybeFinishCuaBatch()
         m_cuaFollowupAsk = false;
         m_cuaFollowupNote.clear();
         m_cuaFollowupGoal.clear();
+        syncSpotlightTurn();
     });
+}
+
+// --- L2 routing and the MacBook-wide Spotlight bar ---------------------------------------------
+
+studio::cua::CuaSpotlight *Backend::spotlight()
+{
+    if (!m_spotlight) {
+        // A real panel only in the interactive live window (warm helpers); Offscreen everywhere
+        // else, so --test and every snapshot mode open no window.
+        const auto mode = m_mode == Mode::Live && m_cuaHud ? studio::cua::CuaSpotlight::Mode::Visible
+                                                           : studio::cua::CuaSpotlight::Mode::Offscreen;
+        m_spotlight = std::make_unique<studio::cua::CuaSpotlight>(mode);
+        m_spotlight->onSubmit = [this](const QString &) { submitSpotlight(); };
+        m_spotlight->onDismiss = [this] { dismissSpotlight(studio::cua::studioAppIsActive()); };
+    }
+    return m_spotlight.get();
+}
+
+bool Backend::spotlightOpen() const
+{
+    return m_spotlight && m_spotlight->isOpen();
+}
+
+void Backend::syncSpotlightOpen()
+{
+    const bool now = spotlightOpen();
+    if (now == m_spotlightOpenSeen)
+        return;
+    m_spotlightOpenSeen = now;
+    if (now && m_cuaHud)
+        refreshShadowExcludes();  // the panel's window exists now: keep it out of frames
+    emit spotlightOpenChanged();
+}
+
+int Backend::prepareVoiceTarget(bool active)
+{
+    if (!active) {
+        if (m_spotlight && m_spotlight->isOpen())
+            m_spotlight->setListening(false);
+        return 0;
+    }
+    const bool studioActive = m_studioActiveProbe ? m_studioActiveProbe()
+                                                  : (m_cuaHud ? studio::cua::studioAppIsActive() : true);
+    if (studioActive && !spotlightOpen()) {
+        // Inside Studio: QML's padVoiceHold focuses the ask card; the key goes out at once.
+        m_voiceTarget = VoiceTarget::Studio;
+        return 0;
+    }
+    m_voiceTarget = VoiceTarget::Spotlight;
+    studio::cua::CuaSpotlight *sp = spotlight();
+    const bool wasKey = sp->openOrFocus();
+    sp->setListening(true);
+    syncSpotlightOpen();
+    return wasKey ? 0 : kSpotlightVoiceDelayMs;
+}
+
+void Backend::submitSpotlight()
+{
+    if (!m_spotlight || !m_spotlight->isOpen())
+        return;
+    const QString q = m_spotlight->takeInputText().trimmed();
+    if (q.isEmpty())
+        return;
+    if (m_streamAsks.contains(QLatin1String(kSpotlightStreamId)))
+        cancelStream(QLatin1String(kSpotlightStreamId));  // a new prompt replaces a running one
+    // Tier 3: the app right behind the bar, with a fast bounded AX read of it (live only).
+    const QString app = m_spotlight->targetApp();
+    const int pid = m_spotlight->targetPid();
+    QString slice;
+    if (!app.isEmpty() || pid > 0) {
+        slice = QStringLiteral("Active macOS app behind Spotlight: %1\n").arg(app.isEmpty() ? QStringLiteral("unknown") : app);
+        if (m_mode == Mode::Live && m_cuaHud && pid > 0)
+            slice += studio::cua::formatNodesForModel(studio::cua::inspectApp(pid, 120, 12, 0.25), 2500);
+    }
+    m_spotlight->beginTurn(q);
+    m_spotlightTurn = true;
+    m_spotlightTurnRanCua = false;
+    m_spotlightLastAction.clear();
+    startConversation(QLatin1String(kSpotlightStreamId), focusedProject(), slice, q);
+    syncSpotlightTurn();  // a UI command (or an error) may already have finished it
+}
+
+void Backend::dismissSpotlight(bool restoreTarget)
+{
+    if (!m_spotlight)
+        return;
+    if (m_streamAsks.contains(QLatin1String(kSpotlightStreamId)))
+        cancelStream(QLatin1String(kSpotlightStreamId));
+    m_spotlightTurn = false;
+    m_spotlight->setBusy(false);
+    m_spotlight->dismiss(restoreTarget);
+    syncSpotlightOpen();
+}
+
+void Backend::summonStudio()
+{
+    // A turn still streaming keeps filling the (closed) bar's memory; nothing is cancelled.
+    spotlight()->summonStudio();
+    syncSpotlightOpen();
+}
+
+void Backend::onSpotlightDelta()
+{
+    if (!m_spotlight)
+        return;
+    QString shown = m_spotlightRaw;
+    // A tag still streaming in ("[[ACTION:cua_cl") never flashes on screen.
+    const qsizetype open = shown.lastIndexOf(QLatin1String("[["));
+    if (open >= 0 && shown.indexOf(QLatin1String("]]"), open) < 0)
+        shown.truncate(open);
+    const ParsedModelOutput out = parseStudioModelOutput(shown);
+    m_spotlight->setAnswer(out.ignore ? QString() : out.cleanText);
+}
+
+void Backend::onSpotlightFinished(const QString &error)
+{
+    if (!m_spotlight)
+        return;
+    if (!error.isEmpty()) {
+        m_spotlight->setStatusLine(QStringLiteral("Error \u00B7 ") + oneLine(error, 14));
+    } else {
+        const ParsedModelOutput out = parseStudioModelOutput(m_spotlightRaw);
+        QString clean = out.ignore ? QString() : out.cleanText.trimmed();
+        // A tag-only reply: the action's own confirmation (what the history recorded).
+        if (clean.isEmpty()) {
+            const QVector<ChatTurn> h = m_streamHistory.value(QLatin1String(kSpotlightStreamId));
+            if (!h.isEmpty() && h.last().role == QLatin1String("assistant") && !m_spotlightRaw.isEmpty())
+                clean = h.last().content.trimmed();
+        }
+        if (!clean.isEmpty())
+            m_spotlight->setAnswer(clean);
+    }
+    syncSpotlightTurn();
+}
+
+void Backend::noteSpotlightAction(bool ok, const QString &detail)
+{
+    m_spotlightLastAction = (ok ? QStringLiteral("Done \u00B7 ") : QStringLiteral("Failed \u00B7 ")) + oneLine(detail, 14);
+    if (m_spotlight)
+        m_spotlight->setStatusLine(m_spotlightLastAction);
+}
+
+void Backend::syncSpotlightTurn()
+{
+    if (!m_spotlightTurn || !m_spotlight)
+        return;
+    const bool streaming = m_streamAsks.contains(QLatin1String(kSpotlightStreamId));
+    if (streaming || m_cuaPending > 0 || m_cuaFollowupScheduled)
+        return;  // still answering, acting, or about to take a follow-up turn
+    m_spotlightTurn = false;
+    if (m_spotlightTurnRanCua) {
+        // Acted on the app behind: leave that app frontmost; the exchange waits for the next L2.
+        m_spotlight->finishAfterAction(m_spotlightLastAction.isEmpty() ? QStringLiteral("Done") : m_spotlightLastAction);
+    } else {
+        // Pure Q&A: stay up showing the answer, prompt focused for the next turn.
+        m_spotlight->setBusy(false);
+    }
+    syncSpotlightOpen();
 }
 
 QStringList Backend::runStudioActions(const QVector<StudioAction> &actions)

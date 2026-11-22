@@ -68,10 +68,11 @@ add_library(lapis_mac STATIC
   src/mac/cua_reticle.hpp src/mac/cua_reticle.mm
   src/mac/cua_executor.hpp src/mac/cua_executor.cpp
   src/mac/cua_shadow.hpp src/mac/cua_shadow.mm
+  src/mac/cua_spotlight.hpp src/mac/cua_spotlight.mm
 )
 target_include_directories(lapis_mac PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(lapis_mac PUBLIC lapis_core Qt6::Core Qt6::Gui Qt6::Quick
-  "-framework ApplicationServices" "-framework PDFKit" "-framework AppKit" "-framework CoreGraphics" "-framework Metal" "-framework GameController")
+  "-framework ApplicationServices" "-framework PDFKit" "-framework AppKit" "-framework QuartzCore" "-framework CoreGraphics" "-framework Metal" "-framework GameController")
 lapis_warnings(lapis_mac)
 target_link_libraries(lapis_mac PRIVATE "-framework ScreenCaptureKit" CURL::libcurl)
 

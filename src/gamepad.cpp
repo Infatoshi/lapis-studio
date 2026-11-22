@@ -2,6 +2,8 @@
 // No GameController calls here (see gamepad_mac.mm).
 #include "gamepad.hpp"
 
+#include <QTimer>
+
 #include <algorithm>
 #include <cmath>
 
@@ -567,13 +569,8 @@ void Gamepad::processSnapshot(const Snapshot &s, qint64 nowMs)
                 emit voiceHold(active);
                 break;
             }
-            if (m_voiceActive != active) {
-                m_voiceActive = active;
-                if (m_enabled)
-                    triggerVoiceKey(active);
-                emit voiceActiveChanged();
-                emit voiceHold(active);
-            }
+            if (m_voiceActive != active)
+                setVoiceActive(active);
             break;
         }
         case GamepadAction::RawCaptured:
@@ -584,17 +581,55 @@ void Gamepad::processSnapshot(const Snapshot &s, qint64 nowMs)
     }
 }
 
+// One L2 edge. The order matters for Phonon: on fn key-down it snapshots the frontmost app and
+// its focused text field, and on key-up it pastes there with Cmd+V. So the target field is
+// opened and focused first (prepare hook, voiceHold), and only then does the fn key go out,
+// after a short delay when the Spotlight bar just had to activate this app.
+void Gamepad::setVoiceActive(bool active)
+{
+    m_voiceActive = active;
+    const bool armed = voiceKeyArmed();
+    const int delayMs = (armed && m_prepareVoiceTarget) ? m_prepareVoiceTarget(active) : 0;
+    emit voiceActiveChanged();
+    emit voiceHold(active);
+    if (!armed)
+        return;
+    if (active) {
+        if (m_voiceKeyTimer)
+            m_voiceKeyTimer->stop();
+        if (delayMs <= 0) {
+            m_voiceKeySent = true;
+            triggerVoiceKey(true);
+            return;
+        }
+        if (!m_voiceKeyTimer) {
+            m_voiceKeyTimer = new QTimer(this);
+            m_voiceKeyTimer->setSingleShot(true);
+            connect(m_voiceKeyTimer, &QTimer::timeout, this, [this] {
+                if (m_voiceActive && voiceKeyArmed() && !m_voiceKeySent) {
+                    m_voiceKeySent = true;
+                    triggerVoiceKey(true);
+                }
+            });
+        }
+        m_voiceKeyTimer->start(delayMs);
+        return;
+    }
+    // Released before a delayed key-down went out: cancel it, never an orphan key-up.
+    if (m_voiceKeyTimer)
+        m_voiceKeyTimer->stop();
+    if (m_voiceKeySent) {
+        m_voiceKeySent = false;
+        triggerVoiceKey(false);
+    }
+}
+
 void Gamepad::setConnected(bool on, const QString &name)
 {
     if (on == m_connected && name == m_name)
         return;
-    if (!on && m_voiceActive) {
-        m_voiceActive = false;
-        if (m_enabled)
-            triggerVoiceKey(false);
-        emit voiceActiveChanged();
-        emit voiceHold(false);
-    }
+    if (!on && m_voiceActive)
+        setVoiceActive(false);
     m_connected = on;
     m_name = on ? name : QString();
     m_state.reset();

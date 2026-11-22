@@ -869,8 +869,11 @@ FocusScope {
         else if (lens === 2) stage.scrollPixels(px);
         else if (lens === 1) ladder.scrollPixels(px);
     }
+    // The MacBook-wide Spotlight bar is up: Backend routes R2 / ✕ / ○ / L2 to it alone.
+    readonly property bool spotlightOwnsPad: backend ? backend.spotlightOpen : false
     function padConfirm() {
         poke();
+        if (spotlightOwnsPad) return;
         if (omnibar.open) omnibar.submit();
         else if (controllerMap.open) controllerMap.startCapture();
         else if (onboarding.open) onboarding.confirm();
@@ -889,6 +892,7 @@ FocusScope {
     }
     function padBack() {
         poke();
+        if (spotlightOwnsPad) return;
         if (onboarding.open) return;  // a mode has to be picked once
         if (omnibar.open) omnibar.close();
         else if (controllerMap.open) controllerMap.hide();
@@ -979,15 +983,18 @@ FocusScope {
         lensScrollPixels(dy);
     }
     // L2: dictate into the ask card, opened beside the highlighted target (into the composer
-    // instead when it already has focus).
+    // instead when it already has focus). Already open (a previous turn on screen): focus goes
+    // back to its prompt, so every hold dictates into it, turn after turn.
     function padVoiceHold(active) {
         poke();
+        if (spotlightOwnsPad) return;
         if (active && !onboarding.open && !dialog.open && !settings.open && !controllerMap.open
-                && !briefing.open && !review.open && !answers.inputFocused && !omnibar.open)
-            omnibar.openAt(-1, -1);
+                && !briefing.open && !review.open && !answers.inputFocused)
+            omnibar.focusForVoice();
     }
     function padSend() {
         poke();
+        if (spotlightOwnsPad) return;
         if (omnibar.open) omnibar.submit();
         else if (controllerMap.open) controllerMap.startCapture();
         else if (onboarding.open) onboarding.confirm();
@@ -1734,6 +1741,7 @@ FocusScope {
         mouseMode: app.navMode === "mouse"
         padHints: app.padHints
         padGlyphs: app.padGlyphs
+        voiceListening: app.gamepad ? app.gamepad.voiceActive : false
         suppressed: settings.open || dialog.open || onboarding.open || briefing.open || controllerMap.open || review.open || music.open
         onClosed: app.takeFocus()
     }

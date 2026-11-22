@@ -2,6 +2,7 @@
 #include "mac/cua_reticle.hpp"
 #include "mac/cua_executor.hpp"
 #include "mac/cua_shadow.hpp"
+#include "mac/cua_spotlight.hpp"
 #include <CoreGraphics/CGEventTypes.h>
 #include <QCoreApplication>
 #include <QDateTime>
@@ -1413,6 +1414,106 @@ void shadowTests() {
         check(!rec.isRunning(), "shadow recorder: stop without start is a no-op");
     }
 }
+// The MacBook-wide Spotlight bar: pure geometry, then the Offscreen state machine (no window).
+void spotlightTests() {
+    {
+        const QRectF screen(0, 0, 1512, 982);  // AppKit: origin bottom-left
+        const QRectF f = spotlightFrame(screen, kSpotlightBaseHeight);
+        check(f.width() == kSpotlightWidth && std::abs(f.center().x() - screen.center().x()) <= 1,
+            "spotlight: 620 wide, centred horizontally");
+        check(std::abs((f.y() + f.height()) - (982 - std::round(982 * 0.20))) < 1e-9,
+            "spotlight: top edge 20% below the screen top (AppKit coords)");
+        const QRectF g = spotlightFrame(QRectF(-1920, 200, 1920, 1080), 200);
+        check(g.x() == -1920 + 650 && std::abs(g.y() + g.height() - (200 + 1080 - 216)) < 1e-9,
+            "spotlight: a secondary screen with a negative origin");
+        check(spotlightFrame(screen, 10).height() == kSpotlightBaseHeight
+                  && spotlightFrame(screen, 1000).height() == kSpotlightMaxHeight,
+            "spotlight: height clamped to 96..340");
+        check(spotlightHeight(false, 500) == 96 && spotlightHeight(true, 0) > 96 && spotlightHeight(true, 5000) <= 340
+                  && spotlightHeight(true, 40) < spotlightHeight(true, 120),
+            "spotlight: the drawer grows with the answer, capped at 340");
+        check(spotlightHint(true) == QStringLiteral("● Listening…")
+                  && spotlightHint(false) == QStringLiteral("L2 voice · R2 send · ○ close"),
+            "spotlight: hint text listening / idle");
+        check(spotlightPlaceholder("Google Chrome") == QStringLiteral("Command or ask about Google Chrome…"),
+            "spotlight: placeholder names the target app");
+    }
+    {
+        CuaSpotlight sp(CuaSpotlight::Mode::Offscreen);
+        int frontPid = 4321;
+        QString frontName = "Google Chrome";
+        sp.setFrontmostProbe([&](int *pid, QString *name) { *pid = frontPid; *name = frontName; });
+        QString submitted;
+        int dismissed = 0;
+        sp.onSubmit = [&](const QString &t) { submitted = t; };
+        sp.onDismiss = [&] { ++dismissed; };
+        check(!sp.isOpen() && sp.windowNumber() == 0 && sp.state().opens == 0, "spotlight off: closed, no window");
+        const bool wasKey = sp.openOrFocus();
+        SpotlightState st = sp.state();
+        check(!wasKey && st.open && st.key && st.alpha == 1.0 && st.targetPid == 4321 && st.targetApp == "Google Chrome",
+            "spotlight off: openOrFocus captures the frontmost app as the target");
+        check(st.frame.height() == kSpotlightBaseHeight && !st.drawerVisible && sp.windowNumber() == 0,
+            "spotlight off: base height without a drawer, still no window");
+        check(sp.openOrFocus(), "spotlight off: a second openOrFocus is already key (no voice-key delay)");
+        sp.setListening(true);
+        check(sp.state().listening && sp.state().hint.contains("Listening"), "spotlight off: listening hint");
+        sp.setInputText("click sign in");
+        sp.setListening(false);
+        check(sp.inputText() == "click sign in" && sp.state().hint.startsWith("L2 voice"),
+            "spotlight off: dictated text kept after release");
+        const QString q = sp.takeInputText();
+        sp.beginTurn(q);
+        st = sp.state();
+        check(q == "click sign in" && st.inputText.isEmpty() && st.lastQuestion == "click sign in" && st.busy
+                  && st.statusLine == QStringLiteral("Thinking…") && st.drawerVisible && st.frame.height() > kSpotlightBaseHeight,
+            "spotlight off: a turn shows the question + Thinking… and grows the drawer");
+        const double top = st.frame.y() + st.frame.height();
+        sp.setAnswer(QString("A long answer. ").repeated(60));
+        st = sp.state();
+        check(std::abs(st.frame.y() + st.frame.height() - top) < 1e-9 && st.frame.height() <= kSpotlightMaxHeight,
+            "spotlight off: growing keeps the top edge, capped at 340");
+        sp.setActionRunning(true, "Google Chrome · Clicking sign in…");
+        st = sp.state();
+        check(st.actionRunning && st.alpha == 0.0 && st.open && st.actionRuns == 1,
+            "spotlight off: a cua_* action ghosts the bar (alpha 0)");
+        sp.finishAfterAction("Done · Clicked sign in");
+        st = sp.state();
+        check(!st.open && !st.actionRunning && st.lastQuestion == "click sign in" && st.statusLine == "Done · Clicked sign in"
+                  && !st.answer.isEmpty(),
+            "spotlight off: after the action it closes but keeps the exchange");
+        frontPid = 999; frontName = "Discord";
+        check(!sp.openOrFocus(), "spotlight off: reopening after an action is not key yet (voice key waits)");
+        st = sp.state();
+        check(st.open && st.lastQuestion == "click sign in" && st.drawerVisible && st.targetApp == "Discord" && st.opens == 2,
+            "spotlight off: the second L2 pops it back with the previous exchange and a fresh target");
+        sp.setBusy(false);
+        sp.dismiss(true);
+        check(!sp.isOpen() && sp.state().dismissals == 2 && !sp.reactivateTarget(),
+            "spotlight off: dismiss closes; Offscreen never activates an app");
+        check(submitted.isEmpty() && dismissed == 0, "spotlight off: state calls never fire the user callbacks");
+    }
+    {
+        // A step naming no app goes to the Spotlight's target app, which is activated first.
+        MockRig m = singleScreenRig();
+        m.activateOk = true; m.activatePid = 600;
+        m.windowsAfterActivate = {{600, "Google Chrome", 1, {0, 25, 1512, 957}, true}};
+        m.frontSeq = {600};
+        m.hotkeyCombo.clear();
+        CuaExecutor ex(m.hooks());
+        ex.setDefaultAppHint("Google Chrome");
+        const auto res = ex.hotkeyAction(QString(), "cmd+t");
+        check(res.ok && m.calls.contains("activate:Google Chrome") && !m.calls.contains("hideSelf"),
+            "spotlight exec: an app-less hotkey activates the bar's target app, Lapis is not hidden");
+        MockRig n = singleScreenRig();
+        n.activateOk = true; n.activatePid = 700;
+        n.frontSeq = {700};
+        CuaExecutor ex2(n.hooks());
+        ex2.setDefaultAppHint("Google Chrome");
+        ex2.hotkeyAction("Slack", "cmd+k");
+        check(n.calls.contains("activate:Slack") && !n.calls.contains("activate:Google Chrome"),
+            "spotlight exec: an explicit app still wins over the default");
+    }
+}
 int main(int argc, char **argv) {
     QCoreApplication app(argc, argv);
     traceTests();
@@ -1421,6 +1522,7 @@ int main(int argc, char **argv) {
     reticleGeometryTests(); reticleOffscreenTests(); hudTests(); executorTests(); multiMonitorTests();
     spaceSwitchTests();
     hotkeyDragTests();
+    spotlightTests();
     if (app.arguments().contains("--capture-smoke")) captureSmokeTest();
     std::printf("test_cua: %d passed, %d failed\n", passed, failed);
     return failed ? 1 : 0;

@@ -19,6 +19,8 @@ Item {
     // Controller mode: Ask / + Pin / × carry the pad button that does the same (✕ / R1 / ○).
     property bool padHints: false
     property var padGlyphs: ({})
+    // L2 is held and Phonon is listening (StudioApp binds it to gamepad.voiceActive).
+    property bool voiceListening: false
     onSuppressedChanged: if (suppressed && open) close()  // a modal over it takes the pad and keys
 
     property bool open: false
@@ -76,9 +78,26 @@ Item {
         card.y = clampY(at.y);
         input.forceActiveFocus();
     }
+    // L2 (Phonon push-to-talk): a fresh centred card when closed; when already open (a previous
+    // turn's question and answer still showing) just take focus back, so the next dictation
+    // lands in the prompt and the multi-turn context stays on screen.
+    function focusForVoice() {
+        if (suppressed || !backend)
+            return;
+        if (!open) {
+            openAt(-1, -1);
+            return;
+        }
+        if (targets && targets.hasActiveTarget && targets.pinnedCount === 0)
+            snapshot = [targets.activeTarget];
+        card.x = clampX(card.x);
+        card.y = clampY(card.y);
+        input.forceActiveFocus();
+        input.cursorPosition = input.text.length;
+    }
     // Right beside the highlighted target: its right side when the card fits there, else its
     // left, else under it, else over it, else tucked inside its bottom-right corner (a target as
-    // big as the window). No target: the point that was clicked, else centred near the bottom.
+    // big as the window). No target: the point that was clicked, else upper centre (Raycast).
     function anchorFor(t, px, py) {
         const gap = 14;
         const cw = card.width, ch = Math.max(card.height, 160);
@@ -96,7 +115,7 @@ Item {
         }
         if (px !== undefined && px >= 0)
             return { x: px, y: py + 10 };
-        return { x: (width - cw) / 2, y: height - ch - 56 };
+        return { x: (width - cw) / 2, y: Math.max(margin, Math.round(height * 0.16)) };
     }
     // Send what is typed (✕ / R2 on the pad, Enter on the keyboard).
     function submit() { ask(input.text); }
@@ -206,6 +225,8 @@ Item {
             if (id === root.streamId && root.streamId.length > 0) {
                 root.busy = false;
                 root.error = err;
+                if (root.open)
+                    input.forceActiveFocus();  // never strand keyboard / Phonon focus after a turn
                 return;
             }
             const i = root.pinnedIndex(id);
@@ -365,7 +386,7 @@ Item {
         id: card
         objectName: "omnibarCard"
         visible: root.open
-        width: Math.min(580, root.width - 2 * root.margin)
+        width: Math.min(620, root.width - 2 * root.margin)
         height: col.implicitHeight + 30
         radius: 18
         color: Theme.card
@@ -534,14 +555,35 @@ Item {
                 height: Theme.px(44)
                 radius: 12
                 color: Theme.bg
-                border.width: 1
-                border.color: input.activeFocus ? Theme.goldA(0.55) : Theme.line
+                border.width: root.voiceListening ? 1.5 : 1
+                border.color: root.voiceListening ? Theme.gold : (input.activeFocus ? Theme.goldA(0.55) : Theme.line)
+                // Right-aligned live hint: "● Listening…" while L2 is held, else the pad keys.
+                Text {
+                    id: voiceHint
+                    objectName: "omnibarVoiceHint"
+                    anchors.right: parent.right
+                    anchors.rightMargin: 14
+                    anchors.verticalCenter: parent.verticalCenter
+                    visible: root.voiceListening || root.padHints
+                    text: root.voiceListening ? "\u25CF Listening\u2026"
+                                              : (input.text.length === 0 ? "L2 voice \u00B7 R2 send" : "R2 \u23CE")
+                    color: root.voiceListening ? Theme.gold : Theme.faint
+                    font.family: Theme.mono
+                    font.pixelSize: 12
+                    SequentialAnimation on opacity {
+                        running: root.voiceListening
+                        loops: Animation.Infinite
+                        onStopped: voiceHint.opacity = 1
+                        NumberAnimation { from: 1; to: 0.45; duration: 600; easing.type: Easing.InOutSine }
+                        NumberAnimation { from: 0.45; to: 1; duration: 600; easing.type: Easing.InOutSine }
+                    }
+                }
                 TextInput {
                     id: input
                     objectName: "omnibarInput"
                     anchors.fill: parent
                     anchors.leftMargin: 14
-                    anchors.rightMargin: 14
+                    anchors.rightMargin: voiceHint.visible ? voiceHint.implicitWidth + 26 : 14
                     verticalAlignment: TextInput.AlignVCenter
                     clip: true
                     color: Theme.ink
