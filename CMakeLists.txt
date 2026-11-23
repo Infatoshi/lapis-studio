@@ -47,6 +47,7 @@ add_library(lapis_llm STATIC
   src/llm/prefix.hpp src/llm/prefix.cpp
   src/llm/sse.hpp src/llm/sse.cpp
   src/llm/router.hpp src/llm/router.cpp
+  src/llm/jarvis_legs.hpp src/llm/jarvis_legs.cpp
 )
 target_link_libraries(lapis_llm PUBLIC lapis_core Qt6::Core PRIVATE CURL::libcurl)
 lapis_warnings(lapis_llm)

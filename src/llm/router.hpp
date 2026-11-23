@@ -32,6 +32,9 @@ struct LlmStreamRequest {
     QByteArray payload;     // JSON body (stream: true)
     int timeoutMs = 0;      // whole-transfer timeout; 0 = none
     int connectTimeoutMs = 10000;
+    // Fails the stream ("first byte timeout after N ms") when no response body byte has
+    // arrived this long after the start; 0 = none. Lets a caller fail over before any delta.
+    int firstByteTimeoutMs = 0;
 };
 
 class LlmRouter : public QObject {

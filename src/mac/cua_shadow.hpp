@@ -19,7 +19,10 @@ namespace studio::cua {
 
 constexpr int kShadowMinGapMs = 350;       // at most one capture per 350 ms
 constexpr int kShadowFrameWidth = 1536;    // same width as the CUA L3 / trace frames
-constexpr int kShadowDefaultMaxSteps = 3000;
+// Real clicks are scarce training data: the log keeps 22,000 and prunes only past 25,000
+// (slack = maxSteps * 3 / 22, so a small test cap of 10 trims past 11).
+constexpr int kShadowDefaultMaxSteps = 22000;
+constexpr int kShadowPruneAtSteps = 25000;
 constexpr const char *kShadowLog = "human_traces.jsonl";
 constexpr const char *kShadowFrames = "human_frames";
 

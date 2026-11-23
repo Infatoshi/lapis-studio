@@ -2,11 +2,13 @@
 // The router tests run against a local POSIX-socket HTTP/1.1 SSE server on its own thread that
 // holds every connection open until all N have connected (a barrier), so they only pass when the
 // router really keeps N streams in flight at once (QNetworkAccessManager stops at 6 per host).
+#include "llm/jarvis_legs.hpp"
 #include "llm/prefix.hpp"
 #include "llm/router.hpp"
 #include "llm/sse.hpp"
 
 #include <QCoreApplication>
+#include <QDateTime>
 #include <QElapsedTimer>
 #include <QFile>
 #include <QHash>
@@ -715,6 +717,211 @@ void warmAndErrorTests()
           "router: HTTP 500 -> error with status and body", sink.error.value("e"));
 }
 
+// --- Inkling request shape and Jarvis failover legs ----------------------------------------
+
+QJsonObject jsonOf(const QByteArray &b)
+{
+    return QJsonDocument::fromJson(b).object();
+}
+
+void inklingTests()
+{
+    TieredPrompt p;
+    p.model = QStringLiteral("Infatoshi/Inkling-2-Mini-heretic");
+    p.systemPrompt = QStringLiteral("SYS");
+    p.question = QStringLiteral("open x.com");
+    for (const char *eff : {"", "fast", "none"}) {
+        p.effort = QString::fromLatin1(eff);
+        const QJsonObject o = jsonOf(buildTieredChatRequest(p));
+        const QJsonObject k = o.value("chat_template_kwargs").toObject();
+        check(k.size() == 1 && k.contains("reasoning_effort") && k.value("reasoning_effort").toDouble(-1) == 0.0
+                  && !k.contains("enable_thinking") && !o.contains("reasoning_effort"),
+              "inkling: no-think effort -> chat_template_kwargs.reasoning_effort 0.0, never enable_thinking",
+              QString::fromUtf8(QJsonDocument(k).toJson(QJsonDocument::Compact)) + " effort=" + p.effort);
+        check(o.value("temperature").toDouble(-1) == 0.0 && o.value("repeat_penalty").toDouble(-1) == 1.0
+                  && o.value("max_tokens").toInt() == 384 && o.value("stream").toBool()
+                  && o.value("continue_final_message").toBool() && !o.value("add_generation_prompt").toBool(true)
+                  && o.value("messages").toArray().last().toObject().value("role").toString() == "assistant",
+              "inkling: greedy, repeat_penalty 1.0, max_tokens 384, and continue_final_message prefill when not thinking");
+    }
+    const QHash<QString, double> want = {{"low", 0.2}, {"medium", 0.5}, {"high", 0.8}};
+    for (auto it = want.cbegin(); it != want.cend(); ++it) {
+        p.effort = it.key();
+        const QJsonObject o = jsonOf(buildTieredChatRequest(p));
+        check(o.value("chat_template_kwargs").toObject().value("reasoning_effort").toDouble(-1) == it.value()
+                  && o.value("max_tokens").toInt() == 640 && o.value("repeat_penalty").toDouble(-1) == 1.0,
+              "inkling: low/medium/high -> reasoning_effort 0.2/0.5/0.8, max_tokens 640", it.key());
+    }
+    // Case-insensitive model match; a non-Inkling model keeps the Qwen no-think shape exactly.
+    check(isInklingModel("thinkingmachines/inkling-2-mini") && isInklingModel("INKLING") && !isInklingModel("qwen3.8"),
+          "inkling: model match is case-insensitive");
+    TieredPrompt q = p;
+    q.model = QStringLiteral("qwen3.8-flash-next");
+    q.effort = QStringLiteral("fast");
+    const QJsonObject qo = jsonOf(buildTieredChatRequest(q));
+    check(qo.value("chat_template_kwargs").toObject() == QJsonObject{{"enable_thinking", false}} && !qo.contains("temperature")
+              && !qo.contains("repeat_penalty") && !qo.contains("max_tokens"),
+          "inkling: non-Inkling compat request unchanged (enable_thinking false only)");
+
+    // OpenRouter: PrimeIntellect FP4 only, no fallbacks.
+    TieredPrompt r = p;
+    r.model = QStringLiteral("thinkingmachines/inkling-2-mini");
+    r.effort = QStringLiteral("fast");
+    const QJsonObject ro = jsonOf(buildOpenRouterChatRequest(r));
+    const QJsonObject prov = ro.value("provider").toObject();
+    check(prov.value("order").toArray() == QJsonArray{"PrimeIntellect"} && prov.value("quantizations").toArray() == QJsonArray{"fp4"}
+              && prov.value("allow_fallbacks") == QJsonValue(false) && !prov.contains("sort"),
+          "inkling openrouter: provider PrimeIntellect fp4, allow_fallbacks false",
+          QString::fromUtf8(QJsonDocument(prov).toJson(QJsonDocument::Compact)));
+    check(ro.value("temperature").toDouble(-1) == 0.0 && ro.value("max_tokens").toInt() == 384
+              && ro.value("reasoning").toObject().value("effort") == "none" && !ro.contains("chat_template_kwargs"),
+          "inkling openrouter: temperature 0, max_tokens 384 at effort none");
+    r.effort = QStringLiteral("low");
+    check(jsonOf(buildOpenRouterChatRequest(r)).value("max_tokens").toInt() == 640, "inkling openrouter: max_tokens 640 when thinking");
+    TieredPrompt d = r;
+    d.model = QStringLiteral("deepseek/deepseek-v4.1-flash-1017");
+    const QJsonObject dp = jsonOf(buildOpenRouterChatRequest(d)).value("provider").toObject();
+    check(dp.value("order").toArray() == QJsonArray{"Wafer", "InferenceNet", "Nebius"} && dp.value("allow_fallbacks").toBool()
+              && dp.value("sort") == "latency" && !jsonOf(buildOpenRouterChatRequest(d)).contains("max_tokens"),
+          "inkling openrouter: DeepSeek routing unchanged");
+}
+
+void jarvisLegTests()
+{
+    JarvisLegConfig cfg;
+    check(planJarvisLegs(cfg).isEmpty(), "legs: nothing configured -> no legs");
+    cfg.jarvisEndpoint = QStringLiteral("http://127.0.0.1:9/v1/");
+    cfg.openrouterKey = QStringLiteral("k");
+    QVector<JarvisLeg> legs = planJarvisLegs(cfg);
+    QStringList names;
+    for (const JarvisLeg &l : legs)
+        names << l.name;
+    check(names == QStringList({"self", "inkling", "deepseek"}), "legs: self, inkling, deepseek in order", names.join(','));
+    if (legs.size() == 3) {
+        check(legs[0].endpoint == "http://127.0.0.1:9/v1/chat/completions" && legs[0].model == kJarvisDefaultModel
+                  && legs[0].connectTimeoutMs == 200 && legs[0].firstByteTimeoutMs == 1800 && !legs[0].openRouter
+                  && legs[0].apiKey.isEmpty(),
+              "legs: self leg 200 ms connect, 1.8 s first byte, default Inkling model, no key", legs[0].endpoint);
+        check(legs[1].model == "thinkingmachines/inkling-2-mini" && legs[1].openRouter && legs[1].connectTimeoutMs == 3000
+                  && legs[1].firstByteTimeoutMs == 2500 && legs[1].apiKey == "k"
+                  && legs[1].endpoint == "https://openrouter.ai/api/v1/chat/completions",
+              "legs: OpenRouter Inkling 3 s / 2.5 s");
+        check(legs[2].model == "deepseek/deepseek-v4.1-flash-1017" && legs[2].connectTimeoutMs == 4000
+                  && legs[2].firstByteTimeoutMs == 4000,
+              "legs: OpenRouter DeepSeek 4 s / 4 s");
+        TieredPrompt p;
+        p.question = QStringLiteral("q");
+        p.effort = QStringLiteral("fast");
+        check(jsonOf(buildJarvisLegRequest(legs[0], p)).value("chat_template_kwargs").toObject().contains("reasoning_effort")
+                  && jsonOf(buildJarvisLegRequest(legs[1], p)).value("provider").toObject().value("order").toArray()
+                         == QJsonArray{"PrimeIntellect"}
+                  && jsonOf(buildJarvisLegRequest(legs[2], p)).value("model") == "deepseek/deepseek-v4.1-flash-1017",
+              "legs: each leg builds its own request shape");
+    }
+    cfg.jarvisModel = QStringLiteral("custom/model");
+    check(planJarvisLegs(cfg).value(0).model == "custom/model", "legs: jarvisModel overrides the self model");
+    cfg.selfBreakerOpen = true;
+    check(planJarvisLegs(cfg).size() == 2 && planJarvisLegs(cfg).value(0).name == "inkling", "legs: open breaker skips self");
+    cfg.openrouterKey.clear();
+    check(planJarvisLegs(cfg).isEmpty(), "legs: open breaker and no key -> none (caller retries self)");
+
+    check(jarvisLegRetryable("Failed to connect to 127.0.0.1 port 9") && jarvisLegRetryable("first byte timeout after 1800 ms")
+              && jarvisLegRetryable("HTTP 503: overloaded") && jarvisLegRetryable("HTTP 429") && jarvisLegRetryable("HTTP 0")
+              && !jarvisLegRetryable("HTTP 401: bad key") && !jarvisLegRetryable("HTTP 404") && !jarvisLegRetryable(QString()),
+          "legs: transport / timeout / 5xx / 429 retry; auth and 404 do not");
+    JarvisBreaker b;
+    check(!b.isOpen(1000), "breaker: closed at start");
+    b.trip(1000);
+    check(b.isOpen(1000) && b.isOpen(15999) && !b.isOpen(16000), "breaker: open exactly 15 s after a trip");
+}
+
+// A socket that listens (the kernel completes the TCP handshake) but never answers: a hung model.
+struct SilentListener {
+    int fd = -1;
+    quint16 port = 0;
+    bool listen()
+    {
+        fd = ::socket(AF_INET, SOCK_STREAM, 0);
+        sockaddr_in addr {};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        if (fd < 0 || ::bind(fd, reinterpret_cast<sockaddr *>(&addr), sizeof addr) != 0 || ::listen(fd, 8) != 0)
+            return false;
+        socklen_t len = sizeof addr;
+        ::getsockname(fd, reinterpret_cast<sockaddr *>(&addr), &len);
+        port = ntohs(addr.sin_port);
+        return true;
+    }
+    QString url() const { return QStringLiteral("http://127.0.0.1:%1/v1/chat/completions").arg(port); }
+    ~SilentListener()
+    {
+        if (fd >= 0)
+            ::close(fd);
+    }
+};
+
+void firstByteAndFailoverTests()
+{
+    SilentListener hung;
+    check(hung.listen(), "first byte: silent listener up");
+    LlmRouter router;
+    Sink sink;
+    sink.attach(router);
+    LlmStreamRequest r = req(QStringLiteral("fb"), hung.url(), QStringLiteral("fb"));
+    r.firstByteTimeoutMs = 300;
+    QElapsedTimer t;
+    t.start();
+    router.startStream(r);
+    const bool done = waitUntil([&] { return sink.finishes.contains("fb"); }, 5000);
+    const qint64 ms = t.elapsed();
+    check(done && sink.error.value("fb") == "first byte timeout after 300 ms" && sink.deltas.value("fb") == 0,
+          "first byte: a hung endpoint fails with a first byte timeout, no deltas", sink.error.value("fb"));
+    check(ms >= 280 && ms < 1500, "first byte: fires near its 300 ms deadline", QString::number(ms));
+    check(waitUntil([&] { return router.handlesInMulti() == 0; }, 1000), "first byte: the hung handle is removed");
+
+    // Leg 1 (hung) -> leg 2 (answers) on one stream id, before any delta: the Backend's rule.
+    MiniServer ok;
+    check(ok.listen(), "failover: answering server up");
+    MiniServer::Config c;
+    c.rounds = 3;
+    ok.start(c);
+    QVector<JarvisLeg> legs = {{QStringLiteral("self"), hung.url(), QString(), QStringLiteral("inkling-local"), false, 200, 300},
+                               {QStringLiteral("inkling"), ok.url(), QString(), QStringLiteral("inkling-or"), false, 3000, 2500}};
+    int leg = 0;
+    JarvisBreaker breaker;
+    QStringList finishes;
+    QString text;
+    auto launch = [&] {
+        LlmStreamRequest lr = req(QStringLiteral("spotlight"), legs[leg].endpoint, QStringLiteral("j%1").arg(leg));
+        lr.connectTimeoutMs = legs[leg].connectTimeoutMs;
+        lr.firstByteTimeoutMs = legs[leg].firstByteTimeoutMs;
+        router.startStream(lr);
+    };
+    QObject::connect(&router, &LlmRouter::streamDelta, [&](const QString &id, const QString &tx, const QString &) {
+        if (id == "spotlight")
+            text += tx;
+    });
+    QObject::connect(&router, &LlmRouter::streamFinished, [&](const QString &id, const QString &e) {
+        if (id != "spotlight")
+            return;
+        if (jarvisLegRetryable(e) && text.isEmpty() && leg + 1 < legs.size()) {
+            if (legs[leg].name == "self")
+                breaker.trip(QDateTime::currentMSecsSinceEpoch());
+            ++leg;
+            launch();
+            return;
+        }
+        finishes << e;
+    });
+    launch();
+    const bool fin = waitUntil([&] { return !finishes.isEmpty(); }, 6000);
+    ok.join();
+    check(fin && finishes == QStringList{QString()} && leg == 1 && !text.isEmpty()
+              && breaker.isOpen(QDateTime::currentMSecsSinceEpoch()),
+          "failover: hung leg 1 -> leg 2 answers on the same stream, one clean finish, breaker tripped",
+          finishes.join(';') + " leg=" + QString::number(leg) + " text=" + text);
+}
+
 }  // namespace
 
 int main(int argc, char **argv)
@@ -729,6 +936,9 @@ int main(int argc, char **argv)
     cancelTest();
     restartTest();
     warmAndErrorTests();
+    inklingTests();
+    jarvisLegTests();
+    firstByteAndFailoverTests();
     std::printf("test_llm: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

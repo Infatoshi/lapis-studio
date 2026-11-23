@@ -618,6 +618,9 @@ const QList<ModelSpec> &modelCatalog()
         // "fast" = reasoning effort "none" on OpenRouter, the default; low..high opt into thinking.
         {QStringLiteral("deepseek/deepseek-v4.1-flash-1017"), QStringLiteral("openrouter"), QStringLiteral("DeepSeek V4.1 Flash"),
          QStringList{QStringLiteral("fast")} + lmh, QStringLiteral("Fast")},
+        // Jarvis's OpenRouter leg (PrimeIntellect FP4). "fast" = reasoning_effort 0.0.
+        {QStringLiteral("thinkingmachines/inkling-2-mini"), QStringLiteral("openrouter"), QStringLiteral("Inkling 2 Mini"),
+         QStringList{QStringLiteral("fast")} + lmh, QStringLiteral("Fast")},
         // "fast" = no thinking (enable_thinking false), the default; low / medium opt into it.
         {QStringLiteral("qwen3.8-flash-next"), QStringLiteral("openai-compat"), QStringLiteral("Qwen3.8 Flash Next"),
          QStringList{QStringLiteral("fast"), QStringLiteral("low"), QStringLiteral("medium")}, QStringLiteral("Fast")},
@@ -1785,6 +1788,9 @@ void Backend::loadPrefs()
         m_openaiCompatModel = compatModel;
     m_openaiCompatKey = o.value(QLatin1String("openaiCompatKey")).toString().trimmed();
     m_openrouterKey = o.value(QLatin1String("openrouterApiKey")).toString().trimmed();
+    // Read only, like the key: savePrefs merges over the file, so both survive untouched.
+    m_jarvisEndpointPref = o.value(QLatin1String("jarvisEndpoint")).toString().trimmed();
+    m_jarvisModelPref = o.value(QLatin1String("jarvisModel")).toString().trimmed();
     m_viewState = normalizedViewState(o.value(QLatin1String("viewState")).toObject().toVariantMap());
     emit viewStateChanged();
     m_showCodeDiffs = o.value(QLatin1String("showCodeDiffs")).toBool(false);
@@ -3163,6 +3169,9 @@ void Backend::onRouterDelta(const QString &streamId, const QString &text, const 
     if (it == m_streamAsks.end())
         return;  // not ours (a shared, injected router)
     it->answer += text;
+    if (!text.isEmpty() && m_jarvisTurn.active && m_jarvisTurn.firstTextMs < 0
+        && streamId == QLatin1String(kSpotlightStreamId))
+        m_jarvisTurn.firstTextMs = m_jarvisClock.elapsed();
     emit streamDelta(streamId, text, thinking);
 }
 
@@ -3239,6 +3248,23 @@ void Backend::onRouterFinished(const QString &streamId, const QString &error)
     auto it = m_streamAsks.find(streamId);
     if (it == m_streamAsks.end())
         return;
+    if (m_jarvisTurn.active && streamId == QLatin1String(kSpotlightStreamId)) {
+        const JarvisLeg &leg = m_jarvisTurn.legs[m_jarvisTurn.leg];
+        const bool retryable = jarvisLegRetryable(error);
+        if (retryable && leg.name == QLatin1String("self"))
+            m_jarvisBreaker.trip(QDateTime::currentMSecsSinceEpoch());  // 15 s of straight-to-OpenRouter
+        if (retryable && it->answer.isEmpty() && m_jarvisTurn.leg + 1 < m_jarvisTurn.legs.size()) {
+            // Nothing reached the user yet: the next leg answers on the same stream, unseen.
+            m_jarvisTurn.failedLegs << leg.name + QStringLiteral(": ") + oneLine(error, 16);
+            if (m_mode == Mode::Live)
+                std::fprintf(stderr, "lapis_studio: jarvis leg %s failed (%s), trying %s\n", qPrintable(leg.name),
+                             qPrintable(oneLine(error, 16)), qPrintable(m_jarvisTurn.legs[m_jarvisTurn.leg + 1].name));
+            ++m_jarvisTurn.leg;
+            startJarvisLeg();
+            return;
+        }
+        finishJarvisTurn(error, it->answer);
+    }
     const StreamAsk done = it.value();
     m_streamAsks.erase(it);
     if (error.isEmpty() && !done.answer.trimmed().isEmpty()) {
@@ -3313,6 +3339,17 @@ void Backend::startConversation(const QString &streamId, const QString &projectK
         emit streamFinished(streamId, QStringLiteral("no LLM router (mock mode)"));
         return;
     }
+    const QVector<JarvisLeg> legs = streamId == QLatin1String(kSpotlightStreamId) ? jarvisLegs() : QVector<JarvisLeg>{};
+    if (!legs.isEmpty()) {
+        // Jarvis: the self-hosted leg first, then OpenRouter, all on this one stream id.
+        TieredPrompt p = tieredPrompt(projectKey, slice, q, m_sharedHistory);
+        const QString base = isInklingModel(m_chatModel) ? m_chatEffort : compatEffort();
+        p.effort = jarvisEscalatedEffort(base, m_cuaLoopDepth, followup && m_cuaPrevStepErr);
+        const QString goal = followup ? m_cuaFollowupGoal : q;
+        m_streamAsks.insert(streamId, StreamAsk{q, QString(), projectKey, followup ? m_cuaFollowupNote : QString(), goal});
+        startJarvisTurn(legs, p, projectKey, goal, followup ? m_cuaLastAxChars : 0);
+        return;
+    }
     const QString endpoint = compatEndpoint();
     if (endpoint.isEmpty()) {
         emit streamFinished(streamId, QStringLiteral("Set openaiCompatUrl in studio_prefs.json or LAPIS_OPENAI_COMPAT_URL"));
@@ -3359,6 +3396,155 @@ void Backend::cancelStream(const QString &streamId)
     m_streamAsks.remove(streamId);
     if (m_router)
         m_router->cancelStream(streamId);
+}
+
+// --- Jarvis failover legs and planner_turns.jsonl ---------------------------------------------
+
+QString Backend::jarvisEndpoint() const
+{
+    // Like LAPIS_OPENAI_COMPAT_URL, the env var only reaches the live window, never --test.
+    if (!m_jarvisEndpointPref.isEmpty() || m_mode != Mode::Live)
+        return m_jarvisEndpointPref;
+    return qEnvironmentVariable("LAPIS_JARVIS_ENDPOINT").trimmed();
+}
+
+QString Backend::jarvisModel() const
+{
+    if (!m_jarvisModelPref.isEmpty())
+        return m_jarvisModelPref;
+    const QString env = m_mode == Mode::Live ? qEnvironmentVariable("LAPIS_JARVIS_MODEL").trimmed() : QString();
+    if (!env.isEmpty())
+        return env;
+    return jarvisEndpoint().isEmpty() ? QString() : QString::fromLatin1(kJarvisDefaultModel);
+}
+
+bool Backend::jarvisBreakerOpen() const
+{
+    return m_jarvisBreaker.isOpen(QDateTime::currentMSecsSinceEpoch());
+}
+
+QVector<JarvisLeg> Backend::jarvisLegs() const
+{
+    const bool open = jarvisBreakerOpen();
+    if (!m_testJarvisLegs.isEmpty()) {
+        QVector<JarvisLeg> legs;
+        for (const JarvisLeg &l : m_testJarvisLegs)
+            if (!open || l.name != QLatin1String("self"))
+                legs << l;
+        return legs.isEmpty() ? m_testJarvisLegs : legs;
+    }
+    // No self-hosted endpoint: Jarvis keeps the OpenAI-compatible path it always had.
+    JarvisLegConfig cfg{jarvisEndpoint(), jarvisModel(), openrouterKey(), open};
+    if (cfg.jarvisEndpoint.isEmpty())
+        return {};
+    QVector<JarvisLeg> legs = planJarvisLegs(cfg);
+    if (legs.isEmpty()) {
+        cfg.selfBreakerOpen = false;  // breaker open but nothing to fall back to: still try it
+        legs = planJarvisLegs(cfg);
+    }
+    return legs;
+}
+
+QString Backend::jarvisEscalatedEffort(const QString &effort, int loopDepth, bool prevStepErr)
+{
+    if (loopDepth >= 1 && prevStepErr && (effort.isEmpty() || isNoThinkEffort(effort)))
+        return QStringLiteral("low");
+    return effort;
+}
+
+void Backend::startJarvisTurn(const QVector<JarvisLeg> &legs, const TieredPrompt &p, const QString &projectKey,
+                              const QString &goal, int axChars)
+{
+    if (!m_jarvisClock.isValid())
+        m_jarvisClock.start();
+    const quint64 replaced = m_jarvisTurn.active ? m_jarvisTurn.id : 0;
+    if (replaced && !jarvisLogBlocked(m_jarvisTurn.projectKey, {m_jarvisTurn.goal}))
+        appendPlannerLog(QJsonObject{{QStringLiteral("event"), QStringLiteral("interrupt")},
+                                     {QStringLiteral("aborted_turn_id"), qint64(replaced)},
+                                     {QStringLiteral("superseded"), true},
+                                     {QStringLiteral("ts"), QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs)}});
+    JarvisTurn t;
+    t.active = true;
+    t.id = ++m_jarvisTurnSeq;
+    t.supersedes = replaced ? replaced : std::exchange(m_jarvisSupersedes, 0);
+    t.legs = legs;
+    t.prompt = p;
+    t.projectKey = projectKey;
+    t.goal = goal;
+    t.axChars = axChars;
+    t.startMs = m_jarvisClock.elapsed();
+    m_jarvisTurn = t;
+    m_jarvisLastTurnId = t.id;
+    startJarvisLeg();
+}
+
+void Backend::startJarvisLeg()
+{
+    LlmRouter *router = llmRouter();
+    if (!router || m_jarvisTurn.leg >= m_jarvisTurn.legs.size())
+        return;
+    const JarvisLeg &leg = m_jarvisTurn.legs[m_jarvisTurn.leg];
+    LlmStreamRequest req;
+    req.streamId = QLatin1String(kSpotlightStreamId);
+    req.endpoint = leg.endpoint;
+    req.apiKey = leg.apiKey;
+    req.payload = buildJarvisLegRequest(leg, m_jarvisTurn.prompt);
+    req.connectTimeoutMs = leg.connectTimeoutMs;
+    req.firstByteTimeoutMs = leg.firstByteTimeoutMs;
+    router->startStream(req);
+}
+
+void Backend::finishJarvisTurn(const QString &error, const QString &raw)
+{
+    if (!m_jarvisTurn.active)
+        return;
+    m_jarvisTurn.active = false;
+    const JarvisTurn &t = m_jarvisTurn;
+    if (jarvisLogBlocked(t.projectKey, {t.goal, raw}))
+        return;
+    const qint64 now = m_jarvisClock.elapsed();
+    QJsonObject o;
+    o[QStringLiteral("turn_id")] = qint64(t.id);
+    o[QStringLiteral("supersedes_turn_id")] = t.supersedes ? QJsonValue(qint64(t.supersedes)) : QJsonValue(QJsonValue::Null);
+    o[QStringLiteral("model")] = t.legs.value(t.leg).model;
+    o[QStringLiteral("leg")] = t.legs.value(t.leg).name;
+    o[QStringLiteral("effort")] = t.prompt.effort;
+    o[QStringLiteral("goal")] = t.goal;
+    o[QStringLiteral("ax_chars")] = t.axChars;
+    o[QStringLiteral("raw_reply")] = raw;
+    o[QStringLiteral("ttft_ms")] = t.firstTextMs >= 0 ? QJsonValue(t.firstTextMs - t.startMs) : QJsonValue(QJsonValue::Null);
+    o[QStringLiteral("e2e_ms")] = now - t.startMs;
+    o[QStringLiteral("ok")] = error.isEmpty();
+    if (!error.isEmpty())
+        o[QStringLiteral("error")] = oneLine(error, 24);
+    if (!t.failedLegs.isEmpty())
+        o[QStringLiteral("failed_legs")] = QJsonArray::fromStringList(t.failedLegs);
+    o[QStringLiteral("ts")] = QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs);
+    appendPlannerLog(o);
+}
+
+bool Backend::jarvisLogBlocked(const QString &projectKey, const QStringList &fields)
+{
+    bool redacted = false;
+    QStringList all = fields;
+    all << projectKey;
+    if (const Project *p = find(projectKey)) {
+        redacted = std::any_of(p->sessions.cbegin(), p->sessions.cend(), [](const SessionInfo &s) { return s.redacted; });
+        all << p->name << p->dir;
+    }
+    return studio::cua::traceBlocked(redacted, all);
+}
+
+void Backend::appendPlannerLog(const QJsonObject &o) const
+{
+    if (m_mode != Mode::Live)
+        return;  // tests and mocks never touch ~/.lapis-next
+    const QString dir = studio::cua::defaultTraceDir();
+    if (dir.isEmpty() || !QDir().mkpath(dir))
+        return;
+    QFile f(dir + QStringLiteral("/planner_turns.jsonl"));
+    if (f.open(QIODevice::WriteOnly | QIODevice::Append))
+        f.write(QJsonDocument(o).toJson(QJsonDocument::Compact) + '\n');
 }
 
 void Backend::clearStreamHistory(const QString &streamId)
@@ -5670,6 +5856,8 @@ void Backend::resetCuaLoop()
     ++m_cuaBatchId;  // results of actions still running belong to nothing now
     m_cuaLoopDepth = 0;
     m_cuaFollowups.clear();
+    m_cuaPrevStepErr = false;
+    m_cuaLastAxChars = 0;
 }
 
 void Backend::noteCuaResult(quint64 batchId, const CuaStepResult &step)
@@ -5693,6 +5881,12 @@ void Backend::maybeFinishCuaBatch()
     if (!cuaShouldContinue(steps, m_cuaLoopDepth))
         return;
     ++m_cuaLoopDepth;
+    m_cuaPrevStepErr = std::any_of(steps.cbegin(), steps.cend(), [](const CuaStepResult &s) {
+        return !s.ok || s.tier == QLatin1String("ERR");
+    });
+    m_cuaLastAxChars = 0;
+    for (const CuaStepResult &s : steps)
+        m_cuaLastAxChars += int(s.observation.size());
     const QString prompt = cuaFollowupPrompt(steps);
     m_cuaFollowups << prompt;
     if (m_mode != Mode::Live)
@@ -5906,6 +6100,22 @@ bool Backend::interruptJarvis(bool superseded)
         goal = m_cuaBatch.goal;
     if (goal.isEmpty() && m_spotlightTurn && m_spotlight)
         goal = m_spotlight->state().lastQuestion;
+    // 0. Tombstone the aborted Jarvis turn (streaming, or acting on its reply) in
+    // planner_turns.jsonl, so harvesting never learns from a reply the user cut off.
+    {
+        // Not streaming but still acting (m_spotlightTurn): the reply that started the steps.
+        const quint64 aborted = m_jarvisTurn.active ? m_jarvisTurn.id : m_spotlightTurn ? m_jarvisLastTurnId : 0;
+        const QString abortedProject = m_jarvisTurn.projectKey;
+        m_jarvisTurn.active = false;
+        if (superseded)
+            m_jarvisSupersedes = aborted;
+        if (aborted && !jarvisLogBlocked(abortedProject, {goal}))
+            appendPlannerLog(QJsonObject{
+                {QStringLiteral("event"), QStringLiteral("interrupt")},
+                {QStringLiteral("aborted_turn_id"), qint64(aborted)},
+                {QStringLiteral("superseded"), superseded},
+                {QStringLiteral("ts"), QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs)}});
+    }
     // 1. Abort the in-flight step (glide, click, type, hotkey, drag, AX scan) and drop the queue.
     latchCuaCancel();  // also bumps the epoch: nothing queued by the old turn will run
     if (m_cuaPending == 0)

@@ -9,6 +9,7 @@
 #include "ingest/phonon.hpp"
 #include "ingest/slowmix.hpp"
 #include "ingest/spotify.hpp"
+#include "llm/jarvis_legs.hpp"
 #include "llm/prefix.hpp"
 #include "llm/router.hpp"
 #include "llm/sse.hpp"
@@ -791,7 +792,57 @@ public:
     // CUA loop included) and returns the cleaned answer.
     QString runModelAnswer(const QString &answer);
 
+    // Jarvis (stream "spotlight") zero-stall failover. jarvisEndpoint: prefs "jarvisEndpoint",
+    // else env LAPIS_JARVIS_ENDPOINT; empty = Jarvis uses the OpenAI-compatible endpoint as
+    // before. jarvisModel: prefs "jarvisModel", env LAPIS_JARVIS_MODEL, else kJarvisDefaultModel.
+    QString jarvisEndpoint() const;
+    QString jarvisModel() const;
+    // The legs the next Jarvis turn would try, in order (leg 1 skipped while its breaker is open).
+    QVector<JarvisLeg> jarvisLegs() const;
+    // Tests: replace the planned legs (the "self" leg still obeys the breaker); empty = plan.
+    void setJarvisLegsForTest(const QVector<JarvisLeg> &legs) { m_testJarvisLegs = legs; }
+    bool jarvisBreakerOpen() const;
+    quint64 jarvisTurnSeq() const { return m_jarvisTurnSeq; }
+    QString jarvisLastLeg() const { return m_jarvisTurn.legs.value(m_jarvisTurn.leg).name; }
+    QString jarvisLastEffort() const { return m_jarvisTurn.prompt.effort; }
+    // A no-think effort ("", fast, none) becomes "low" on a CUA follow-up (depth >= 1) whose
+    // previous step failed (tier ERR); anything else is kept.
+    static QString jarvisEscalatedEffort(const QString &effort, int loopDepth, bool prevStepErr);
+
 private:
+    // One Jarvis turn across its failover legs.
+    struct JarvisTurn {
+        bool active = false;
+        quint64 id = 0;
+        quint64 supersedes = 0;  // the still-running turn this one replaced (0 = none)
+        QVector<JarvisLeg> legs;
+        int leg = 0;
+        TieredPrompt prompt;
+        QString projectKey;
+        QString goal;
+        int axChars = 0;
+        qint64 startMs = 0;      // m_jarvisClock
+        qint64 firstTextMs = -1;
+        QStringList failedLegs;  // "self: first byte timeout after 1800 ms"
+    };
+    JarvisTurn m_jarvisTurn;
+    quint64 m_jarvisTurnSeq = 0;
+    quint64 m_jarvisLastTurnId = 0;   // the newest turn started, for interrupts after it streamed
+    quint64 m_jarvisSupersedes = 0;   // an interrupt's aborted turn, stamped on the next turn
+    JarvisBreaker m_jarvisBreaker;
+    QElapsedTimer m_jarvisClock;
+    QVector<JarvisLeg> m_testJarvisLegs;
+    QString m_jarvisEndpointPref, m_jarvisModelPref;
+    bool m_cuaPrevStepErr = false;  // the last finished CUA batch had an ERR step
+    int m_cuaLastAxChars = 0;       // observation chars the last batch fed its follow-up
+    void startJarvisTurn(const QVector<JarvisLeg> &legs, const TieredPrompt &p, const QString &projectKey,
+                         const QString &goal, int axChars);
+    void startJarvisLeg();
+    void finishJarvisTurn(const QString &error, const QString &raw);
+    // The same privacy rule as the CUA trace log: redacted / infinity projects never log.
+    bool jarvisLogBlocked(const QString &projectKey, const QStringList &fields);
+    void appendPlannerLog(const QJsonObject &o) const;
+
     // One model answer's cua_* actions, gathered until the last one finishes.
     struct CuaBatch {
         bool open = false;  // runAnswerTags is still dispatching it

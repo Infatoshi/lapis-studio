@@ -172,7 +172,9 @@ void pruneHumanTraces(const QString &traceDir, int maxSteps)
     QList<QByteArray> lines = f.readAll().split('\n');
     f.close();
     lines.removeIf([](const QByteArray &l) { return l.trimmed().isEmpty(); });
-    if (lines.size() <= maxSteps + maxSteps / 10)
+    static_assert(kShadowDefaultMaxSteps + kShadowDefaultMaxSteps * 3 / 22 == kShadowPruneAtSteps);
+    const qint64 pruneAt = maxSteps + qint64(maxSteps) * 3 / 22;
+    if (lines.size() <= pruneAt)
         return;
     lines = lines.mid(lines.size() - maxSteps);
     QSaveFile out(f.fileName());

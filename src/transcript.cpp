@@ -821,6 +821,75 @@ Unit unitFor(const QString &header, const QStringList &samples)
     return u;
 }
 
+// Bars are for fundamental performance metrics (throughput, speedup, latency, loss, FLOPs, a
+// memory scaling sweep). Inventory tables (disk / mount free and used, file sizes, counts of
+// files / lines / rows, PIDs, ports) stay a table: comparing two disks as bars is noise.
+bool fundamentalChart(const QStringList &header, const QVariantList &rows, int labelCol, int valueCol, const Unit &unit)
+{
+    const QString vh = header.value(valueCol).toLower();
+    const QString lh = header.value(labelCol).toLower();
+    QStringList valueCells, labelCells;
+    for (const QVariant &r : rows) {
+        const QStringList cells = r.toStringList();
+        valueCells << cells.value(valueCol).trimmed();
+        labelCells << cells.value(labelCol).trimmed();
+    }
+    // A rate (GB/s, MB/s, GiB/s, tok/s, req/s) is always a throughput metric, even next to disks.
+    static const QRegularExpression rate(QStringLiteral("\\b(?:[kmgt]i?b|tok(?:en)?s?|req|it|samples?|img|ops)/s\\b"),
+                                         QRegularExpression::CaseInsensitiveOption);
+    if (rate.match(vh).hasMatch())
+        return true;
+    for (const QString &v : valueCells)
+        if (rate.match(v).hasMatch())
+            return true;
+    if (unit.unit == QLatin1String("tok/s") || unit.unit == QLatin1String("x") || unit.unit == QLatin1String("TFLOPS")
+        || unit.unit == QLatin1String("GB/s"))
+        return true;
+
+    // Storage / inventory vocabulary anywhere in the header row.
+    static const QRegularExpression storageHeader(
+        QStringLiteral("\\b(?:storage|disk|disks|filesystem|file ?system|fs|mount(?:ed)?(?: on)?|volume|partition|"
+                       "capacity|free|used|avail|available|space|file ?size|bytes|inodes?)\\b|\\buse%"),
+        QRegularExpression::CaseInsensitiveOption);
+    // ...and in the value column's own header: sizes and plain counts.
+    static const QRegularExpression countHeader(
+        QStringLiteral("^(?:#|n|num|number|count|total)$|\\b(?:size|count|files|lines|loc|rows|entries|items|pid|port|"
+                       "kb|mb|gb|gib|mib|tb|tib|kib|bytes)\\b"),
+        QRegularExpression::CaseInsensitiveOption);
+    static const QRegularExpression byteCell(QStringLiteral("^[~≈]?\\d[\\d,]*(?:\\.\\d+)?\\s*(?:[kmgtp]i?b?|bytes?)$"),
+                                             QRegularExpression::CaseInsensitiveOption);
+    static const QRegularExpression memoryHeader(QStringLiteral("\\b(?:vram|memory|mem|hbm|kv ?cache|peak|resident|rss)\\b"),
+                                                 QRegularExpression::CaseInsensitiveOption);
+    static const QRegularExpression sweepAxis(
+        QStringLiteral("\\b(?:model|config|configuration|step|steps|batch|bs|seq|sequence|context|ctx|len|length|"
+                       "layers?|rank|tp|dp|quant|precision|dtype|variant|arm|run|tile|kernel|size)\\b"),
+        QRegularExpression::CaseInsensitiveOption);
+
+    bool byteValues = !valueCells.isEmpty();
+    for (const QString &v : valueCells)
+        byteValues = byteValues && byteCell.match(v).hasMatch();
+    // A memory scaling sweep (VRAM by model / batch / context) is a fundamental metric.
+    if (memoryHeader.match(vh).hasMatch() && rows.size() >= 3 && sweepAxis.match(lh).hasMatch())
+        return true;
+    bool storage = byteValues || countHeader.match(vh).hasMatch();
+    for (const QString &h : header)
+        storage = storage || storageHeader.match(h).hasMatch();
+    // Labels that are paths or devices (/, /home, /dev/disk3s1, ~/data) are a file listing.
+    int pathLabels = 0;
+    for (const QString &l : labelCells)
+        if (l.startsWith(QLatin1Char('/')) || l.startsWith(QLatin1String("~/")) || l.startsWith(QLatin1String("./")))
+            ++pathLabels;
+    storage = storage || pathLabels * 2 > labelCells.size();
+    if (!storage)
+        return true;
+    // Inventory vocabulary elsewhere in the row next to a real latency / loss column: still a metric.
+    // (unitFor's "us" also fires on "used", so the value header itself must name the metric.)
+    static const QRegularExpression latencyHeader(QStringLiteral("\\b(?:ms|us|µs|latency|ttft|p50|p90|p99|loss)\\b"),
+                                                  QRegularExpression::CaseInsensitiveOption);
+    return !byteValues && !countHeader.match(vh).hasMatch() && !storageHeader.match(vh).hasMatch()
+           && latencyHeader.match(vh).hasMatch();
+}
+
 QString fmt(double v)
 {
     if (std::fabs(v) >= 100)
@@ -932,6 +1001,8 @@ QVariantMap chartFromTable(const QVariantMap &table)
     }
     if (labelCol < 0 || bestCol < 0 || (!line && rows.size() > 24))
         return c;
+    if (!fundamentalChart(header, rows, labelCol, bestCol, bestUnit))
+        return c;  // disk space, file sizes, counts: a plain table, never bars
     QStringList labels;
     QVariantList values;
     double best = 0;

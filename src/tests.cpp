@@ -559,7 +559,7 @@ void unitTests()
         check(b.chatEffort() == "xhigh", "picker: D/l x3 -> xhigh", b.chatEffort());
         b.cycleEffort(1);
         check(b.chatEffort() == "xhigh", "picker: effort stops at the model's top (no wrap)", b.chatEffort());
-        // Catalog order: DeepSeek, Qwen, Fable, Opus, Sonnet, Astra, Sol, Carbon, Neon, Hydrogen.
+        // Catalog order: DeepSeek, Inkling, Qwen, Fable, Opus, Sonnet, Astra, Sol, Carbon, Neon, Hydrogen.
         b.cycleModel(-1);
         check(b.chatModel() == "claude-opus-5-5" && b.chatEffort() == "xhigh" && b.chatProvider() == "anthropic",
               "picker: W from Sonnet steps to Opus 5.5, xhigh kept", b.chatModel() + " " + b.chatEffort());
@@ -567,6 +567,12 @@ void unitTests()
         b.cycleModel(-1);
         check(b.chatModel() == "qwen3.8-flash-next" && b.chatEffort() == "fast" && b.chatProvider() == "openai-compat",
               "picker: W x2 -> Qwen3.8 Flash Next on no-think fast", b.chatModel() + " " + b.chatEffort());
+        b.cycleModel(-1);
+        check(b.chatModel() == "thinkingmachines/inkling-2-mini" && b.chatEffort() == "fast"
+                  && b.chatProvider() == "openrouter" && b.chatEfforts() == QStringList({"fast", "low", "medium", "high"})
+                  && modelDisplayLabel(b.chatModel()) == "Inkling 2 Mini · Fast",
+              "picker: W -> Inkling 2 Mini (OpenRouter), fast default",
+              b.chatModel() + " " + b.chatEffort() + " " + b.chatEfforts().join(','));
         b.cycleModel(-1);
         check(b.chatModel() == "deepseek/deepseek-v4.1-flash-1017" && b.chatEffort() == "fast"
                   && b.chatProvider() == "openrouter" && b.chatEfforts() == QStringList({"fast", "low", "medium", "high"}),
@@ -593,10 +599,10 @@ void unitTests()
         QStringList ids;
         for (const ModelSpec &m : modelCatalog())
             ids << m.id;
-        check(ids == QStringList({"deepseek/deepseek-v4.1-flash-1017", "qwen3.8-flash-next", "claude-fable-5-2",
-                                  "claude-opus-5-5", "claude-sonnet-5-5", "gpt-6-astra", "gpt-6-sol", "gemini-4-carbon",
-                                  "gemini-4-neon", "gemini-4-hydrogen"}),
-              "picker: exactly the curated 10-model lineup, in order", ids.join(','));
+        check(ids == QStringList({"deepseek/deepseek-v4.1-flash-1017", "thinkingmachines/inkling-2-mini", "qwen3.8-flash-next",
+                                  "claude-fable-5-2", "claude-opus-5-5", "claude-sonnet-5-5", "gpt-6-astra", "gpt-6-sol",
+                                  "gemini-4-carbon", "gemini-4-neon", "gemini-4-hydrogen"}),
+              "picker: exactly the curated 11-model lineup, in order", ids.join(','));
         for (const char *gone : {"gpt-6-luna", "gemini-3.8-flash", "gemini-4-argon", "claude-haiku-5-5"}) {
             b.setChatModel(gone);
             check(b.chatModel() == "gemini-4-neon" && providerFor(gone).isEmpty(), "picker: retired model is not selectable", gone);
@@ -1507,13 +1513,14 @@ void uiTests()
         check(ordered, "settings: rows ranked Model, Effort, Controller, Ambient, Nav, Theme, Scale, Diffs, Suggestions",
               texts.mid(0, 40).join(" | "));
         QStringList missing;
-        for (const char *m : {"DeepSeek V4.1 Flash", "Qwen3.8 Flash Next", "Fable 5.2", "Opus 5.5", "Sonnet 5.5",
-                              "GPT 6.2 Astra", "GPT 6.2 Sol", "Gemini 4 Carbon", "Gemini 4 Neon", "Gemini 4 Hydrogen"})
+        for (const char *m : {"DeepSeek V4.1 Flash", "Inkling 2 Mini", "Qwen3.8 Flash Next", "Fable 5.2", "Opus 5.5",
+                              "Sonnet 5.5", "GPT 6.2 Astra", "GPT 6.2 Sol", "Gemini 4 Carbon", "Gemini 4 Neon",
+                              "Gemini 4 Hydrogen"})
             if (!texts.contains(QString::fromUtf8(m)))
                 missing << m;
-        check(missing.isEmpty() && findItems(win->contentItem(), "settingsModelChip").size() == 10
+        check(missing.isEmpty() && findItems(win->contentItem(), "settingsModelChip").size() == 11
                   && !all.contains("Luna") && !all.contains("Gemini 3"),
-              "settings: Model grid shows all 10 models at once, no retired ones", missing.join(","));
+              "settings: Model grid shows all 11 models at once, no retired ones", missing.join(","));
         check(all.contains("Neovim") && all.contains("Gaming") && all.contains("Mouse")
                   && !all.contains("arrows", Qt::CaseInsensitive),
               "settings: Navigation Mode shows Controller / Neovim / Gaming / Mouse only");
@@ -7283,6 +7290,128 @@ void voiceSpotlightTests()
 // The Jarvis bar (jarvisBarMode "overlay"): L2 hold or tap, auto-send on Phonon's paste, the
 // instant interrupt, and the unified overlay over Studio itself. Mock + Offscreen bar: no window,
 // no keys posted, no model.
+// Bars only for fundamental metrics: disk space, file sizes and counts stay a table.
+void chartGateTests()
+{
+    auto md = [](const QStringList &rows) { return tableFromMarkdown(rows); };
+    struct Case {
+        const char *name;
+        QStringList rows;
+    };
+    const QList<Case> rejected = {
+        {"disk space Mount | Used | Avail", {"| Mount | Used | Avail |", "|---|---|---|", "| / | 609 GB | 261 GB |", "| /data | 1200 GB | 800 GB |"}},
+        {"2-row disk Used", {"| Disk | Used |", "|---|---|", "| internal | 609 GB |", "| external | 261 GB |"}},
+        {"df Use%", {"| Filesystem | Size | Use% |", "|---|---|---|", "| disk3s1 | 994 | 61% |", "| disk5s2 | 1863 | 14% |"}},
+        {"plain-number free space", {"| volume | free |", "|---|---|", "| Macintosh HD | 261 |", "| Backup | 1400 |"}},
+        {"file sizes", {"| file | size |", "|---|---|", "| main.cpp | 12 KB |", "| backend.cpp | 240 KB |", "| tests.cpp | 310 KB |"}},
+        {"bare byte cells", {"| artifact | on disk |", "|---|---|", "| model.gguf | 4.2G |", "| tokenizer | 12M |"}},
+        {"file counts", {"| dir | files |", "|---|---|", "| src | 120 |", "| qml | 45 |"}},
+        {"line counts", {"| module | lines |", "|---|---|", "| backend | 6286 |", "| transcript | 2319 |"}},
+        {"PIDs", {"| process | PID |", "|---|---|", "| vllm | 4121 |", "| sglang | 5120 |"}},
+        {"2-row VRAM is a lookup, not a sweep", {"| Model | VRAM (GB) |", "|---|---|", "| Llama 8B | 18 |", "| Llama 70B | 141 |"}},
+    };
+    for (const Case &c : rejected) {
+        const QVariantMap t = md(c.rows);
+        check(!t.isEmpty() && chartFromTable(t).isEmpty(), "chart gate: inventory table stays a table", c.name);
+    }
+    const QList<Case> charted = {
+        {"Config | tok/s", {"| Config | tok/s |", "|---|---|", "| c1 | 126 |", "| c8 | 610 |"}},
+        {"Kernel | Speedup (x)", {"| Kernel | Speedup (x) |", "|---|---|", "| naive | 1.00x |", "| tiled | 2.63x |"}},
+        {"BW (GB/s)", {"| Copy | BW (GB/s) |", "|---|---|", "| H2D | 25.1 |", "| D2D | 1450 |"}},
+        {"disk read MB/s is throughput", {"| Disk | Read |", "|---|---|", "| nvme0 | 7000 MB/s |", "| sata | 550 MB/s |"}},
+        {"latency ms", {"| build | latency ms |", "|---|---|", "| a | 142 |", "| b | 38 |"}},
+        {"VRAM sweep by model", {"| Model | VRAM (GB) |", "|---|---|", "| Llama 8B | 18 |", "| Qwen 32B | 70 |", "| Llama 70B | 141 |"}},
+        {"peak memory by batch", {"| batch | peak mem |", "|---|---|", "| bs 1 | 20 GB |", "| bs 8 | 34 GB |", "| bs 32 | 71 GB |"}},
+    };
+    for (const Case &c : charted) {
+        const QVariantMap ch = chartFromTable(md(c.rows));
+        check(ch.value("kind") == "chart" && ch.value("values").toList().size() == c.rows.size() - 2,
+              "chart gate: fundamental metric still charts", c.name);
+    }
+    // End to end: a disk-space write-up yields a table artifact and no chart.
+    {
+        const QList<Turn> turns = {
+            mkTurn("user", "how much disk is left?"),
+            mkTurn("assistant", "Here is the current disk usage on both volumes after the cleanup run finished.\n\n"
+                                "| Mount | Used | Avail |\n|---|---|---|\n| / | 609 GB | 261 GB |\n| /data | 1.2 TB | 800 GB |\n")};
+        const Extracted ex = extractArtifacts(turns, noFiles);
+        check(!firstOfKind(ex.artifacts, "table").isEmpty() && firstOfKind(ex.artifacts, "chart").isEmpty(),
+              "chart gate: a disk-space answer renders as a table, never a bar chart");
+    }
+}
+
+// Jarvis zero-stall failover through the Backend: a hung leg 1 hands the same "spotlight"
+// stream to leg 2 before any text reaches the bar, trips the 15 s breaker, and the next turn
+// goes straight to leg 2.
+void jarvisFailoverTests()
+{
+    check(Backend::jarvisEscalatedEffort("fast", 1, true) == "low" && Backend::jarvisEscalatedEffort("none", 3, true) == "low"
+              && Backend::jarvisEscalatedEffort("", 1, true) == "low",
+          "jarvis effort: no-think escalates to low after an ERR step on a follow-up");
+    check(Backend::jarvisEscalatedEffort("fast", 0, true) == "fast" && Backend::jarvisEscalatedEffort("fast", 2, false) == "fast"
+              && Backend::jarvisEscalatedEffort("medium", 2, true) == "medium",
+          "jarvis effort: first turn, clean steps and thinking efforts are kept");
+
+    Backend b(Backend::Mode::Mock);
+    check(b.jarvisEndpoint().isEmpty() && b.jarvisModel().isEmpty() && b.jarvisLegs().isEmpty(),
+          "jarvis legs: nothing configured (mock ignores env) -> the compat path as before");
+    QString key;
+    for (const QVariant &v : b.projects()) {
+        key = v.toMap().value("key").toString();
+        if (!key.isEmpty())
+            break;
+    }
+    const QString planner = QDir::homePath() + "/.lapis-next/cua_traces/planner_turns.jsonl";
+    const qint64 plannerBefore = QFileInfo(planner).exists() ? QFileInfo(planner).size() : -1;
+
+    FakeSse hung;
+    hung.hold = true;
+    FakeSse ok;
+    ok.answer = QStringLiteral("The run peaked at 126 tok/s.");
+    check(hung.start() && ok.start(), "jarvis failover: two local SSE endpoints listen");
+    LlmRouter router;
+    b.setLlmRouter(&router);
+    b.setJarvisLegsForTest(
+        {{QStringLiteral("self"), hung.url() + "/chat/completions", QString(), QStringLiteral("Infatoshi/Inkling-2-Mini-heretic"),
+          false, 200, 300},
+         {QStringLiteral("inkling"), ok.url() + "/chat/completions", QString(), QStringLiteral("thinkingmachines/inkling-2-mini"),
+          true, 3000, 2500}});
+    QStringList finished;
+    QString text;
+    QObject::connect(&b, &Backend::streamFinished, [&](const QString &id, const QString &err) {
+        if (id == "spotlight")
+            finished << err;
+    });
+    QObject::connect(&b, &Backend::streamDelta, [&](const QString &id, const QString &t, const QString &) {
+        if (id == "spotlight")
+            text += t;
+    });
+    b.askStream(QStringLiteral("spotlight"), key, 0, QStringLiteral("what did the run peak at?"));
+    const bool done = waitUntil([&] { return !finished.isEmpty(); }, 6000);
+    check(done && finished == QStringList{QString()} && text == ok.answer,
+          "jarvis failover: hung leg 1 -> leg 2 answers, one clean finish, no error shown", finished.join(';') + " / " + text);
+    check(hung.bodies.size() == 1 && ok.bodies.size() == 1 && b.jarvisLastLeg() == "inkling" && b.jarvisTurnSeq() == 1,
+          "jarvis failover: leg 1 tried once, leg 2 answered the same turn",
+          QStringLiteral("%1/%2 %3").arg(hung.bodies.size()).arg(ok.bodies.size()).arg(b.jarvisLastLeg()));
+    const QJsonObject body = QJsonDocument::fromJson(ok.bodies.value(0)).object();
+    const QJsonObject hungBody = QJsonDocument::fromJson(hung.bodies.value(0)).object();
+    check(body.value("model") == "thinkingmachines/inkling-2-mini"
+              && body.value("provider").toObject().value("order").toArray() == QJsonArray{"PrimeIntellect"}
+              && hungBody.value("model") == "Infatoshi/Inkling-2-Mini-heretic"
+              && hungBody.value("chat_template_kwargs").toObject().value("reasoning_effort").toDouble(-1) == 0.0,
+          "jarvis failover: each leg sent its own model and request shape");
+    check(b.jarvisBreakerOpen() && b.jarvisLegs().size() == 1 && b.jarvisLegs().value(0).name == "inkling",
+          "jarvis failover: leg 1's breaker is open, the next plan skips it");
+    b.askStream(QStringLiteral("spotlight"), key, 0, QStringLiteral("and the p50 latency?"));
+    check(waitUntil([&] { return finished.size() == 2; }, 6000) && hung.bodies.size() == 1 && ok.bodies.size() == 2
+              && b.jarvisTurnSeq() == 2,
+          "jarvis failover: while the breaker is open the turn goes straight to leg 2",
+          QStringLiteral("%1/%2").arg(hung.bodies.size()).arg(ok.bodies.size()));
+    const qint64 plannerAfter = QFileInfo(planner).exists() ? QFileInfo(planner).size() : -1;
+    check(plannerBefore == plannerAfter, "jarvis failover: mock mode never writes planner_turns.jsonl");
+    b.setLlmRouter(nullptr);
+}
+
 void jarvisTests()
 {
     using S = GamepadSnapshot;
@@ -7578,6 +7707,8 @@ int runTests()
     gamepadUiTests();
     voiceSpotlightTests();
     jarvisTests();
+    chartGateTests();
+    jarvisFailoverTests();
     std::printf("%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

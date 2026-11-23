@@ -56,6 +56,12 @@ QByteArray buildOpenRouterChatRequest(const TieredPrompt &p);
 // reasoning_effort (Qwen3.8 no_think). Any other non-empty effort rides as reasoning_effort.
 bool isNoThinkEffort(const QString &effort);
 
+// Inkling (any model id containing "inkling", case-insensitive): both builders above switch to
+// chat_template_kwargs.reasoning_effort (0.0 fast/none/empty, 0.2 low, 0.5 medium, 0.8 high),
+// temperature 0, repeat_penalty 1.0 and bounded max_tokens; OpenRouter pins PrimeIntellect FP4.
+bool isInklingModel(const QString &model);
+double inklingReasoningEffort(const QString &effort);
+
 // Optional local studio context (default ~/.lapis-next/studio_context.md), capped at 4 KB.
 // Returns empty when the file is missing or unreadable. Lives in Tier 0, so it stays APC-hot.
 QString loadLocalStudioContext(const QString &path = {});

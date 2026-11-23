@@ -58,6 +58,22 @@ bool isNoThinkEffort(const QString &effort)
     return effort == QLatin1String("fast") || effort == QLatin1String("none");
 }
 
+bool isInklingModel(const QString &model)
+{
+    return model.contains(QLatin1String("inkling"), Qt::CaseInsensitive);
+}
+
+double inklingReasoningEffort(const QString &effort)
+{
+    if (effort == QLatin1String("low"))
+        return 0.2;
+    if (effort == QLatin1String("medium"))
+        return 0.5;
+    if (effort == QLatin1String("high"))
+        return 0.8;
+    return 0.0;  // empty, fast, none
+}
+
 QString loadLocalStudioContext(const QString &path)
 {
     const QString p = path.isEmpty() ? QDir::homePath() + QStringLiteral("/.lapis-next/studio_context.md") : path;
@@ -153,6 +169,17 @@ QByteArray buildOpenRouterChatRequest(const TieredPrompt &p)
     body.insert(QStringLiteral("messages"), msgs);
     const QString effort = p.effort.isEmpty() || isNoThinkEffort(p.effort) ? QStringLiteral("none") : p.effort;
     body.insert(QStringLiteral("reasoning"), QJsonObject{{QStringLiteral("effort"), effort}});
+    if (isInklingModel(p.model)) {
+        // Inkling: PrimeIntellect's FP4 deployment only (the one measured for Jarvis), greedy,
+        // bounded output so a runaway thought never stalls the CUA loop.
+        body.insert(QStringLiteral("provider"),
+                    QJsonObject{{QStringLiteral("order"), QJsonArray{QStringLiteral("PrimeIntellect")}},
+                                {QStringLiteral("quantizations"), QJsonArray{QStringLiteral("fp4")}},
+                                {QStringLiteral("allow_fallbacks"), false}});
+        body.insert(QStringLiteral("temperature"), 0.0);
+        body.insert(QStringLiteral("max_tokens"), effort == QLatin1String("none") ? 384 : 640);
+        return QJsonDocument(body).toJson(QJsonDocument::Compact);
+    }
     body.insert(QStringLiteral("provider"),
                 QJsonObject{{QStringLiteral("order"), QJsonArray{QStringLiteral("Wafer"), QStringLiteral("InferenceNet"),
                                                                  QStringLiteral("Nebius")}},
@@ -170,7 +197,26 @@ QByteArray buildTieredChatRequest(const TieredPrompt &p)
     body.insert(QStringLiteral("model"), p.model);
     body.insert(QStringLiteral("stream"), true);
     body.insert(QStringLiteral("messages"), msgs);
-    if (isNoThinkEffort(p.effort))
+    if (isInklingModel(p.model)) {
+        // Inkling's chat template ignores enable_thinking and thinks at "high" when no
+        // reasoning_effort reaches it, so the effort always rides as a template kwarg. Greedy
+        // decoding and repeat_penalty 1.0 override the GGUF / server defaults, whose repeat
+        // penalty mangles repeated [[ACTION:cua_...]] tags.
+        const bool noThink = p.effort.isEmpty() || isNoThinkEffort(p.effort);
+        if (noThink) {
+            // Prefill <|message_model|><|content_text|> directly so Inkling emits zero reasoning
+            // tokens on fast/none turns (cuts self-hosted SGLang TTFT from ~508 ms to ~78 ms).
+            msgs << message(QStringLiteral("assistant"), QString());
+            body.insert(QStringLiteral("messages"), msgs);
+            body.insert(QStringLiteral("continue_final_message"), true);
+            body.insert(QStringLiteral("add_generation_prompt"), false);
+        }
+        body.insert(QStringLiteral("chat_template_kwargs"),
+                    QJsonObject{{QStringLiteral("reasoning_effort"), inklingReasoningEffort(p.effort)}});
+        body.insert(QStringLiteral("temperature"), 0.0);
+        body.insert(QStringLiteral("repeat_penalty"), 1.0);
+        body.insert(QStringLiteral("max_tokens"), noThink ? 384 : 640);
+    } else if (isNoThinkEffort(p.effort))
         body.insert(QStringLiteral("chat_template_kwargs"), QJsonObject{{QStringLiteral("enable_thinking"), false}});
     else if (!p.effort.isEmpty())
         body.insert(QStringLiteral("reasoning_effort"), p.effort);

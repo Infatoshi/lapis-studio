@@ -5,6 +5,7 @@
 #include <curl/curl.h>
 
 #include <algorithm>
+#include <chrono>
 #include <unordered_map>
 #include <vector>
 
@@ -45,6 +46,10 @@ struct LlmRouter::Net {
         QByteArray errBody;  // non-2xx body, for the error message
         QString pendText, pendThink;
         QString sseError;
+        // Steady-clock deadline for the first body byte (0 = none); cleared once a byte lands.
+        std::chrono::steady_clock::time_point firstByteDeadline{};
+        int firstByteTimeoutMs = 0;
+        bool gotByte = false;
         char errbuf[CURL_ERROR_SIZE] = {0};
         Net *net = nullptr;
     };
@@ -76,6 +81,7 @@ struct LlmRouter::Net {
     {
         auto *e = static_cast<Easy *>(userdata);
         const size_t n = size * nmemb;
+        e->gotByte = true;
         if (!e->receiving) {
             e->receiving = true;
             Net *net = e->net;
@@ -205,6 +211,10 @@ struct LlmRouter::Net {
         curl_easy_setopt(h, CURLOPT_TCP_KEEPALIVE, 1L);
         curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT_MS, long(std::max(0, c.req.connectTimeoutMs)));
         curl_easy_setopt(h, CURLOPT_TIMEOUT_MS, long(std::max(0, c.req.timeoutMs)));
+        if (!e->warm && c.req.firstByteTimeoutMs > 0) {
+            e->firstByteTimeoutMs = c.req.firstByteTimeoutMs;
+            e->firstByteDeadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(c.req.firstByteTimeoutMs);
+        }
         CURL *raw = h;
         easies.emplace(raw, std::move(e));
         Easy *ep = easies[raw].get();
@@ -212,6 +222,36 @@ struct LlmRouter::Net {
             streams.insert(ep->id, ep);
         curl_multi_add_handle(multi, raw);
         self->m_handlesInMulti.store(int(easies.size()), std::memory_order_relaxed);
+    }
+
+    // Fails every stream still waiting for its first byte past its deadline. Returns the ms until
+    // the nearest remaining deadline (capped at capMs) so the poll wakes in time for it.
+    int expireFirstByte(int capMs)
+    {
+        const auto now = std::chrono::steady_clock::now();
+        std::vector<Easy *> expired;
+        int wait = capMs;
+        for (auto &kv : easies) {
+            Easy *e = kv.second.get();
+            if (e->warm || e->gotByte || e->firstByteTimeoutMs <= 0)
+                continue;
+            if (now >= e->firstByteDeadline) {
+                expired.push_back(e);
+                continue;
+            }
+            const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(e->firstByteDeadline - now).count();
+            wait = std::min(wait, int(std::max<long long>(1, left)));
+        }
+        for (Easy *e : expired) {
+            Event ev;
+            ev.kind = Event::Finished;
+            ev.gen = e->gen;
+            ev.streamId = e->id;
+            ev.error = QStringLiteral("first byte timeout after %1 ms").arg(e->firstByteTimeoutMs);
+            removeEasy(e->h);
+            pushEvent(std::move(ev));
+        }
+        return wait;
     }
 
     void finish(CURL *h, CURLcode rc)
@@ -440,8 +480,9 @@ void LlmRouter::runNetwork()
             if (msg->msg == CURLMSG_DONE)
                 net.finish(msg->easy_handle, msg->data.result);
         }
+        const int pollMs = net.expireFirstByte(net.overflow.empty() ? kIdlePollMs : kOverflowPollMs);
         net.flushOverflow();
-        curl_multi_poll(net.multi, nullptr, 0, net.overflow.empty() ? kIdlePollMs : kOverflowPollMs, nullptr);
+        curl_multi_poll(net.multi, nullptr, 0, pollMs, nullptr);
     }
 }
 
