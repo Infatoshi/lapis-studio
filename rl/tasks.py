@@ -67,16 +67,55 @@ WORDS = ["kernel", "latency", "cache", "tensor", "shader", "compiler", "vector",
 SORT_KEYS = ("likes", "reposts", "timestamp", "virality")
 
 
-def generate_feed(seed: int, n: int = 16, n_pinned: int = 2, base_ts: int = 1_790_000_000) -> list[Post]:
-    """Deterministic feed. Guarantees, for any seed:
-    * the newest post overall is pinned (so "latest" must skip pinned posts);
-    * the two most viral posts are non-pinned and tie on likes+reposts, so
-      "most viral" must apply the tie-break (more likes wins).
-    """
-    if n < n_pinned + 3:
-        raise ValueError("n too small")
+# Where pinned posts sit in time: the k newest posts; the newest post plus k-1 random older
+# ones; or k posts anywhere. Only the PINNED badge tells them apart from ordinary posts.
+PINNED_LAYOUTS = ("newest", "mixed", "scattered")
+PINNED_LAYOUT_WEIGHTS = (4, 4, 2)
+TIE_RATE = 0.35  # share of seeds whose two most viral posts tie on likes+reposts
+LIKES_BAIT_RATE = 0.85  # more likes than the winner, fewer likes+reposts
+REPOSTS_BAIT_RATE = 0.75  # more reposts than the winner, fewer likes+reposts (non-tie seeds)
+ENGAGEMENT_SCALES = (1, 2, 3, 5, 8, 13, 20, 40)  # per-seed magnitude, so no fixed count recurs
+
+
+def feed_params(seed: int, n_pinned: int | None = None, pinned_layout: str | None = None) -> dict[str, Any]:
+    """The per-seed knobs ``generate_feed`` draws first (pure; same rng stream)."""
     rng = random.Random(seed)
+    k = rng.randint(0, 4)
+    layout = rng.choices(PINNED_LAYOUTS, weights=PINNED_LAYOUT_WEIGHTS)[0]
+    tie = rng.random() < TIE_RATE
+    return {
+        "rng": rng,
+        "n_pinned": k if n_pinned is None else n_pinned,
+        "pinned_layout": layout if pinned_layout is None else pinned_layout,
+        "tie": tie,
+    }
+
+
+def generate_feed(
+    seed: int,
+    n: int = 16,
+    n_pinned: int | None = None,
+    base_ts: int = 1_790_000_000,
+    pinned_layout: str | None = None,
+) -> list[Post]:
+    """Deterministic feed per ``seed``. Built so no surface heuristic solves the tasks:
+
+    * ``n_pinned`` is drawn from 0..4 (unless given) and pinned posts are the newest ones,
+      the newest plus random older ones, or scattered, so "Nth card" and "newest timestamp"
+      both fail; only reading the PINNED badge plus the order finds the latest non-pinned post;
+    * engagement counts are scaled per seed and the most viral post usually has fewer likes
+      than a likes-bait post and fewer reposts than a reposts-bait post;
+    * ~35% of seeds tie the top two posts on likes+reposts at random repost values, so the
+      tie-break (more likes wins) matters; the rest have a unique winner.
+    """
+    p = feed_params(seed, n_pinned, pinned_layout)
+    rng, k, layout, tie = p["rng"], p["n_pinned"], p["pinned_layout"], p["tie"]
+    if not 0 <= k <= n - 3 or n < 6:
+        raise ValueError("n too small for n_pinned")
+    if layout not in PINNED_LAYOUTS:
+        raise ValueError(f"pinned_layout must be one of {PINNED_LAYOUTS}")
     ts = sorted(rng.sample(range(base_ts, base_ts + 30 * 86400), n), reverse=True)
+    scale = rng.choice(ENGAGEMENT_SCALES)
     posts: list[dict[str, Any]] = []
     for i in range(n):
         posts.append(
@@ -84,22 +123,43 @@ def generate_feed(seed: int, n: int = 16, n_pinned: int = 2, base_ts: int = 1_79
                 id=f"p{i:03d}",
                 author=rng.choice(AUTHORS),
                 timestamp=ts[i],
-                likes=rng.randint(0, 500),
-                reposts=rng.randint(0, 200),
+                likes=rng.randint(0, 200) * scale + rng.randint(0, scale - 1),
+                reposts=rng.randint(0, 80) * scale + rng.randint(0, scale - 1),
                 pinned=False,
                 text=" ".join(rng.choice(WORDS) for _ in range(6)),
             )
         )
-    # newest post (index 0) is pinned; other pinned posts are older ones
-    pinned_idx = [0] + rng.sample(range(n // 2, n), n_pinned - 1) if n_pinned else []
+    # index 0 is the newest post
+    if k == 0:
+        pinned_idx: list[int] = []
+    elif layout == "newest":
+        pinned_idx = list(range(k))
+    elif layout == "mixed":
+        pinned_idx = [0] + rng.sample(range(1, n), k - 1)
+    else:
+        pinned_idx = rng.sample(range(n), k)
     for i in pinned_idx:
         posts[i]["pinned"] = True
-    # force a virality tie between two non-pinned posts at the top of the non-pinned range
-    free = [i for i in range(n) if i not in pinned_idx]
-    a, b = rng.sample(free, 2)
-    top = max(200, max(p["likes"] + p["reposts"] for p in posts)) + rng.randint(1, 50)
-    posts[a]["likes"], posts[a]["reposts"] = top - 100, 100
-    posts[b]["likes"], posts[b]["reposts"] = top - 60, 60
+
+    # engagement: every special post is strictly above (winner) or below (bait) the top virality
+    top = max(q["likes"] + q["reposts"] for q in posts)
+    v = top + rng.randint(max(2, top // 25), max(3, top // 4))
+    slots = rng.sample(range(n), 3)  # winner, second (tie or reposts bait), likes bait
+    if tie:
+        r_a = rng.randint(v // 10, v * 55 // 100)
+        r_b = rng.randint(r_a + 1, min(v, r_a + max(1, v // 2)))
+        posts[slots[0]].update(likes=v - r_a, reposts=r_a)  # winner: same sum, more likes
+        posts[slots[1]].update(likes=v - r_b, reposts=r_b)
+    else:
+        r_w = rng.randint(v // 4, v * 8 // 10)
+        posts[slots[0]].update(likes=v - r_w, reposts=r_w)
+        if rng.random() < REPOSTS_BAIT_RATE:
+            r_e = rng.randint(r_w + 1, v - 1)
+            posts[slots[1]].update(reposts=r_e, likes=rng.randint(0, (v - 1 - r_e) // 2))
+    l_w = posts[slots[0]]["likes"]
+    if rng.random() < LIKES_BAIT_RATE and l_w + 1 <= v - 1:
+        l_d = rng.randint(l_w + 1, v - 1)
+        posts[slots[2]].update(likes=l_d, reposts=rng.randint(0, (v - 1 - l_d) // 2))
     ids = [f"p{i:03d}" for i in range(n)]
     rng.shuffle(ids)  # ids do not encode order
     for p, pid in zip(posts, ids):
@@ -160,7 +220,49 @@ def fmt_ts(ts: int) -> str:
     return _dt.datetime.fromtimestamp(ts, tz=_dt.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 
-def render_feed_html(posts: list[Post], title: str = "Feed") -> str:
+THEMES = {
+    "light": {"bg": "#ffffff", "fg": "#111111", "card": "#ffffff", "border": "#888888", "pin": "#ffcc00", "pin_fg": "#111111"},
+    "dark": {"bg": "#15171a", "fg": "#e6e6e6", "card": "#1e2125", "border": "#3a3f45", "pin": "#8a6d00", "pin_fg": "#ffffff"},
+}
+DENSITIES = {"compact": {"pad": "4px 8px", "gap": "4px"}, "normal": {"pad": "8px 12px", "gap": "8px"},
+             "spacious": {"pad": "16px 20px", "gap": "18px"}}
+BORDERS = ("solid", "dashed", "shadow", "none")
+
+
+def feed_style(style_seed: int | None) -> dict[str, Any]:
+    """CSS knobs for ``render_feed_html``. ``None`` is the legacy look; any int draws theme,
+    density, font size, card border, radius and page width deterministically."""
+    if style_seed is None:
+        return {"theme": "light", "density": "normal", "font_px": 16, "border": "solid", "radius": 6, "width": 760}
+    rng = random.Random(f"style-{style_seed}")
+    return {
+        "theme": rng.choice(sorted(THEMES)),
+        "density": rng.choice(sorted(DENSITIES)),
+        "font_px": rng.randint(13, 19),
+        "border": rng.choice(BORDERS),
+        "radius": rng.choice((0, 4, 6, 12)),
+        "width": rng.choice((600, 680, 760, 900)),
+    }
+
+
+def feed_css(style: dict[str, Any]) -> str:
+    t, d = THEMES[style["theme"]], DENSITIES[style["density"]]
+    card_border = {
+        "solid": f"border:1px solid {t['border']}",
+        "dashed": f"border:1px dashed {t['border']}",
+        "shadow": "border:none;box-shadow:0 1px 4px rgba(0,0,0,.35)",
+        "none": f"border:none;border-bottom:1px solid {t['border']}",
+    }[style["border"]]
+    return (
+        f"body{{font:{style['font_px']}px sans-serif;max-width:{style['width']}px;margin:20px auto;"
+        f"background:{t['bg']};color:{t['fg']}}}\n"
+        f".post{{{card_border};border-radius:{style['radius']}px;padding:{d['pad']};margin:{d['gap']} 0;"
+        f"background:{t['card']}}}\n"
+        f".pin{{background:{t['pin']};color:{t['pin_fg']};padding:1px 4px}} button{{margin-left:12px}}"
+    )
+
+
+def render_feed_html(posts: list[Post], title: str = "Feed", style_seed: int | None = None) -> str:
     rows = []
     for p in display_order(posts):
         badge = '<span class="pin">PINNED</span> ' if p.pinned else ""
@@ -175,9 +277,7 @@ def render_feed_html(posts: list[Post], title: str = "Feed") -> str:
             f'<button onclick="pick(\'{p.id}\')">Open {p.id}</button></footer></article>'
         )
     return f"""<!doctype html><html><head><meta charset="utf-8"><title>{html.escape(title)}</title>
-<style>body{{font:16px sans-serif;max-width:760px;margin:20px auto}}
-.post{{border:1px solid #888;border-radius:6px;padding:8px 12px;margin:8px 0}}
-.pin{{background:#fc0;padding:1px 4px}} button{{margin-left:12px}}</style>
+<style>{feed_css(feed_style(style_seed))}</style>
 <script>function pick(id){{fetch('/click?id='+id).catch(()=>{{}});
 location.hash='clicked='+id;document.title='clicked '+id;}}</script></head>
 <body><h1>{html.escape(title)}</h1>{"".join(rows)}</body></html>"""
@@ -316,7 +416,7 @@ def web_tasks(seed: int) -> list[Task]:
 
 def feed_tasks(seed: int) -> list[Task]:
     posts = generate_feed(seed)
-    site = {"index.html": render_feed_html(posts, title=f"Feed {seed}")}
+    site = {"index.html": render_feed_html(posts, title=f"Feed {seed}", style_seed=seed)}
     setup = _serve(site, "index.html")
     viral = most_viral(posts)
     latest = latest_non_pinned(posts)
