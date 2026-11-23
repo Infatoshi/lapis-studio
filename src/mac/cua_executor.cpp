@@ -988,6 +988,14 @@ CuaExecutor::Located CuaExecutor::locate(const QString &targetDesc, bool refineC
         loc.detail = QStringLiteral("Grounder point is off the display");
         return loc;
     }
+    const double localY = pt.y() - display.globalPoints.top();
+    const bool wantsMenu = targetDesc.contains(QLatin1String("menu"), Qt::CaseInsensitive)
+                           || targetDesc.contains(QLatin1String("apple"), Qt::CaseInsensitive);
+    if (!wantsMenu && localY >= 0.0 && localY < 24.0) {
+        loc.detail = QStringLiteral("Grounder hit macOS menu bar (%1, %2) for non-menu target")
+                         .arg(pt.x(), 0, 'f', 1).arg(pt.y(), 0, 'f', 1);
+        return loc;
+    }
     loc.ok = true;
     loc.tier = QStringLiteral("L3_VLM");
     loc.pt = pt;

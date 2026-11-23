@@ -5865,6 +5865,9 @@ void Backend::resetCuaLoop()
     m_cuaFollowups.clear();
     m_cuaPrevStepErr = false;
     m_cuaLastAxChars = 0;
+    m_cuaPrevStepSig.clear();
+    m_cuaPrevObsChars = -1;
+    m_cuaRepeatCount = 0;
 }
 
 void Backend::noteCuaResult(quint64 batchId, const CuaStepResult &step)
@@ -5892,9 +5895,27 @@ void Backend::maybeFinishCuaBatch()
         return !s.ok || s.tier == QLatin1String("ERR");
     });
     m_cuaLastAxChars = 0;
-    for (const CuaStepResult &s : steps)
+    QStringList sigParts;
+    for (const CuaStepResult &s : steps) {
         m_cuaLastAxChars += int(s.observation.size());
-    const QString prompt = cuaFollowupPrompt(steps);
+        sigParts << s.action + QLatin1Char(':') + s.target;
+    }
+    const QString stepSig = sigParts.join(QLatin1Char(';'));
+    const bool sameNoop = !stepSig.isEmpty() && stepSig == m_cuaPrevStepSig
+                          && (m_cuaPrevStepErr || m_cuaLastAxChars == m_cuaPrevObsChars);
+    m_cuaRepeatCount = sameNoop ? m_cuaRepeatCount + 1 : 0;
+    m_cuaPrevStepSig = stepSig;
+    m_cuaPrevObsChars = m_cuaLastAxChars;
+    if (m_mode == Mode::Live && m_cuaRepeatCount >= 2) {
+        resetCuaLoop();
+        return;  // hard-stop after 3 identical no-op/failed actions in a row
+    }
+    QString prompt = cuaFollowupPrompt(steps);
+    if (m_mode == Mode::Live && m_cuaRepeatCount == 1)
+        prompt += QStringLiteral(
+            "\n[LOOP GUARD: You repeated %1 with no screen change. Do NOT repeat it again; try a different action "
+            "(such as cua_scroll or cua_open) or give a concise final answer from what is visible now.]")
+                      .arg(stepSig);
     m_cuaFollowups << prompt;
     if (m_mode != Mode::Live)
         return;  // --test: recorded only; no model call, no network

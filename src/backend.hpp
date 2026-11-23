@@ -835,6 +835,9 @@ private:
     QString m_jarvisEndpointPref, m_jarvisModelPref;
     bool m_cuaPrevStepErr = false;  // the last finished CUA batch had an ERR step
     int m_cuaLastAxChars = 0;       // observation chars the last batch fed its follow-up
+    QString m_cuaPrevStepSig;       // last executed CUA action signature for loop breaking
+    int m_cuaPrevObsChars = -1;     // previous observation size for no-op detection
+    int m_cuaRepeatCount = 0;       // consecutive identical no-op/failed CUA steps
     void startJarvisTurn(const QVector<JarvisLeg> &legs, const TieredPrompt &p, const QString &projectKey,
                          const QString &goal, int axChars);
     void startJarvisLeg();
