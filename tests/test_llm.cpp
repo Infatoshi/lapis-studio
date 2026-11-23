@@ -786,6 +786,70 @@ void inklingTests()
           "inkling openrouter: DeepSeek routing unchanged");
 }
 
+// A CUA follow-up's screenshot: an Inkling leaf becomes [image_url, text]; everything else
+// (no image, a non-Inkling model, the prefix tiers, the OpenRouter legs) is byte-for-byte as before.
+void multimodalTests()
+{
+    TieredPrompt p;
+    p.model = QStringLiteral("Infatoshi/Inkling-2-Mini-heretic");
+    p.systemPrompt = QStringLiteral("SYS");
+    p.trunk = QStringLiteral("TRUNK");
+    p.history = {{QStringLiteral("user"), QStringLiteral("open x.com")}, {QStringLiteral("assistant"), QStringLiteral("ok")}};
+    p.question = QStringLiteral("[CUA observation after cua_open]");
+    p.effort = QStringLiteral("low");
+    const QByteArray plain = buildTieredChatRequest(p);
+    const QByteArray jpeg("\xff\xd8\xff\xe0 fake jpeg bytes", 22);
+    p.imageJpeg = jpeg;
+    const QByteArray withImage = buildTieredChatRequest(p);
+    const QJsonArray pm = jsonOf(plain).value("messages").toArray();
+    const QJsonArray im = jsonOf(withImage).value("messages").toArray();
+    const QJsonObject leaf = im.last().toObject();
+    const QJsonArray parts = leaf.value("content").toArray();
+    check(leaf.value("role") == "user" && parts.size() == 2 && parts[0].toObject().value("type") == "image_url"
+              && parts[1].toObject().value("type") == "text",
+          "multimodal: Inkling + image -> leaf content is [image_url, text]");
+    check(parts[0].toObject().value("image_url").toObject().value("url").toString()
+              == "data:image/jpeg;base64," + QString::fromLatin1(jpeg.toBase64()),
+          "multimodal: image_url is a base64 JPEG data URL");
+    check(parts[1].toObject().value("text").toString() == tieredLeafText(p)
+              && pm.last().toObject().value("content").toString() == tieredLeafText(p),
+          "multimodal: the text part is exactly the leaf a text turn sends");
+    bool prefixSame = pm.size() == im.size();
+    for (qsizetype i = 0; prefixSame && i + 1 < pm.size(); ++i)
+        prefixSame = compact(pm[i]) == compact(im[i]);
+    check(prefixSame && !compact(pm).contains("base64") && compact(QJsonArray{im[0], im[1], im[2], im[3]}).indexOf("base64") < 0,
+          "multimodal: Tiers 0-2 byte-identical with and without the image (APC stays hot)");
+
+    // Zero-think prefill still trails the multimodal leaf.
+    p.effort = QStringLiteral("fast");
+    const QJsonArray fm = jsonOf(buildTieredChatRequest(p)).value("messages").toArray();
+    check(fm.last().toObject().value("role") == "assistant" && fm[fm.size() - 2].toObject().value("content").isArray(),
+          "multimodal: zero-think prefill follows the image leaf");
+
+    // Empty image or a non-Inkling model: the exact old string content.
+    p.effort = QStringLiteral("low");
+    p.imageJpeg.clear();
+    check(buildTieredChatRequest(p) == plain && jsonOf(plain).value("messages").toArray().last().toObject().value("content").isString(),
+          "multimodal: empty image -> the unchanged string request");
+    TieredPrompt q = p;
+    q.model = QStringLiteral("qwen3.8-flash-next");
+    const QByteArray qPlain = buildTieredChatRequest(q);
+    q.imageJpeg = jpeg;
+    check(buildTieredChatRequest(q) == qPlain, "multimodal: non-Inkling model ignores the image (string content)");
+
+    // Legs: only the self-hosted leg sends the screenshot.
+    JarvisLegConfig cfg;
+    cfg.jarvisEndpoint = QStringLiteral("http://127.0.0.1:9/v1");
+    cfg.openrouterKey = QStringLiteral("k");
+    const QVector<JarvisLeg> legs = planJarvisLegs(cfg);
+    p.imageJpeg = jpeg;
+    check(legs.size() == 3 && buildJarvisLegRequest(legs[0], p).contains("data:image/jpeg;base64,")
+              && !buildJarvisLegRequest(legs[1], p).contains("base64") && !buildJarvisLegRequest(legs[2], p).contains("base64"),
+          "multimodal: leg 1 (self) carries the image, the OpenRouter legs never do");
+    check(kCompatSystemPrompt.contains("When a screenshot is attached to a follow-up turn, read visible text directly from the image"),
+          "multimodal: system prompt tells the model to read the attached screenshot");
+}
+
 void jarvisLegTests()
 {
     JarvisLegConfig cfg;
@@ -937,6 +1001,7 @@ int main(int argc, char **argv)
     restartTest();
     warmAndErrorTests();
     inklingTests();
+    multimodalTests();
     jarvisLegTests();
     firstByteAndFailoverTests();
     std::printf("test_llm: %d passed, %d failed\n", g_pass, g_fail);

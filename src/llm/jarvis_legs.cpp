@@ -47,6 +47,8 @@ bool jarvisLegRetryable(const QString &error)
 QByteArray buildJarvisLegRequest(const JarvisLeg &leg, TieredPrompt p)
 {
     p.model = leg.model;
+    if (leg.name != QLatin1String("self"))
+        p.imageJpeg.clear();  // only the self-hosted multimodal leg sees the screenshot
     return leg.openRouter ? buildOpenRouterChatRequest(p) : buildTieredChatRequest(p);
 }
 

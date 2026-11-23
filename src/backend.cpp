@@ -2775,6 +2775,12 @@ void Backend::ask(const QString &projectKey, int artifactIndex, const QString &q
     prompt += QStringLiteral("\n\nQuestion: ") + q;
     m_quickClock.start();
     m_quickTicker.start();
+    m_legChains.remove(QString::fromLatin1(kQuickStreamId));  // a stale chain never steals this ask's finish
+    const QVector<JarvisLeg> legs = chatLegs(QString::fromLatin1(kQuickStreamId));
+    if (!legs.isEmpty()) {
+        askViaLegs(legs, projectKey, artifactIndex, q);
+        return;
+    }
     if (providerFor(m_chatModel) == QLatin1String("openai-compat")) {
         askOpenAiCompat(projectKey, artifactIndex, q);
         return;
@@ -3087,6 +3093,91 @@ void Backend::askOpenRouter(const QString &projectKey, int artifactIndex, const 
     router->startStream(req);
 }
 
+void Backend::askViaLegs(const QVector<JarvisLeg> &legs, const QString &projectKey, int artifactIndex,
+                         const QString &question)
+{
+    if (m_suggestReply) {
+        m_suggestReply->disconnect(this);
+        m_suggestReply->abort();
+        m_suggestReply->deleteLater();
+        m_suggestReply.clear();
+    }
+    m_quickChannel = channelKeyFor(m_chatModel, m_chatEffort);
+    if (!llmRouter()) {
+        m_quickAnswer = QStringLiteral("inkling: no router");
+        finishQuick(false);
+        return;
+    }
+    // The compat ask's tiers (the shared ring in Tier 2) on the Jarvis legs: self-hosted Inkling
+    // first, OpenRouter after it. A CUA follow-up's screenshot rides on the leaf only.
+    TieredPrompt p = tieredPrompt(projectKey, contextSlice(projectKey, artifactIndex), question, m_sharedHistory);
+    p.effort = legEffort(legs, m_cuaFollowupAsk);
+    if (m_cuaFollowupAsk)
+        p.imageJpeg = m_cuaFollowupImage;
+    const QString id = QString::fromLatin1(kQuickStreamId);
+    m_legChains.insert(id, LegChain{legs, 0, p});
+    startChainLeg(id);
+}
+
+QVector<JarvisLeg> Backend::chatLegs(const QString &streamId) const
+{
+    if (streamId == QLatin1String(kQuickStreamId)) {
+        // An explicit CLI pick (Claude, Codex, Gemini) keeps its own channel.
+        const QString prov = providerFor(m_chatModel);
+        if (prov != QLatin1String("openai-compat") && prov != QLatin1String("openrouter"))
+            return {};
+    }
+    return jarvisLegs();
+}
+
+QString Backend::legEffort(const QVector<JarvisLeg> &legs, bool followup) const
+{
+    QString base = isInklingModel(m_chatModel) ? m_chatEffort : compatEffort();
+    // Inkling 2 Mini at zero-think (0.0) drops [[ACTION:...]] tags on multi-turn CUA loops;
+    // low (0.2) keeps ~425 ms E2E on fast hardware while reliably emitting action tags.
+    if (!legs.isEmpty() && isInklingModel(legs.first().model) && (base.isEmpty() || isNoThinkEffort(base)))
+        base = QStringLiteral("low");
+    return jarvisEscalatedEffort(base, m_cuaLoopDepth, followup && m_cuaPrevStepErr);
+}
+
+void Backend::startChainLeg(const QString &streamId)
+{
+    LlmRouter *router = llmRouter();
+    const auto it = m_legChains.constFind(streamId);
+    if (!router || it == m_legChains.cend() || it->leg >= it->legs.size())
+        return;
+    const JarvisLeg &leg = it->legs[it->leg];
+    LlmStreamRequest req;
+    req.streamId = streamId;
+    req.endpoint = leg.endpoint;
+    req.apiKey = leg.apiKey;
+    req.payload = buildJarvisLegRequest(leg, it->prompt);
+    req.connectTimeoutMs = leg.connectTimeoutMs;
+    req.firstByteTimeoutMs = leg.firstByteTimeoutMs;
+    router->startStream(req);
+}
+
+bool Backend::advanceLegChain(const QString &streamId, const QString &error, bool nothingShown)
+{
+    auto it = m_legChains.find(streamId);
+    if (it == m_legChains.end())
+        return false;
+    const QString name = it->legs.value(it->leg).name;
+    const bool retryable = jarvisLegRetryable(error);
+    if (retryable && name == QLatin1String("self"))
+        m_jarvisBreaker.trip(QDateTime::currentMSecsSinceEpoch());  // the next turns skip it for 15 s
+    if (retryable && nothingShown && it->leg + 1 < it->legs.size()) {
+        if (m_mode == Mode::Live)
+            std::fprintf(stderr, "lapis_studio: %s leg %s failed (%s), trying %s\n", qPrintable(streamId), qPrintable(name),
+                         qPrintable(oneLine(error, 16)), qPrintable(it->legs[it->leg + 1].name));
+        ++it->leg;
+        startChainLeg(streamId);
+        return true;
+    }
+    m_legChains.erase(it);
+    return false;
+}
+
 // --- LlmRouter streams ----------------------------------------------------------------------
 
 LlmRouter *Backend::llmRouter()
@@ -3239,6 +3330,8 @@ void Backend::onRouterFinished(const QString &streamId, const QString &error)
         return;
     }
     if (streamId == QLatin1String(kQuickStreamId)) {
+        if (advanceLegChain(streamId, error, m_quickAnswerRaw.isEmpty()))
+            return;  // the next leg answers the same ask, unseen
         if (!error.isEmpty())
             m_quickAnswer = QStringLiteral("openai-compat: ") + oneLine(error, 12);
         if (m_quickBusy)
@@ -3248,6 +3341,8 @@ void Backend::onRouterFinished(const QString &streamId, const QString &error)
     auto it = m_streamAsks.find(streamId);
     if (it == m_streamAsks.end())
         return;
+    if (streamId != QLatin1String(kSpotlightStreamId) && advanceLegChain(streamId, error, it->answer.isEmpty()))
+        return;  // an island card's next leg answers on the same stream, unseen
     if (m_jarvisTurn.active && streamId == QLatin1String(kSpotlightStreamId)) {
         const JarvisLeg &leg = m_jarvisTurn.legs[m_jarvisTurn.leg];
         const bool retryable = jarvisLegRetryable(error);
@@ -3342,19 +3437,23 @@ void Backend::startConversation(const QString &streamId, const QString &projectK
         emit streamFinished(streamId, QStringLiteral("no LLM router (mock mode)"));
         return;
     }
-    const QVector<JarvisLeg> legs = streamId == QLatin1String(kSpotlightStreamId) ? jarvisLegs() : QVector<JarvisLeg>{};
+    m_legChains.remove(streamId);  // a stale chain never steals this turn's finish
+    const QVector<JarvisLeg> legs = chatLegs(streamId);
     if (!legs.isEmpty()) {
-        // Jarvis: the self-hosted leg first, then OpenRouter, all on this one stream id.
+        // Jarvis and every island card: the self-hosted leg first, then OpenRouter, all on this
+        // one stream id. A CUA follow-up's screenshot rides on the leaf only (never history).
         TieredPrompt p = tieredPrompt(projectKey, slice, q, m_sharedHistory);
-        QString base = isInklingModel(m_chatModel) ? m_chatEffort : compatEffort();
-        // Inkling 2 Mini at zero-think (0.0) drops [[ACTION:...]] tags on multi-turn CUA loops;
-        // low (0.2) keeps ~425 ms E2E on fast hardware while reliably emitting action tags.
-        if (isInklingModel(legs.first().model) && (base.isEmpty() || isNoThinkEffort(base)))
-            base = QStringLiteral("low");
-        p.effort = jarvisEscalatedEffort(base, m_cuaLoopDepth, followup && m_cuaPrevStepErr);
+        p.effort = legEffort(legs, followup);
+        if (followup)
+            p.imageJpeg = m_cuaFollowupImage;
         const QString goal = followup ? m_cuaFollowupGoal : q;
         m_streamAsks.insert(streamId, StreamAsk{q, QString(), projectKey, followup ? m_cuaFollowupNote : QString(), goal});
-        startJarvisTurn(legs, p, projectKey, goal, followup ? m_cuaLastAxChars : 0);
+        if (streamId == QLatin1String(kSpotlightStreamId)) {
+            startJarvisTurn(legs, p, projectKey, goal, followup ? m_cuaLastAxChars : 0);
+        } else {
+            m_legChains.insert(streamId, LegChain{legs, 0, p});
+            startChainLeg(streamId);
+        }
         return;
     }
     const QString endpoint = compatEndpoint();
@@ -3401,6 +3500,7 @@ void Backend::cancelStream(const QString &streamId)
     if (m_cuaBatch.streamId == streamId)
         resetCuaLoop();  // the user stopped this conversation: no more automatic turns
     m_streamAsks.remove(streamId);
+    m_legChains.remove(streamId);
     if (m_router)
         m_router->cancelStream(streamId);
 }
@@ -3526,6 +3626,9 @@ void Backend::finishJarvisTurn(const QString &error, const QString &raw)
         o[QStringLiteral("error")] = oneLine(error, 24);
     if (!t.failedLegs.isEmpty())
         o[QStringLiteral("failed_legs")] = QJsonArray::fromStringList(t.failedLegs);
+    // The size only: the screenshot itself never reaches the log.
+    if (!t.prompt.imageJpeg.isEmpty() && t.legs.value(t.leg).name == QLatin1String("self"))
+        o[QStringLiteral("image_bytes")] = qint64(t.prompt.imageJpeg.size());
     o[QStringLiteral("ts")] = QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs);
     appendPlannerLog(o);
 }
@@ -4923,6 +5026,14 @@ bool cuaShouldContinue(const QVector<CuaStepResult> &steps, int depth)
     return true;  // feed post-action observation back until the model finishes without cua_* tags or hits depth cap
 }
 
+QByteArray cuaLastScreenshot(const QVector<CuaStepResult> &steps)
+{
+    for (auto it = steps.crbegin(); it != steps.crend(); ++it)
+        if (!it->screenshotJpeg.isEmpty())
+            return it->screenshotJpeg;
+    return {};
+}
+
 QString cuaFollowupPrompt(const QVector<CuaStepResult> &steps)
 {
     QStringList blocks;
@@ -5742,8 +5853,14 @@ QString Backend::startCuaAction(const QString &action, const CuaCommand &c)
     if (const Project *p = find(trace.projectKey))
         trace.redacted = std::any_of(p->sessions.cbegin(), p->sessions.cend(), [](const SessionInfo &s) { return s.redacted; })
                          || studio::cua::traceBlocked(false, {p->name, p->dir});
+    // Inkling everywhere: L3 grounds on the multimodal jarvisEndpoint first (LFM3 as the offline
+    // fallback), and a batch step brings back its settled screenshot for the follow-up turn.
+    const QString vlmEndpoint = jarvisEndpoint();
+    const QString vlmModel = vlmEndpoint.isEmpty() ? QString() : jarvisModel();
+    const bool attachShots = inBatch && !vlmEndpoint.isEmpty();
     QPointer<Backend> self(this);
-    m_cuaPool->start([self, action, c, shownTarget, logLine, inBatch, batchId, trace, spot, defaultApp, verb, epoch] {
+    m_cuaPool->start([self, action, c, shownTarget, logLine, inBatch, batchId, trace, spot, defaultApp, verb, epoch,
+                      vlmEndpoint, vlmModel, attachShots] {
         // An interrupt since this step was queued: it never runs. A cancel latched by an older
         // turn (its last step has returned: the pool runs one at a time) is cleared first.
         if (!claimCuaEpoch(epoch)) {
@@ -5765,6 +5882,8 @@ QString Backend::startCuaAction(const QString &action, const CuaCommand &c)
         studio::cua::CuaExecutor ex;
         ex.setTraceContext(trace);
         ex.setDefaultAppHint(defaultApp);
+        ex.setVlmEndpoint(vlmEndpoint, vlmModel);
+        ex.setAttachScreenshots(attachShots);
         const studio::cua::CuaExecResult r = c.kind == QLatin1String("type")      ? ex.typeIntoTarget(c.target, c.text)
                                              : c.kind == QLatin1String("scroll")  ? ex.scrollTarget(c.target, c.deltaY)
                                              : c.kind == QLatin1String("observe") ? ex.observeApp(c.target)
@@ -5786,7 +5905,7 @@ QString Backend::startCuaAction(const QString &action, const CuaCommand &c)
                     self->noteSpotlightAction(r.ok, r.ok ? verb : r.detail);
                 if (inBatch)
                     self->noteCuaResult(batchId, CuaStepResult{action, target, r.ok, r.ok ? r.tier : QStringLiteral("ERR"),
-                                                               r.detail, r.observation});
+                                                               r.detail, r.observation, r.screenshotJpeg});
                 self->onCuaActionDone();
                 if (spot)
                     self->syncSpotlightTurn();  // the last step of a turn closes the bar
@@ -5928,34 +6047,49 @@ void Backend::maybeFinishCuaBatch()
     const QString streamId = m_cuaBatch.streamId, project = m_cuaBatch.projectKey, goal = m_cuaBatch.goal;
     const QString shown = m_cuaBatch.shownRaw;
     const quint64 id = m_cuaBatchId;
+    const QByteArray image = cuaLastScreenshot(steps);  // the screen the model sees next (leaf only)
     m_cuaFollowupScheduled = true;
     // Next event-loop turn: the answer that started this batch has been recorded by then.
-    QTimer::singleShot(0, this, [this, id, streamId, project, prompt, note, goal, shown] {
+    QTimer::singleShot(0, this, [this, id, streamId, project, prompt, note, goal, shown, image] {
         m_cuaFollowupScheduled = false;
         if (id != m_cuaBatchId) {
             syncSpotlightTurn();
             return;  // reset (new question, cancel) in between
         }
-        m_cuaFollowupAsk = true;
-        m_cuaFollowupNote = note;
-        m_cuaFollowupGoal = goal;
-        if (streamId.isEmpty()) {
-            m_quickNote = note;
-            ask(project, m_quickArtifact, prompt);
-        } else {
-            // The card keeps appending on this stream: the follow-up's prose opens a fresh
-            // paragraph instead of running into the last turn ("...bar.x.com is loaded").
-            // The Spotlight bar shows only the newest reply, so it needs no break.
-            const QString gap = cuaFollowupBreak(shown);
-            if (!gap.isEmpty() && streamId != QLatin1String(kSpotlightStreamId))
-                emit streamDelta(streamId, gap, QString());
-            startConversation(streamId, project, QString(), prompt);
-        }
-        m_cuaFollowupAsk = false;
-        m_cuaFollowupNote.clear();
-        m_cuaFollowupGoal.clear();
-        syncSpotlightTurn();
+        issueCuaFollowup(streamId, project, prompt, note, goal, shown, image);
     });
+}
+
+void Backend::issueCuaFollowup(const QString &streamId, const QString &project, const QString &prompt,
+                               const QString &note, const QString &goal, const QString &shown, const QByteArray &image)
+{
+    m_cuaFollowupAsk = true;
+    m_cuaFollowupNote = note;
+    m_cuaFollowupGoal = goal;
+    m_cuaFollowupImage = image;
+    if (streamId.isEmpty()) {
+        m_quickNote = note;
+        ask(project, m_quickArtifact, prompt);
+    } else {
+        // The card keeps appending on this stream: the follow-up's prose opens a fresh
+        // paragraph instead of running into the last turn ("...bar.x.com is loaded").
+        // The Spotlight bar shows only the newest reply, so it needs no break.
+        const QString gap = cuaFollowupBreak(shown);
+        if (!gap.isEmpty() && streamId != QLatin1String(kSpotlightStreamId))
+            emit streamDelta(streamId, gap, QString());
+        startConversation(streamId, project, QString(), prompt);
+    }
+    m_cuaFollowupAsk = false;
+    m_cuaFollowupNote.clear();
+    m_cuaFollowupGoal.clear();
+    m_cuaFollowupImage.clear();
+    syncSpotlightTurn();
+}
+
+void Backend::runCuaFollowupForTest(const QString &streamId, const QString &projectKey, const QString &prompt,
+                                    const QString &note, const QByteArray &image)
+{
+    issueCuaFollowup(streamId, projectKey, prompt, note, prompt, QString(), image);
 }
 
 // --- L2 routing and the MacBook-wide Spotlight bar ---------------------------------------------

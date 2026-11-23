@@ -42,6 +42,10 @@ struct TieredPrompt {
     // Wall-clock line ("Current time: 6:16 pm"), Tier 3 only so Tiers 0/1 stay byte-stable and
     // APC-hot. Empty = omitted (deterministic tests); Backend::tieredPrompt fills it.
     QString currentTime;
+    // A live screenshot (JPEG) for the leaf user message; empty on normal text turns. Only an
+    // Inkling model's buildTieredChatRequest sends it (an OpenAI image_url content part); it is
+    // never part of history, so Tiers 0-2 stay byte-identical and APC-hot.
+    QByteArray imageJpeg;
 };
 
 // "Current time: 6:16 pm" from the local clock (12-hour, lowercase am/pm).
@@ -75,7 +79,8 @@ QJsonArray tieredPrefixMessages(const QString &systemPrompt, const QString &trun
                                 const QVector<ChatTurn> &history = {});
 // The Tier 3 leaf text. With only a question it is exactly "Question: <q>".
 QString tieredLeafText(const TieredPrompt &p);
-// Streamed chat request: Tiers 0-2 then the Tier 3 leaf as the final user message.
+// Streamed chat request: Tiers 0-2 then the Tier 3 leaf as the final user message. With an
+// Inkling model and a non-empty imageJpeg, that message's content is [image_url, text].
 QByteArray buildTieredChatRequest(const TieredPrompt &p);
 // Prefix warm: Tiers 0-2 only, max_tokens 1, stream false, no reasoning_effort.
 QByteArray buildTieredWarmRequest(const TieredPrompt &p);

@@ -284,6 +284,159 @@ GroundResult httpGroundPixel(const QByteArray &jpeg, const QString &instruction,
     return parseGroundReply(reply);
 }
 
+GroundResult parseInklingGroundResponse(const QString &content)
+{
+    GroundResult g;
+    const QString text = content.trimmed();
+    static const QRegularExpression kNotFound(QStringLiteral(R"("?not_found"?\s*:\s*true)"),
+                                              QRegularExpression::CaseInsensitiveOption);
+    static const QRegularExpression kPair(QStringLiteral(R"(\[\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\])"));
+    double x = NAN, y = NAN;
+    bool found = false;
+    // The first {...} span, so a ```json fence or a stray word around the object still parses.
+    const qsizetype open = text.indexOf(QLatin1Char('{')), close = text.lastIndexOf(QLatin1Char('}'));
+    if (open >= 0 && close > open) {
+        const QJsonDocument doc = QJsonDocument::fromJson(text.mid(open, close - open + 1).toUtf8());
+        if (doc.isObject()) {
+            const QJsonObject o = doc.object();
+            if (o.value(QStringLiteral("not_found")).toBool(false)) {
+                g.notFound = true;
+                g.detail = QStringLiteral("Inkling: target not visible");
+                return g;
+            }
+            QPointF p;
+            for (const char *key : {"point", "point_1000"})
+                if (!found && jsonPoint(o.value(QLatin1String(key)), &p)) {
+                    x = p.x();
+                    y = p.y();
+                    found = true;
+                }
+        }
+    }
+    if (!found && kNotFound.match(text).hasMatch()) {
+        g.notFound = true;  // a truncated {"not_found": true
+        g.detail = QStringLiteral("Inkling: target not visible");
+        return g;
+    }
+    if (!found) {
+        const QRegularExpressionMatch m = kPair.match(text);
+        if (m.hasMatch()) {
+            x = m.captured(1).toDouble();
+            y = m.captured(2).toDouble();
+            found = true;
+        }
+    }
+    if (!found || !std::isfinite(x) || !std::isfinite(y)) {
+        g.detail = QStringLiteral("Inkling reply has no point");
+        return g;
+    }
+    // 0..1 fractions ([0.283, 0.733]): both within [0, 1] and at least one not a whole number.
+    const bool fraction = x >= 0 && x <= 1.0 && y >= 0 && y <= 1.0 && (x != std::floor(x) || y != std::floor(y));
+    if (fraction) {
+        x *= 1000.0;
+        y *= 1000.0;
+    }
+    if (x < 0 || x > 1000 || y < 0 || y > 1000) {
+        g.detail = QStringLiteral("Inkling point (%1, %2) is outside 0-1000").arg(x).arg(y);
+        return g;
+    }
+    g.ok = true;
+    g.hasPoint1000 = true;
+    g.point1000 = {std::round(x), std::round(y)};
+    return g;
+}
+
+QByteArray buildInklingGroundRequest(const QByteArray &jpeg, const QString &target, const QString &model)
+{
+    const QString prompt = QStringLiteral("Locate the exact center of UI element: \"%1\". Reply ONLY with JSON "
+                                          "{\"point\":[x,y]} using integer coordinates 0-1000 (x=0 left, y=0 top), or "
+                                          "{\"not_found\":true} if it is not clearly visible on screen.")
+                               .arg(target.simplified());
+    const QString url = QStringLiteral("data:image/jpeg;base64,") + QString::fromLatin1(jpeg.toBase64());
+    const QJsonArray content{
+        QJsonObject{{QStringLiteral("type"), QStringLiteral("image_url")},
+                    {QStringLiteral("image_url"), QJsonObject{{QStringLiteral("url"), url}}}},
+        QJsonObject{{QStringLiteral("type"), QStringLiteral("text")}, {QStringLiteral("text"), prompt}}};
+    const QJsonArray msgs{QJsonObject{{QStringLiteral("role"), QStringLiteral("user")}, {QStringLiteral("content"), content}},
+                          QJsonObject{{QStringLiteral("role"), QStringLiteral("assistant")}, {QStringLiteral("content"), QString()}}};
+    QJsonObject o;
+    o.insert(QStringLiteral("model"), model.trimmed().isEmpty() ? QString::fromLatin1(kInklingGroundDefaultModel) : model.trimmed());
+    o.insert(QStringLiteral("stream"), false);
+    o.insert(QStringLiteral("temperature"), 0.0);
+    o.insert(QStringLiteral("repeat_penalty"), 1.0);
+    o.insert(QStringLiteral("max_tokens"), 48);
+    o.insert(QStringLiteral("chat_template_kwargs"), QJsonObject{{QStringLiteral("reasoning_effort"), 0.0}});
+    o.insert(QStringLiteral("continue_final_message"), true);
+    o.insert(QStringLiteral("add_generation_prompt"), false);
+    o.insert(QStringLiteral("messages"), msgs);
+    return QJsonDocument(o).toJson(QJsonDocument::Compact);
+}
+
+QString inklingChatUrl(const QString &endpoint)
+{
+    QString base = endpoint.trimmed();
+    while (base.endsWith(QLatin1Char('/')))
+        base.chop(1);
+    if (base.isEmpty() || base.endsWith(QLatin1String("/chat/completions")))
+        return base;
+    return base + QStringLiteral("/chat/completions");
+}
+
+GroundResult httpGroundWithInkling(const QString &endpoint, const QString &model, const QByteArray &jpeg,
+                                   const QString &target)
+{
+    static std::once_flag once;
+    std::call_once(once, [] { curl_global_init(CURL_GLOBAL_DEFAULT); });
+    GroundResult fail;
+    fail.unreachable = true;
+    const QByteArray url = inklingChatUrl(endpoint).toUtf8();
+    if (url.isEmpty()) {
+        fail.detail = QStringLiteral("No Inkling endpoint");
+        return fail;
+    }
+    CURL *h = curl_easy_init();
+    if (!h) {
+        fail.detail = QStringLiteral("libcurl init failed");
+        return fail;
+    }
+    const QByteArray body = buildInklingGroundRequest(jpeg, target, model);
+    QByteArray reply;
+    curl_slist *headers = curl_slist_append(nullptr, "Content-Type: application/json");
+    curl_easy_setopt(h, CURLOPT_URL, url.constData());
+    curl_easy_setopt(h, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(h, CURLOPT_POST, 1L);
+    curl_easy_setopt(h, CURLOPT_POSTFIELDS, body.constData());
+    curl_easy_setopt(h, CURLOPT_POSTFIELDSIZE_LARGE, curl_off_t(body.size()));
+    curl_easy_setopt(h, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(h, CURLOPT_TIMEOUT_MS, long(kInklingGroundTimeoutMs));
+    curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT_MS, long(kInklingGroundConnectMs));
+    curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, &appendBody);
+    curl_easy_setopt(h, CURLOPT_WRITEDATA, &reply);
+    const CURLcode rc = curl_easy_perform(h);
+    long status = 0;
+    curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &status);
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(h);
+    if (rc != CURLE_OK) {
+        fail.detail = QStringLiteral("Inkling grounder offline (%1)").arg(QString::fromUtf8(curl_easy_strerror(rc)));
+        return fail;
+    }
+    if (status != 200) {
+        fail.detail = QStringLiteral("Inkling grounder HTTP %1").arg(status);
+        return fail;
+    }
+    const QJsonObject o = QJsonDocument::fromJson(reply).object();
+    const QJsonObject msg = o.value(QStringLiteral("choices")).toArray().at(0).toObject().value(QStringLiteral("message")).toObject();
+    if (!msg.value(QStringLiteral("content")).isString()) {
+        fail.detail = QStringLiteral("Inkling grounder reply has no message content");
+        return fail;  // a 200 that is not a chat completion: treat as unreachable, let LFM3 try
+    }
+    GroundResult g = parseInklingGroundResponse(msg.value(QStringLiteral("content")).toString());
+    if (!g.ok && !g.notFound)
+        g.detail = QStringLiteral("%1: %2").arg(g.detail, msg.value(QStringLiteral("content")).toString().simplified().left(60));
+    return g;
+}
+
 QSizeF expectedCaptureSize(const DisplayInfo &d, int maxWidth)
 {
     if (!d.globalPoints.isValid() || !(d.scale > 0) || maxWidth <= 0)
@@ -379,6 +532,11 @@ CuaHooks defaultCuaHooks()
         return studio::cua::captureDisplayJpeg(id, w, exclude, err);
     };
     h.groundPixel = &httpGroundPixel;
+    h.inklingGround = &httpGroundWithInkling;
+    h.captureObservationJpeg = [](uint32_t id, const QVector<uint32_t> &exclude) {
+        QString err;
+        return studio::cua::captureDisplayJpeg(id, kObservationJpegWidth, exclude, &err, kObservationJpegQuality);
+    };
     h.clickAt = [](QPointF p, bool dbl) { return studio::cua::clickAt(p, dbl); };
     h.scrollAt = [](QPointF p, int dy) { return studio::cua::scrollAt(p, dy); };
     h.typeText = [](const QString &t) { return studio::cua::typeText(t); };
@@ -950,7 +1108,8 @@ CuaExecutor::Located CuaExecutor::locate(const QString &targetDesc, bool refineC
 
     // L3: local VLM pixel grounding on the first routed display (the hinted app's monitor, else
     // one Lapis is not on), on a capture that leaves our own overlay out.
-    if (!m_hooks.captureDisplayJpeg || !m_hooks.groundPixel) {
+    const bool inkling = !m_vlmEndpoint.isEmpty() && m_hooks.inklingGround;
+    if (!m_hooks.captureDisplayJpeg || (!m_hooks.groundPixel && !inkling)) {
         loc.detail = QStringLiteral("No AX match and no grounder");
         return loc;
     }
@@ -970,7 +1129,16 @@ CuaExecutor::Located CuaExecutor::locate(const QString &targetDesc, bool refineC
         m_step.before = jpeg;  // the trace reuses this frame instead of capturing again
         m_step.beforeDisplayId = display.displayId;
     }
-    const GroundResult g = m_hooks.groundPixel(jpeg, targetDesc, refineCrop);
+    // Inkling on the multimodal endpoint first; LFM3 only when that is unset or unreachable. An
+    // explicit not_found stands: LFM3 would only guess a stray click.
+    GroundResult g;
+    bool grounded = false;
+    if (inkling) {
+        g = m_hooks.inklingGround(m_vlmEndpoint, m_vlmModel, jpeg, targetDesc);
+        grounded = !g.unreachable;
+    }
+    if (!grounded && m_hooks.groundPixel)
+        g = m_hooks.groundPixel(jpeg, targetDesc, refineCrop);
     if (!g.ok) {
         loc.detail = g.detail.isEmpty() ? QStringLiteral("Grounder failed") : g.detail;
         return loc;
@@ -999,7 +1167,8 @@ CuaExecutor::Located CuaExecutor::locate(const QString &targetDesc, bool refineC
     loc.ok = true;
     loc.tier = QStringLiteral("L3_VLM");
     loc.pt = pt;
-    loc.detail = QStringLiteral("VLM point (%1, %2)").arg(pt.x(), 0, 'f', 1).arg(pt.y(), 0, 'f', 1);
+    loc.detail = QStringLiteral("VLM point (%1, %2)").arg(pt.x(), 0, 'f', 1).arg(pt.y(), 0, 'f', 1)
+                 + (grounded ? QStringLiteral(" via Inkling") : QString());
     if (m_hooks.reticleMove)
         m_hooks.reticleMove(pt, label);
     return loc;
@@ -1013,7 +1182,7 @@ CuaExecResult CuaExecutor::clickTarget(const QString &targetDesc, bool doubleCli
     const CuaExecResult r = click(targetDesc, doubleClick, refineCrop, true, &rt);
     endStep();
     traceStep(QStringLiteral("click"), targetDesc.simplified(), {}, rt, r);
-    return r;
+    return withShot(r);
 }
 
 CuaExecResult CuaExecutor::click(const QString &targetDesc, bool doubleClick, bool refineCrop, bool finish, Route *routeOut)
@@ -1134,7 +1303,26 @@ QString CuaExecutor::observeAfterAction(const Route &routed, bool waitPageLoad, 
             nodes = visibleNodes(rt, displayId);
         }
     }
+    captureObservationShot(displayId);  // the settled screen, same moment as the AX read
     return formatNodesForModel(nodes, kPostActionChars);
+}
+
+void CuaExecutor::captureObservationShot(uint32_t displayId)
+{
+    if (!m_attachScreenshots || !m_hooks.captureObservationJpeg || !displayId)
+        return;
+    QVector<uint32_t> exclude;  // the cursor and HUD bar never appear in what the model sees
+    for (const uint32_t id : {m_hooks.reticleWindowId ? m_hooks.reticleWindowId() : 0u,
+                              m_hooks.hudWindowId ? m_hooks.hudWindowId() : 0u})
+        if (id)
+            exclude.push_back(id);
+    m_step.obsJpeg = m_hooks.captureObservationJpeg(displayId, exclude);
+}
+
+CuaExecResult CuaExecutor::withShot(CuaExecResult r)
+{
+    r.screenshotJpeg = std::exchange(m_step.obsJpeg, {});
+    return r;
 }
 
 CuaExecResult CuaExecutor::observeApp(const QString &appHint)
@@ -1144,7 +1332,7 @@ CuaExecResult CuaExecutor::observeApp(const QString &appHint)
     Route rt;
     const CuaExecResult r = observeImpl(appHint, &rt);
     traceStep(QStringLiteral("observe"), appHint.simplified(), {}, rt, r);
-    return r;
+    return withShot(r);
 }
 
 CuaExecResult CuaExecutor::typeIntoTarget(const QString &targetDesc, const QString &text, bool clearFirst)
@@ -1156,7 +1344,7 @@ CuaExecResult CuaExecutor::typeIntoTarget(const QString &targetDesc, const QStri
     const CuaExecResult r = typeImpl(targetDesc, text, clearFirst, &rt);
     endStep();
     traceStep(QStringLiteral("type"), targetDesc.simplified(), normalizeTypedText(text), rt, r);
-    return r;
+    return withShot(r);
 }
 
 CuaExecResult CuaExecutor::scrollTarget(const QString &targetDesc, int deltaY)
@@ -1167,7 +1355,7 @@ CuaExecResult CuaExecutor::scrollTarget(const QString &targetDesc, int deltaY)
     const CuaExecResult r = scrollImpl(targetDesc, deltaY, &rt);
     endStep();
     traceStep(QStringLiteral("scroll"), targetDesc.simplified(), {}, rt, r, deltaY);
-    return r;
+    return withShot(r);
 }
 
 CuaExecResult CuaExecutor::observeImpl(const QString &appHint, Route *rtOut)
@@ -1187,6 +1375,7 @@ CuaExecResult CuaExecutor::observeImpl(const QString &appHint, Route *rtOut)
     const QVector<AxNode> nodes = visibleNodes(rt, display.displayId);
     CuaExecResult r{true, QStringLiteral("L1_OBS"), display.globalPoints.center(), {}};
     r.observation = formatNodesForModel(nodes, kObserveChars);
+    captureObservationShot(display.displayId);
     qsizetype inApp = 0;
     if (!rt.appHint.isEmpty())
         inApp = std::count_if(nodes.begin(), nodes.end(), [&](const AxNode &n) { return appNameMatches(n.appName, rt.appHint); });
@@ -1314,7 +1503,7 @@ CuaExecResult CuaExecutor::hotkeyAction(const QString &appHint, const QString &c
     const CuaExecResult r = hotkeyImpl(appHint, combo, &rt);
     endStep();
     traceStep(QStringLiteral("hotkey"), appHint.simplified(), combo.simplified(), rt, r);
-    return r;
+    return withShot(r);
 }
 
 CuaExecResult CuaExecutor::openAction(const QString &appHint, const QString &url)
@@ -1326,7 +1515,7 @@ CuaExecResult CuaExecutor::openAction(const QString &appHint, const QString &url
     const CuaExecResult r = openImpl(appHint, url, &rt);
     endStep();
     traceStep(QStringLiteral("open"), appHint.simplified(), url.trimmed(), rt, r);
-    return r;
+    return withShot(r);
 }
 
 CuaExecResult CuaExecutor::openImpl(const QString &appHint, const QString &url, Route *rtOut)
@@ -1401,7 +1590,7 @@ CuaExecResult CuaExecutor::dragTarget(const QString &fromDesc, const QString &to
     const CuaExecResult r = dragImpl(fromDesc, toDesc, &rt);
     endStep();
     traceStep(QStringLiteral("drag"), fromDesc.simplified(), toDesc.simplified(), rt, r);
-    return r;
+    return withShot(r);
 }
 
 CuaExecResult CuaExecutor::hotkeyImpl(const QString &appHint, const QString &combo, Route *rtOut)

@@ -151,8 +151,9 @@ QString formatNodesForModel(const QVector<AxNode> &nodes, int maxChars = 6000);
 QByteArray captureDisplayJpeg(uint32_t displayId, int maxWidth = 1280,
                             uint32_t excludeWindowId = 0, QString *errOut = nullptr);
 // Same, excluding every listed window (the reticle and the HUD bar); zero ids are ignored.
+// quality is the JPEG compression factor (0..1).
 QByteArray captureDisplayJpeg(uint32_t displayId, int maxWidth, const QVector<uint32_t> &excludeWindowIds,
-                            QString *errOut = nullptr);
+                            QString *errOut = nullptr, double quality = 0.8);
 
 struct ActionResult { bool ok; QString detail; };
 ActionResult axPress(int pid, const QString &titleOrRole, const QRectF &nearRect);

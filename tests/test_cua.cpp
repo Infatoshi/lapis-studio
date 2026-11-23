@@ -1444,6 +1444,155 @@ QVector<QJsonObject> humanLines(const QString &dir) {
 }
 // The six live-prompt reliability fixes: deep web scan, compact observations, whole-page scroll,
 // cua_open, navigation settle, and following a new window.
+// Inkling 2 Mini as the L3 grounder (ahead of LFM3) and the post-action screenshot.
+void inklingGroundTests() {
+    // Parser.
+    GroundResult g = parseInklingGroundResponse("{\"point\":[283,733]}");
+    check(g.ok && g.hasPoint1000 && g.point1000 == QPointF(283, 733) && !g.notFound, "inkling parse: {\"point\":[283,733]}");
+    g = parseInklingGroundResponse("{\"point\": [0.283, 0.733]}");
+    check(g.ok && g.hasPoint1000 && g.point1000 == QPointF(283, 733), "inkling parse: 0..1 floats scale to 0..1000");
+    g = parseInklingGroundResponse("{\"not_found\": true}");
+    check(!g.ok && g.notFound && !g.hasPoint1000 && !g.unreachable, "inkling parse: not_found -> not ok, notFound");
+    g = parseInklingGroundResponse("{\"not_found\":tr");
+    check(!g.ok && !g.notFound, "inkling parse: truncated not_found without true is malformed");
+    g = parseInklingGroundResponse("{\"not_found\": true");
+    check(!g.ok && g.notFound, "inkling parse: truncated {\"not_found\": true still means not found");
+    g = parseInklingGroundResponse("[283, 733]");
+    check(g.ok && g.point1000 == QPointF(283, 733), "inkling parse: bare [x, y] fallback");
+    g = parseInklingGroundResponse("```json\n{\"point\":[500,20]}\n```");
+    check(g.ok && g.point1000 == QPointF(500, 20), "inkling parse: fenced JSON");
+    g = parseInklingGroundResponse("point\":[283,733]}");
+    check(g.ok && g.point1000 == QPointF(283, 733), "inkling parse: prefill-continued fragment still yields the pair");
+    for (const char *bad : {"", "I cannot see it", "{\"point\":[283]}", "{\"point\":\"x\"}", "{\"point\":[1200,40]}", "[-5, 40]"}) {
+        g = parseInklingGroundResponse(QString::fromLatin1(bad));
+        check(!g.ok && !g.notFound && !g.hasPoint1000 && !g.detail.isEmpty(), "inkling parse: malformed or out of range -> no point");
+    }
+    g = parseInklingGroundResponse("{\"point\":[1,0]}");
+    check(g.ok && g.point1000 == QPointF(1, 0), "inkling parse: whole-number [1,0] stays on the 0..1000 scale");
+
+    // Request body.
+    const QJsonObject body = QJsonDocument::fromJson(buildInklingGroundRequest("JPEG", "Send button in Discord", {})).object();
+    const QJsonArray msgs = body.value("messages").toArray();
+    const QJsonArray parts = msgs.at(0).toObject().value("content").toArray();
+    check(body.value("model") == kInklingGroundDefaultModel && !body.value("stream").toBool(true)
+              && body.value("temperature").toDouble(-1) == 0.0 && body.value("repeat_penalty").toDouble(-1) == 1.0
+              && body.value("max_tokens").toInt() == 48
+              && body.value("chat_template_kwargs").toObject().value("reasoning_effort").toDouble(-1) == 0.0
+              && body.value("continue_final_message").toBool() && !body.value("add_generation_prompt").toBool(true),
+          "inkling request: default model, greedy, 48 tokens, zero reasoning, prefill");
+    check(msgs.size() == 2 && msgs.at(1).toObject().value("role") == "assistant"
+              && msgs.at(1).toObject().value("content").toString().isEmpty()
+              && parts.at(0).toObject().value("image_url").toObject().value("url") == "data:image/jpeg;base64," + QString::fromLatin1(QByteArray("JPEG").toBase64())
+              && parts.at(1).toObject().value("text").toString().startsWith("Locate the exact center of UI element: \"Send button in Discord\". Reply ONLY with JSON"),
+          "inkling request: image then the locate prompt, trailing empty assistant");
+    check(QJsonDocument::fromJson(buildInklingGroundRequest("J", "x", "my/model")).object().value("model") == "my/model",
+          "inkling request: explicit model wins");
+    check(inklingChatUrl("http://h:1/v1/") == "http://h:1/v1/chat/completions"
+              && inklingChatUrl("http://h:1/v1/chat/completions") == "http://h:1/v1/chat/completions" && inklingChatUrl(" ").isEmpty(),
+          "inkling url: /chat/completions appended once");
+    // Network failure is unreachable (LFM3 may try), never notFound.
+    g = httpGroundWithInkling("http://127.0.0.1:9/v1", {}, "J", "x");
+    check(!g.ok && g.unreachable && !g.notFound, "inkling http: closed port -> unreachable");
+
+    auto inklingRig = [](MockRig &m, GroundResult reply, QStringList *log, QString *endpointSeen) {
+        CuaHooks h = m.hooks();
+        h.inklingGround = [&m, reply, log, endpointSeen](const QString &ep, const QString &model, const QByteArray &, const QString &instr) {
+            m.calls << "inkling";
+            *log << model + "|" + instr;
+            *endpointSeen = ep;
+            return reply;
+        };
+        return h;
+    };
+    const QVector<AxNode> toolbar = {axNode(1, "AXGroup", "Toolbar", {0, 0, 1440, 40})};
+    // Inkling answers: LFM3 never runs.
+    {
+        MockRig m;
+        m.nodes = toolbar;
+        GroundResult hit; hit.ok = true; hit.hasPoint1000 = true; hit.point1000 = {250, 500};
+        QStringList log; QString ep;
+        CuaExecutor ex(inklingRig(m, hit, &log, &ep));
+        ex.setVlmEndpoint("http://self:8000/v1", "Infatoshi/Inkling-2-Mini-heretic");
+        const auto res = ex.clickTarget("the gear icon");
+        check(res.ok && res.tier == "L3_VLM" && res.detail.endsWith("via Inkling") && close(m.clickPt, {360, 450}),
+              "exec inkling: L3 grounds on Inkling and clicks its point");
+        check(m.effects() == QStringList({"capture", "inkling", "reticleMove", "reticlePulse", "click"}) && !m.calls.contains("ground"),
+              "exec inkling: capture -> Inkling -> click, LFM3 never asked");
+        check(ep == "http://self:8000/v1" && log == QStringList{"Infatoshi/Inkling-2-Mini-heretic|the gear icon"},
+              "exec inkling: endpoint, model and target forwarded");
+    }
+    // Explicit not_found: no click, no LFM3.
+    {
+        MockRig m;
+        m.nodes = toolbar;
+        m.ground.ok = true; m.ground.hasPoint1000 = true; m.ground.point1000 = {250, 500};
+        GroundResult nf; nf.notFound = true; nf.detail = "Inkling: target not visible";
+        QStringList log; QString ep;
+        CuaExecutor ex(inklingRig(m, nf, &log, &ep));
+        ex.setVlmEndpoint("http://self:8000/v1");
+        const auto res = ex.clickTarget("the gear icon");
+        check(!res.ok && res.tier == "ERR" && !m.calls.contains("click") && !m.calls.contains("ground")
+                  && res.detail.contains("not visible"),
+              "exec inkling: not_found stands (no click, no LFM3 guess)");
+    }
+    // Unreachable: LFM3 fallback.
+    {
+        MockRig m;
+        m.nodes = toolbar;
+        m.ground.ok = true; m.ground.hasPoint1000 = true; m.ground.point1000 = {250, 500};
+        GroundResult down; down.unreachable = true; down.detail = "Inkling grounder offline";
+        QStringList log; QString ep;
+        CuaExecutor ex(inklingRig(m, down, &log, &ep));
+        ex.setVlmEndpoint("http://self:8000/v1");
+        const auto res = ex.clickTarget("the gear icon");
+        check(res.ok && res.tier == "L3_VLM" && !res.detail.contains("Inkling")
+                  && m.effects() == QStringList({"capture", "inkling", "ground", "reticleMove", "reticlePulse", "click"}),
+              "exec inkling: unreachable endpoint -> LFM3 fallback");
+    }
+    // No endpoint: LFM3 only, Inkling hook untouched.
+    {
+        MockRig m;
+        m.nodes = toolbar;
+        m.ground.ok = true; m.ground.hasPoint1000 = true; m.ground.point1000 = {250, 500};
+        GroundResult hit; hit.ok = true; hit.hasPoint1000 = true; hit.point1000 = {1, 1};
+        QStringList log; QString ep;
+        CuaExecutor ex(inklingRig(m, hit, &log, &ep));
+        const auto res = ex.clickTarget("the gear icon");
+        check(res.ok && !m.calls.contains("inkling") && m.calls.contains("ground"), "exec inkling: no vlmEndpoint -> LFM3 only");
+    }
+
+    // Post-action screenshots: off by default; on, every result carries the settled frame.
+    {
+        MockRig m;
+        const QRectF button(400, 300, 120, 40);
+        m.nodes = {axNode(2, "AXButton", "Send", button)};
+        int shots = 0;
+        uint32_t shotDisplay = 0;
+        QVector<uint32_t> shotExclude;
+        CuaHooks h = m.hooks();
+        h.captureObservationJpeg = [&](uint32_t id, const QVector<uint32_t> &ex) {
+            ++shots;
+            shotDisplay = id;
+            shotExclude = ex;
+            return QByteArray("SHOT");
+        };
+        CuaExecutor off(h);
+        check(off.clickTarget("Send").screenshotJpeg.isEmpty() && shots == 0, "exec shot: off by default, nothing captured");
+        CuaExecutor on(h);
+        on.setAttachScreenshots(true);
+        const auto r = on.clickTarget("Send");
+        check(r.ok && r.screenshotJpeg == "SHOT" && shots == 1 && shotDisplay == 7
+                  && shotExclude == QVector<uint32_t>({4242, 5151}),
+              "exec shot: click result carries one settled screenshot, overlays excluded");
+        const auto o = on.observeApp("Chrome");
+        check(o.ok && o.screenshotJpeg == "SHOT" && shots == 2, "exec shot: observe carries the observed screen");
+        CuaExecutor noHook(m.hooks());
+        noHook.setAttachScreenshots(true);
+        check(noHook.clickTarget("Send").screenshotJpeg.isEmpty(), "exec shot: no capture hook -> no screenshot");
+        check(kObservationJpegWidth == 1280 && kObservationJpegQuality == 0.72, "exec shot: 1280 px at quality 72");
+    }
+}
+
 void reliabilityTests() {
     // --- scan policy on a synthetic Chrome tree --------------------------------------------------
     {
@@ -2180,6 +2329,7 @@ int main(int argc, char **argv) {
     spaceSwitchTests();
     hotkeyDragTests();
     reliabilityTests();
+    inklingGroundTests();
     spotlightTests();
     if (app.arguments().contains("--capture-smoke")) captureSmokeTest();
     std::printf("test_cua: %d passed, %d failed\n", passed, failed);

@@ -23,6 +23,10 @@ struct GroundResult {
     QPointF pointPx;
     QSizeF imageSize;
     QString detail;  // error text when !ok
+    // Inkling grounding only: notFound = the model said {"not_found":true} (never click, never
+    // ask LFM3); unreachable = the request failed at the network / HTTP layer (LFM3 may try).
+    bool notFound = false;
+    bool unreachable = false;
 };
 
 // Parses a grounder JSON reply: point_1000 / point_px as [x, y] or {x, y}, optional
@@ -34,6 +38,28 @@ QByteArray buildGroundRequest(const QByteArray &jpeg, const QString &instruction
 QString grounderUrl();
 // libcurl POST to grounderUrl() with a 4 s total timeout; ok=false (no throw) when offline.
 GroundResult httpGroundPixel(const QByteArray &jpeg, const QString &instruction, bool refineCrop);
+
+// L3 on the multimodal Inkling endpoint (the self-hosted jarvisEndpoint), ahead of LFM3.
+constexpr char kInklingGroundDefaultModel[] = "Infatoshi/Inkling-2-Mini-heretic";
+constexpr int kInklingGroundConnectMs = 250, kInklingGroundTimeoutMs = 3500;
+// Parses Inkling's reply text (choices[0].message.content): {"point":[x,y]} in 0..1000 (0..1
+// floats are scaled up), {"not_found":true} (ok=false, notFound=true), or a bare [x, y].
+// Anything else is ok=false with a detail. Fenced or prose-wrapped JSON is tolerated.
+GroundResult parseInklingGroundResponse(const QString &content);
+// The OpenAI-compat multimodal grounding body: greedy, 48 tokens, zero reasoning, the image
+// then the locate instruction, and an empty assistant prefill (continue_final_message).
+QByteArray buildInklingGroundRequest(const QByteArray &jpeg, const QString &target, const QString &model);
+// "http://host:8000/v1" or ".../v1/chat/completions" -> the full chat/completions URL.
+QString inklingChatUrl(const QString &endpoint);
+// libcurl POST to endpoint (250 ms connect, 3.5 s total). Transport errors and non-200 replies
+// come back with unreachable=true; a 200 is parsed with parseInklingGroundResponse.
+GroundResult httpGroundWithInkling(const QString &endpoint, const QString &model, const QByteArray &jpeg,
+                                   const QString &target);
+
+// Post-action screenshots for a multimodal follow-up turn: 1280 px wide at JPEG quality 72
+// (~100-200 KB a frame), overlays excluded.
+constexpr int kObservationJpegWidth = 1280;
+constexpr double kObservationJpegQuality = 0.72;
 
 // The pixel size captureDisplayJpeg(display, maxWidth) produces (same rounding as cua.mm).
 QSizeF expectedCaptureSize(const DisplayInfo &display, int maxWidth);
@@ -56,6 +82,14 @@ struct CuaHooks {
     std::function<QByteArray(uint32_t displayId, int maxWidth, const QVector<uint32_t> &excludeWindowIds, QString *err)>
         captureDisplayJpeg;
     std::function<GroundResult(const QByteArray &jpeg, const QString &instruction, bool refineCrop)> groundPixel;
+    // Inkling grounding on a multimodal endpoint (httpGroundWithInkling); used only when the
+    // executor has a vlmEndpoint. Unset means LFM3 (groundPixel) alone.
+    std::function<GroundResult(const QString &endpoint, const QString &model, const QByteArray &jpeg,
+                               const QString &instruction)>
+        inklingGround;
+    // The post-action screenshot (kObservationJpegWidth at kObservationJpegQuality). Unset, or
+    // attach screenshots off, means results carry no screenshotJpeg.
+    std::function<QByteArray(uint32_t displayId, const QVector<uint32_t> &excludeWindowIds)> captureObservationJpeg;
     std::function<ActionResult(QPointF globalPt, bool doubleClick)> clickAt;
     std::function<ActionResult(QPointF globalPt, int deltaY)> scrollAt;
     std::function<ActionResult(const QString &text)> typeText;
@@ -162,6 +196,9 @@ struct CuaExecResult {
     // What the screen showed afterwards: formatted AX nodes (formatNodesForModel), never Lapis's
     // own unless the target names Lapis. Empty when nothing was observed.
     QString observation = {};
+    // The settled screen after the action (or the observed screen), when the executor attaches
+    // screenshots: JPEG, kObservationJpegWidth wide. Empty otherwise.
+    QByteArray screenshotJpeg = {};
 };
 
 // Scores one AX node against a target description: 0 = no match. Exact title > exact value >
@@ -221,10 +258,26 @@ public:
     // The app a step acts on when its target names none (the Spotlight bar's target app).
     void setDefaultAppHint(const QString &app) { m_defaultAppHint = app.trimmed(); }
     QString defaultAppHint() const { return m_defaultAppHint; }
+    // L3 goes to Inkling on this endpoint first (model empty: kInklingGroundDefaultModel); LFM3
+    // only when it is empty or unreachable. An explicit not_found is final.
+    void setVlmEndpoint(const QString &endpoint, const QString &model = {})
+    {
+        m_vlmEndpoint = endpoint.trimmed();
+        m_vlmModel = model.trimmed();
+    }
+    QString vlmEndpoint() const { return m_vlmEndpoint; }
+    // Every result carries the settled post-action screenshot (screenshotJpeg). Off by default.
+    void setAttachScreenshots(bool on) { m_attachScreenshots = on; }
     const CuaHooks &hooks() const { return m_hooks; }
 
 private:
     QString m_defaultAppHint;
+    QString m_vlmEndpoint, m_vlmModel;
+    bool m_attachScreenshots = false;
+    // Grabs the observation screenshot of displayId into m_step.obsJpeg (when attaching).
+    void captureObservationShot(uint32_t displayId);
+    // Moves the step's observation screenshot into r.
+    CuaExecResult withShot(CuaExecResult r);
     // One public call's trace material, all in memory until the privacy check passes.
     struct StepTrace {
         QByteArray before;  // JPEG captured before the action (the L3 capture when there was one)
@@ -234,6 +287,7 @@ private:
         QString target, text;  // what the public call was asked, for the privacy check
         bool hasToPt = false;  // drags: where the button was released
         QPointF toPt;
+        QByteArray obsJpeg;    // the post-action screenshot (attach screenshots only)
     };
     struct Located {
         bool ok = false;

@@ -601,8 +601,9 @@ QString formatNodesForModel(const QVector<AxNode> &nodes, int maxChars) {
 QByteArray captureDisplayJpeg(uint32_t displayId, int maxWidth, uint32_t excludeWindowId, QString *errOut) {
     return captureDisplayJpeg(displayId, maxWidth, excludeWindowId ? QVector<uint32_t>{excludeWindowId} : QVector<uint32_t>{}, errOut);
 }
-QByteArray captureDisplayJpeg(uint32_t displayId, int maxWidth, const QVector<uint32_t> &excludeIds, QString *errOut) {
+QByteArray captureDisplayJpeg(uint32_t displayId, int maxWidth, const QVector<uint32_t> &excludeIds, QString *errOut, double quality) {
     if (errOut) errOut->clear();
+    const double jpegQuality = std::isfinite(quality) ? std::clamp(quality, 0.05, 1.0) : 0.8;
     auto fail = [errOut](const QString &s) { if (errOut) *errOut = s; return QByteArray(); };
     if (cancelFlag.load()) return fail("Cancelled");
     if (maxWidth <= 0 || maxWidth > 16384) return fail("Invalid maximum width");
@@ -637,7 +638,7 @@ QByteArray captureDisplayJpeg(uint32_t displayId, int maxWidth, const QVector<ui
                         @autoreleasepool {
                             if (!img || captureError) { state->finish({}, captureError ? QString::fromNSString(captureError.localizedDescription) : "Capture returned no image"); return; }
                             NSBitmapImageRep *rep = [[NSBitmapImageRep alloc] initWithCGImage:img];
-                            NSData *jpeg = [rep representationUsingType:NSBitmapImageFileTypeJPEG properties:@{NSImageCompressionFactor: @0.8}];
+                            NSData *jpeg = [rep representationUsingType:NSBitmapImageFileTypeJPEG properties:@{NSImageCompressionFactor: @(jpegQuality)}];
                             QByteArray bytes((const char *)jpeg.bytes, qsizetype(jpeg.length));
                             [rep release];
                             state->finish(bytes, bytes.isEmpty() ? QString("JPEG encoding failed") : QString());

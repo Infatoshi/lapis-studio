@@ -7412,6 +7412,91 @@ void jarvisFailoverTests()
     b.setLlmRouter(nullptr);
 }
 
+// Inkling everywhere: an island card runs on the Jarvis legs, a CUA follow-up's screenshot rides
+// on leg 1's leaf only, and no history ever holds the image.
+void inklingUniversalTests()
+{
+    Backend b(Backend::Mode::Mock);
+    QString key;
+    for (const QVariant &v : b.projects()) {
+        key = v.toMap().value("key").toString();
+        if (!key.isEmpty())
+            break;
+    }
+    // Quick-ask gating: a CLI pick keeps its channel; a compat / OpenRouter pick rides the legs.
+    const QVector<JarvisLeg> testLegs = {{QStringLiteral("self"), QStringLiteral("http://127.0.0.1:9/v1/chat/completions"), QString(),
+                                          QStringLiteral("Infatoshi/Inkling-2-Mini-heretic"), false, 200, 1800}};
+    check(b.chatLegs("__quick__").isEmpty() && b.chatLegs("card:x").isEmpty(),
+          "inkling universal: no jarvisEndpoint (mock) -> every stream keeps its old path");
+    b.setJarvisLegsForTest(testLegs);
+    b.setChatModel(QStringLiteral("claude-sonnet-5-5"));
+    check(b.chatLegs("__quick__").isEmpty() && b.chatLegs("card:x").size() == 1 && b.chatLegs("spotlight").size() == 1,
+          "inkling universal: a Claude pick keeps the quick ask on its CLI; cards and Jarvis use the legs");
+    b.setChatModel(QStringLiteral("deepseek/deepseek-v4.1-flash-1017"));
+    check(b.chatLegs("__quick__").size() == 1, "inkling universal: a DeepSeek (OpenRouter) pick puts the quick ask on the legs");
+    b.setChatModel(QStringLiteral("thinkingmachines/inkling-2-mini"));
+    check(b.chatLegs("__quick__").size() == 1, "inkling universal: an Inkling pick puts the quick ask on the legs");
+    b.setChatModel(QStringLiteral("qwen3.8-flash-next"));
+    check(b.chatLegs("__quick__").size() == 1, "inkling universal: a compat pick puts the quick ask on the legs");
+
+    FakeSse self;
+    self.answer = QStringLiteral("The pinned post says the run peaked at 126 tok/s.");
+    FakeSse backup;
+    check(self.start() && backup.start(), "inkling universal: two local SSE endpoints listen");
+    LlmRouter router;
+    b.setLlmRouter(&router);
+    b.setJarvisLegsForTest(
+        {{QStringLiteral("self"), self.url() + "/chat/completions", QString(), QStringLiteral("Infatoshi/Inkling-2-Mini-heretic"),
+          false, 200, 1800},
+         {QStringLiteral("inkling"), backup.url() + "/chat/completions", QString(), QStringLiteral("thinkingmachines/inkling-2-mini"),
+          true, 3000, 2500}});
+    const QString card = QStringLiteral("card:inkling-universal");
+    int finished = 0;
+    QStringList errors;
+    QObject::connect(&b, &Backend::streamFinished, [&](const QString &id, const QString &err) {
+        if (id == card) {
+            ++finished;
+            errors << err;
+        }
+    });
+    b.askStream(card, key, 0, QStringLiteral("what did the run peak at?"));
+    check(waitUntil([&] { return finished == 1; }, 6000) && errors.value(0).isEmpty() && self.bodies.size() == 1
+              && backup.bodies.isEmpty(),
+          "inkling universal: an island card asks the self-hosted Inkling leg first",
+          QStringLiteral("%1/%2 %3").arg(self.bodies.size()).arg(backup.bodies.size()).arg(errors.join(';')));
+    const QJsonObject first = QJsonDocument::fromJson(self.bodies.value(0)).object();
+    const QJsonObject firstLeaf = first.value("messages").toArray().last().toObject();
+    check(first.value("model") == "Infatoshi/Inkling-2-Mini-heretic" && firstLeaf.value("role") == "user"
+              && firstLeaf.value("content").isString()
+              && first.value("chat_template_kwargs").toObject().value("reasoning_effort").toDouble(-1) == 0.2,
+          "inkling universal: a plain card turn sends Inkling a text-only leaf at low effort");
+
+    const QByteArray jpeg("\xff\xd8\xff\xe0 FAKE-SCREENSHOT-BYTES for the leaf", 40);
+    const QString b64 = QString::fromLatin1(jpeg.toBase64());
+    b.runCuaFollowupForTest(card, key,
+                            QStringLiteral("[CUA observation after cua_open:Chrome|https://x.com (OPEN, ok=1, detail=Opened)]:\n- AXLink \"Posts\""),
+                            QStringLiteral("[CUA observation after cua_open:Chrome|https://x.com (OPEN, ok=1, detail=Opened)]"), jpeg);
+    check(waitUntil([&] { return finished == 2; }, 6000) && self.bodies.size() == 2,
+          "inkling universal: the CUA follow-up streams on the same card");
+    const QJsonArray fm = QJsonDocument::fromJson(self.bodies.value(1)).object().value("messages").toArray();
+    QJsonArray leafParts;
+    for (const QJsonValue &m : fm)
+        if (m.toObject().value("content").isArray())
+            leafParts = m.toObject().value("content").toArray();
+    check(leafParts.size() == 2 && leafParts[0].toObject().value("image_url").toObject().value("url") == "data:image/jpeg;base64," + b64
+              && leafParts[1].toObject().value("text").toString().contains("CUA observation after cua_open"),
+          "inkling universal: the follow-up's leaf carries the screenshot then the observation text");
+    bool clean = !b.sharedHistory().isEmpty() && !b.streamHistory(card).isEmpty();
+    for (const ChatTurn &t : b.sharedHistory() + b.streamHistory(card))
+        clean = clean && !t.content.contains(b64) && !t.content.contains(QLatin1String("data:image"));
+    check(clean, "inkling universal: the screenshot never enters the shared or stream history");
+
+    b.askStream(card, key, 0, QStringLiteral("and the p50?"));
+    check(waitUntil([&] { return finished == 3; }, 6000) && self.bodies.size() == 3 && !self.bodies.value(2).contains("data:image"),
+          "inkling universal: the next turn sends no image (it was the follow-up's leaf only)");
+    b.setLlmRouter(nullptr);
+}
+
 void jarvisTests()
 {
     using S = GamepadSnapshot;
@@ -7709,6 +7794,7 @@ int runTests()
     jarvisTests();
     chartGateTests();
     jarvisFailoverTests();
+    inklingUniversalTests();
     std::printf("%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

@@ -257,7 +257,12 @@ struct CuaStepResult {
     QString target;
     bool ok = false;
     QString tier, detail, observation;
+    // The settled post-action screenshot (JPEG, 1280 px wide) when the executor attached one.
+    // Rides only on the next follow-up's leaf message, never into any history or log.
+    QByteArray screenshotJpeg = {};
 };
+// The newest non-empty screenshot of a finished batch (the screen the model should see next).
+QByteArray cuaLastScreenshot(const QVector<CuaStepResult> &steps);
 // At most this many automatic follow-up turns per user prompt.
 constexpr int kMaxCuaLoopDepth = 7;
 // "[CUA observation after <action> (<tier>, ok=<0|1>, detail=<detail>)]:\n<observation>".
@@ -808,6 +813,15 @@ public:
     // A no-think effort ("", fast, none) becomes "low" on a CUA follow-up (depth >= 1) whose
     // previous step failed (tier ERR); anything else is kept.
     static QString jarvisEscalatedEffort(const QString &effort, int loopDepth, bool prevStepErr);
+    // Inkling everywhere: with a jarvisEndpoint (Live) the quick ask (when the picked model is
+    // not a CLI one: openai-compat / openrouter) and every island / card stream run on the same
+    // legs as Jarvis (self-hosted Inkling, OpenRouter PrimeIntellect, OpenRouter DeepSeek).
+    // Empty = the stream keeps its old path. "spotlight" always gets jarvisLegs().
+    QVector<JarvisLeg> chatLegs(const QString &streamId) const;
+    // Tests: issue a CUA follow-up turn now, exactly as maybeFinishCuaBatch's queued turn does
+    // (Mock never schedules one), with image as the post-action screenshot.
+    void runCuaFollowupForTest(const QString &streamId, const QString &projectKey, const QString &prompt,
+                               const QString &note, const QByteArray &image);
 
 private:
     // One Jarvis turn across its failover legs.
@@ -863,6 +877,22 @@ private:
     bool m_cuaFollowupAsk = false;  // ask() / startConversation are carrying a follow-up, not the user
     QString m_cuaFollowupNote;      // the compact user turn a follow-up leaves in the history
     QString m_cuaFollowupGoal;      // the user prompt a follow-up continues (trace log)
+    QByteArray m_cuaFollowupImage;  // the batch's last screenshot, for that follow-up's leaf only
+    void issueCuaFollowup(const QString &streamId, const QString &project, const QString &prompt, const QString &note,
+                          const QString &goal, const QString &shown, const QByteArray &image);
+    // Non-Jarvis streams on the legs (quick ask, island cards): same failover, no planner log.
+    struct LegChain {
+        QVector<JarvisLeg> legs;
+        int leg = 0;
+        TieredPrompt prompt;
+    };
+    QHash<QString, LegChain> m_legChains;
+    void startChainLeg(const QString &streamId);
+    // A finished leg: true when the next leg took over (retryable error, nothing shown yet).
+    bool advanceLegChain(const QString &streamId, const QString &error, bool nothingShown);
+    // The effort a leg turn runs at: the picked Inkling effort, else the compat one; a no-think
+    // effort on an Inkling leg 1 becomes "low", then the follow-up escalation applies.
+    QString legEffort(const QVector<JarvisLeg> &legs, bool followup) const;
     QString m_cuaAnswerGoal;        // the goal of the stream runAnswerTags is handling
     QString m_cuaAnswerStream;      // which stream runAnswerTags is handling ("" = the quick ask)
     int m_quickArtifact = -1;       // the user ask's artifact, reused by its follow-ups
@@ -1011,6 +1041,7 @@ private:
     void askOpenAiCompat(const QString &projectKey, int artifactIndex, const QString &question);
     // DeepSeek V4.1 Flash via OpenRouter: same tiers, reasoning effort "none" on fast.
     void askOpenRouter(const QString &projectKey, int artifactIndex, const QString &question);
+    void askViaLegs(const QVector<JarvisLeg> &legs, const QString &projectKey, int artifactIndex, const QString &question);
     QString openrouterKey() const;  // m_openrouterKey (prefs openrouterApiKey), then env OPENROUTER_API_KEY
     void onRouterDelta(const QString &streamId, const QString &text, const QString &thinking);
     void onRouterFinished(const QString &streamId, const QString &error);

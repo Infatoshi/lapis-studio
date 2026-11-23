@@ -38,6 +38,8 @@ const QString kCompatSystemPrompt = QStringLiteral(
     "below the fold, and report the actual post text once you can see it. "
     "When you do not know an app's layout (a DM list, a search bar), emit [[ACTION:cua_observe:Discord]] first and "
     "stop: the app's controls come back in a follow-up turn, and after a failed action you see the screen too. "
+    "When a screenshot is attached to a follow-up turn, read visible text directly from the image as well as the "
+    "accessibility tree, and answer as soon as the requested content is visible on screen. "
     "Click and type only targets you saw there; when the task is done, answer without cua tags. "
     "Never narrate a Mac action (\"Opening Chrome\", \"I'll scroll\", \"Doing it now\") without emitting the "
     "[[ACTION:cua_...]] tag in that exact same reply; prose without a tag does nothing. "
@@ -194,7 +196,17 @@ QByteArray buildTieredChatRequest(const TieredPrompt &p)
 {
     QJsonArray msgs = tieredPrefixMessages(tier0SystemText(p.systemPrompt, p.model, p.extraSystemContext), p.trunk,
                                            p.history);
-    msgs << message(QStringLiteral("user"), tieredLeafText(p));
+    if (isInklingModel(p.model) && !p.imageJpeg.isEmpty()) {
+        // Multimodal leaf: the screenshot first, then the same leaf text a text turn sends.
+        const QString url = QStringLiteral("data:image/jpeg;base64,") + QString::fromLatin1(p.imageJpeg.toBase64());
+        const QJsonArray content{
+            QJsonObject{{QStringLiteral("type"), QStringLiteral("image_url")},
+                        {QStringLiteral("image_url"), QJsonObject{{QStringLiteral("url"), url}}}},
+            QJsonObject{{QStringLiteral("type"), QStringLiteral("text")}, {QStringLiteral("text"), tieredLeafText(p)}}};
+        msgs << QJsonObject{{QStringLiteral("role"), QStringLiteral("user")}, {QStringLiteral("content"), content}};
+    } else {
+        msgs << message(QStringLiteral("user"), tieredLeafText(p));
+    }
     QJsonObject body;
     body.insert(QStringLiteral("model"), p.model);
     body.insert(QStringLiteral("stream"), true);
