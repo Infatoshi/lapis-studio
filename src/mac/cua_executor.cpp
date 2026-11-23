@@ -1061,6 +1061,7 @@ CuaExecutor::Located CuaExecutor::locate(const QString &targetDesc, bool refineC
 
     // L1: Accessibility trees of every display in route order, never Lapis's own nodes unless
     // the target names Lapis. With an app hint, a hit inside that app beats any other hit.
+    QVector<AxNode> primaryNodes;
     if (m_hooks.inspectDisplay) {
         const QString query = rt.appHint.isEmpty() ? targetDesc : stripAppHint(targetDesc, rt.appHint);
         AxNode fallback;
@@ -1071,6 +1072,8 @@ CuaExecutor::Located CuaExecutor::locate(const QString &targetDesc, bool refineC
             if (rt.selfPid > 0 && !rt.allowSelf)
                 nodes.erase(std::remove_if(nodes.begin(), nodes.end(), [&](const AxNode &n) { return n.pid == rt.selfPid; }),
                             nodes.end());
+            if (d.displayId == display.displayId && primaryNodes.isEmpty())
+                primaryNodes = nodes;
             const int i = bestIndex(nodes, [&](const AxNode &n) {
                 const int s = axMatchScore(n, query);
                 return s && !rt.appHint.isEmpty() && appNameMatches(n.appName, rt.appHint) ? s + 30 : s;
@@ -1164,13 +1167,49 @@ CuaExecutor::Located CuaExecutor::locate(const QString &targetDesc, bool refineC
                          .arg(pt.x(), 0, 'f', 1).arg(pt.y(), 0, 'f', 1);
         return loc;
     }
+    // Snap VLM border/edge hits onto the dead-center of the smallest enclosing clickable AX control
+    // (tabs, buttons, links) so clicks look visually crisp and intentional for the human watching.
+    QPointF finalPt = pt;
+    bool snapped = false;
+    const bool wantsClose = targetDesc.contains(QLatin1String("close"), Qt::CaseInsensitive)
+                            || targetDesc.contains(QChar(0x00D7));
+    if (!wantsClose && !primaryNodes.isEmpty()) {
+        auto isClickableRole = [](const QString &role) {
+            return role == QLatin1String("AXButton") || role == QLatin1String("AXTab")
+                   || role == QLatin1String("AXRadioButton") || role == QLatin1String("AXLink")
+                   || role == QLatin1String("AXMenuItem") || role == QLatin1String("AXCheckBox")
+                   || role == QLatin1String("AXPopUpButton") || role == QLatin1String("AXTextField");
+        };
+        double bestArea = 1e18;
+        QRectF bestRect;
+        for (const AxNode &n : primaryNodes) {
+            if (!isClickableRole(n.role))
+                continue;
+            const QRectF r = n.globalRect;
+            if (r.width() < 8.0 || r.height() < 8.0 || r.width() > 420.0 || r.height() > 90.0)
+                continue;
+            if (!r.adjusted(-6.0, -6.0, 6.0, 6.0).contains(pt))
+                continue;
+            const double area = r.width() * r.height();
+            if (area < bestArea) {
+                bestArea = area;
+                bestRect = r;
+            }
+        }
+        if (bestArea < 1e18) {
+            finalPt = bestRect.center();
+            loc.rect = bestRect;
+            snapped = true;
+        }
+    }
     loc.ok = true;
     loc.tier = QStringLiteral("L3_VLM");
-    loc.pt = pt;
-    loc.detail = QStringLiteral("VLM point (%1, %2)").arg(pt.x(), 0, 'f', 1).arg(pt.y(), 0, 'f', 1)
-                 + (grounded ? QStringLiteral(" via Inkling") : QString());
+    loc.pt = finalPt;
+    loc.detail = QStringLiteral("VLM point (%1, %2)").arg(finalPt.x(), 0, 'f', 1).arg(finalPt.y(), 0, 'f', 1)
+                 + (grounded ? QStringLiteral(" via Inkling") : QString())
+                 + (snapped ? QStringLiteral(" (AX-center)") : QString());
     if (m_hooks.reticleMove)
-        m_hooks.reticleMove(pt, label);
+        m_hooks.reticleMove(finalPt, label);
     return loc;
 }
 
