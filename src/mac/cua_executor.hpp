@@ -115,6 +115,12 @@ void runOnMainThread(const std::function<void()> &fn);
 // Live app only: these open a real window.
 void showCuaHud(const QString &status, HudTone tone);
 void hideCuaHud(double afterSeconds = 0);
+// The desktop overlays' theme (shared reticle + HUD, Spotlight bar): Gold (#e09f3e accent, the
+// default) or lapis blue (#4f8cff). Any thread. Stores the flag and restyles overlays that
+// already exist on the main thread; never creates a window (sharedReticle() applies the flag
+// when it first builds the overlay).
+void setOverlayTheme(bool lapisBlue);
+bool overlayLapisBlue();
 // The shared overlay's window numbers (reticle, HUD bar), zeros dropped. Call on the main thread
 // (it would block a worker on it); the ids stay fixed once a window exists.
 QVector<uint32_t> overlayWindowIds();

@@ -236,61 +236,75 @@ FocusScope {
                             color: "#12110f"; border.width: 1; border.color: Theme.line
                         }
 
-                        // Reusable button node helper via Repeater
+                        // Each input as its vector keycap, placed where it sits on the pad
+                        // (cx, cy: centre; s: icon height). The selected one glows gold.
                         Repeater {
                             model: [
-                                { id: "l2", label: "L2", x: 54,  y: 4,   w: 66, h: 24, r: 8 },
-                                { id: "r2", label: "R2", x: 270, y: 4,   w: 66, h: 24, r: 8 },
-                                { id: "l1", label: "L1", x: 54,  y: 34,  w: 66, h: 20, r: 6 },
-                                { id: "r1", label: "R1", x: 270, y: 34,  w: 66, h: 20, r: 6 },
-                                { id: "options", label: "PAD", x: 132, y: 68, w: 126, h: 52, r: 10 },
-                                { id: "menu", label: "☰", x: 264, y: 74, w: 26, h: 20, r: 10 },
-                                { id: "y", label: "△", x: 298, y: 90,  w: 32, h: 32, r: 16 },
-                                { id: "b", label: "○", x: 332, y: 122, w: 32, h: 32, r: 16 },
-                                { id: "a", label: "✕", x: 298, y: 154, w: 32, h: 32, r: 16 },
-                                { id: "x", label: "□", x: 264, y: 122, w: 32, h: 32, r: 16 },
-                                { id: "l3", label: "L3", x: 112, y: 156, w: 54, h: 54, r: 27 },
-                                { id: "r3", label: "R3", x: 224, y: 156, w: 54, h: 54, r: 27 }
+                                { id: "l2", cx: 84,  cy: 16,  s: 30 },
+                                { id: "r2", cx: 306, cy: 16,  s: 30 },
+                                { id: "l1", cx: 84,  cy: 46,  s: 22 },
+                                { id: "r1", cx: 306, cy: 46,  s: 22 },
+                                { id: "options", cx: 195, cy: 94, s: 52 },
+                                { id: "menu", cx: 277, cy: 82, s: 24 },
+                                { id: "y", cx: 314, cy: 106, s: 30 },
+                                { id: "b", cx: 346, cy: 138, s: 30 },
+                                { id: "a", cx: 314, cy: 170, s: 30 },
+                                { id: "x", cx: 282, cy: 138, s: 30 },
+                                { id: "l3", cx: 139, cy: 183, s: 50 },
+                                { id: "r3", cx: 251, cy: 183, s: 50 }
                             ]
-                            delegate: Rectangle {
+                            delegate: Item {
                                 required property var modelData
                                 readonly property bool active: root.selectedId === modelData.id
-                                x: modelData.x; y: modelData.y
-                                width: modelData.w; height: modelData.h; radius: modelData.r
-                                color: active ? "#241b0b" : "#0b0a09"
-                                border.width: active ? 2 : 1
-                                border.color: active ? Theme.gold : Theme.line
-                                Text {
+                                x: modelData.cx - width / 2
+                                y: modelData.cy - height / 2
+                                width: nodeIcon.width
+                                height: nodeIcon.height
+                                Rectangle {
                                     anchors.centerIn: parent
-                                    text: modelData.label
-                                    color: active ? Theme.gold : Theme.dim
-                                    font.family: Theme.mono
-                                    font.pixelSize: 12
-                                    font.weight: active ? Font.DemiBold : Font.Normal
+                                    visible: parent.active
+                                    width: parent.width + 10
+                                    height: parent.height + 10
+                                    radius: Math.min(width, height) / 2
+                                    color: Theme.goldA(0.10)
+                                    border.width: 1
+                                    border.color: Theme.goldA(0.35)
+                                }
+                                PadIcon {
+                                    id: nodeIcon
+                                    button: modelData.id
+                                    size: modelData.s
+                                    active: parent.active
                                 }
                                 TapHandler { onTapped: root.selectSlotById(modelData.id) }
                             }
                         }
 
                         // D-pad (fixed navigation)
-                        Rectangle {
-                            x: 56; y: 106; width: 52; height: 52; radius: 14
-                            color: "#0b0a09"; border.width: 1; border.color: Theme.line
-                            Text { anchors.centerIn: parent; text: "✥"; color: Theme.faint; font.pixelSize: 18 }
+                        PadIcon {
+                            x: 82 - width / 2; y: 132 - height / 2
+                            button: "dpad"
+                            size: 50
                         }
                     }
 
                     // Bottom stick legend
-                    Text {
+                    Column {
                         anchors.bottom: parent.bottom
                         anchors.left: parent.left
                         anchors.right: parent.right
                         anchors.margins: 20
-                        text: "Left Stick / D-pad: Navigate   ·   Right Stick ↕: Smooth Scroll\nEnter / ✕: Listen for button   ·   ← →: Cycle action"
-                        color: Theme.faint
-                        font.family: Theme.mono
-                        font.pixelSize: 11
-                        lineHeight: 1.4
+                        spacing: 10
+                        Row {
+                            spacing: 22
+                            LegendItem { icons: ["lstick", "dpad"]; label: "Navigate" }
+                            LegendItem { icons: ["rstick"]; label: "Smooth scroll" }
+                        }
+                        Row {
+                            spacing: 22
+                            LegendItem { icons: ["a"]; label: "Listen for button" }
+                            LegendItem { icons: ["dpad_lr"]; label: "Cycle action" }
+                        }
                     }
                 }
 
@@ -313,10 +327,24 @@ FocusScope {
                             border.width: current ? 1.5 : 1
                             border.color: current ? (root.capturing ? Theme.gold : Theme.gold) : Theme.line
 
-                            Text {
-                                anchors.left: parent.left; anchors.leftMargin: 16
+                            Item {
+                                id: slotIcon
+                                anchors.left: parent.left; anchors.leftMargin: 10
                                 anchors.verticalCenter: parent.verticalCenter
-                                text: modelData.label
+                                width: 36
+                                height: 24
+                                PadIcon {
+                                    anchors.centerIn: parent
+                                    button: modelData.id
+                                    size: 22
+                                    active: current
+                                }
+                            }
+                            Text {
+                                anchors.left: slotIcon.right; anchors.leftMargin: 10
+                                anchors.verticalCenter: parent.verticalCenter
+                                // The icon shows the glyph: "✕ Cross" reads "Cross", "Options ☰" "Options".
+                                text: String(modelData.label).replace(/^[✕○□△]\s*/, "").replace(/\s*☰$/, "")
                                 color: current ? Theme.gold : Theme.ink
                                 font.family: Theme.sans; font.pixelSize: 14; font.weight: current ? Font.DemiBold : Font.Normal
                             }
@@ -356,6 +384,30 @@ FocusScope {
                     }
                 }
             }
+        }
+    }
+
+    // A legend entry: one or more pad icons, then what they do.
+    component LegendItem: Row {
+        property var icons: []
+        property string label: ""
+        spacing: 6
+        Repeater {
+            model: parent.icons
+            PadIcon {
+                required property string modelData
+                anchors.verticalCenter: parent.verticalCenter
+                button: modelData
+                size: 18
+            }
+        }
+        Text {
+            anchors.verticalCenter: parent.verticalCenter
+            leftPadding: 2
+            text: parent.label
+            color: Theme.dim
+            font.family: Theme.mono
+            font.pixelSize: 12
         }
     }
 }

@@ -3451,6 +3451,42 @@ QPointF tableCellPoint(QQuickWindow *win, int row, int col)
     return rowItem->mapToScene(QPointF(x + std::min<qreal>(w / 2, 40), rowItem->height() / 2));
 }
 
+// Every slot id and on-screen glyph a PadIcon accepts.
+QStringList padIconProbeButtons()
+{
+    return {"a", "b", "x", "y", "l1", "r1", "l2", "r2", "l3", "r3", "lstick", "rstick", "menu", "options",
+            "dpad", "dpad_up", "dpad_down", "dpad_left", "dpad_right", "dpad_ud", "dpad_lr",
+            "✕", "○", "□", "△", "☰", "Share", "PAD", "↕", "◄►"};
+}
+
+// A black sheet over everything: one row of PadIcons idle, one active (objectName padIconProbe).
+// *owner gets the created object (delete it when done).
+QQuickItem *makePadIconSheet(QQmlEngine &engine, QQuickItem *parent, int size, QObject **owner)
+{
+    QQmlComponent comp(&engine);
+    comp.setData(QByteArrayLiteral(
+                     "import QtQuick\nimport Studio\n"
+                     "Rectangle { property var buttons: []; property int iconSize: 28; color: \"#000000\"; z: 100000\n"
+                     "  width: col.implicitWidth + 24; height: col.implicitHeight + 24\n"
+                     "  Column { id: col; x: 12; y: 12; spacing: iconSize * 0.6\n"
+                     "    Repeater { model: 2\n"
+                     "      Row { id: row; required property int index; spacing: iconSize * 0.45\n"
+                     "        Repeater { model: buttons\n"
+                     "          PadIcon { required property string modelData; objectName: \"padIconProbe\"\n"
+                     "                    anchors.verticalCenter: parent.verticalCenter\n"
+                     "                    button: modelData; size: iconSize; active: row.index === 1 } } } } } }\n"),
+                 QUrl(QStringLiteral("qrc:/padiconprobe.qml")));
+    QObject *obj = comp.createWithInitialProperties({{"buttons", padIconProbeButtons()}, {"iconSize", size}});
+    if (!obj)
+        std::fprintf(stderr, "pad icon sheet: %s\n", qPrintable(comp.errorString()));
+    auto *sheet = qobject_cast<QQuickItem *>(obj);
+    if (sheet)
+        sheet->setParentItem(parent);
+    if (owner)
+        *owner = obj;
+    return sheet;
+}
+
 void omnibarUiTests()
 {
     Backend backend(Backend::Mode::Mock);
@@ -3658,6 +3694,121 @@ void omnibarUiTests()
     check(omni->property("pinnedCardCount").toInt() == 0 && visibleCount(win, "pinnedAskCard") == 0,
           "omni: closing pinned cards removes them");
     QObject::disconnect(conn);
+
+    // Harness tags never show: anywhere in the reply, mid-stream, and between a CUA turn and its
+    // follow-up (which reads as its own paragraph). The QML and C++ strippers agree.
+    {
+        auto qmlShown = [&](const QString &raw, bool streaming) {
+            QVariant out;
+            QMetaObject::invokeMethod(omni, "displayAnswer", Q_RETURN_ARG(QVariant, out), Q_ARG(QVariant, raw),
+                                      Q_ARG(QVariant, streaming));
+            return out.toString();
+        };
+        const QString turn1 = QStringLiteral("Typing x.com into Chrome's address bar. [[ACTION:cua_type:Chrome address bar|x.com\n]]");
+        const QString turn2 = QStringLiteral("x.com is loaded in Chrome.");
+        const QString want = QStringLiteral("Typing x.com into Chrome's address bar.\n\nx.com is loaded in Chrome.");
+        const struct { QString raw; bool streaming; QString want; } cases[] = {
+            {turn1 + turn2, false, want},                                  // the screenshot: no separator
+            {turn1 + cuaFollowupBreak(turn1) + turn2, false, want},        // with the backend's break
+            {QStringLiteral("Opening it. [[ACTION:cua_cl"), true, QStringLiteral("Opening it.")},
+            {QStringLiteral("Opening it. [["), true, QStringLiteral("Opening it.")},
+            {QStringLiteral("Opening it. ["), true, QStringLiteral("Opening it.")},
+            {QStringLiteral("[[ACTION:open_settings]] Done."), false, QStringLiteral("Done.")},
+            {QStringLiteral("Click [[ACTION:cua_click:Send]] now."), false, QStringLiteral("Click now.")},
+            {QStringLiteral("Sure. [[ACTION:cua_type:To: field|a|b]]"), false, QStringLiteral("Sure.")},
+            {QStringLiteral("a [[ACTION:x]] [[ACTION:y]] b"), false, QStringLiteral("a b")},
+            {QStringLiteral("[[IGNORE]]"), false, QString()},
+        };
+        int qmlBad = 0, cppBad = 0;
+        QStringList misses;
+        for (const auto &c : cases) {
+            const QString q = qmlShown(c.raw, c.streaming), p = answerDisplayText(c.raw, c.streaming);
+            qmlBad += q != c.want;
+            cppBad += p != c.want;
+            if (q != c.want || p != c.want)
+                misses << QStringLiteral("[%1] qml=[%2] cpp=[%3]").arg(c.raw, q, p);
+        }
+        check(qmlBad == 0, "omni: displayAnswer strips every [[ACTION:..]] tag (mid-text, partial) with paragraph breaks",
+              misses.join("; "));
+        check(cppBad == 0, "spotlight: answerDisplayText strips every tag the same way", misses.join("; "));
+        check(cuaFollowupBreak(turn1) == "\n\n" && cuaFollowupBreak(QStringLiteral("done.\n")) == "\n"
+                  && cuaFollowupBreak(QStringLiteral("done.\n\n")).isEmpty() && cuaFollowupBreak(QStringLiteral("  ")).isEmpty(),
+              "cua: a follow-up turn opens a fresh paragraph only when one is needed");
+
+        // On screen: the answer text of an open card carries no tag and two paragraphs.
+        sendKey(win, Qt::Key_K, Qt::ControlModifier);
+        settle(20);
+        omni->setProperty("question", QStringLiteral("open x.com"));
+        omni->setProperty("answer", turn1 + turn2);
+        settle(40);
+        QQuickItem *ans = firstItem(win, "omnibarAnswer");
+        const QString html = ans ? ans->property("text").toString() : QString();
+        check(ans && ans->isVisible() && !html.contains("ACTION") && html.contains("address bar.")
+                  && html.contains("x.com is loaded"),
+              "omni: the rendered answer shows no harness tag", html.left(240));
+        // A raw [[ACTION still streaming in never flashes.
+        omni->setProperty("busy", true);
+        omni->setProperty("answer", QStringLiteral("Typing x.com. [[ACTION:cua_type:Chrome addr"));
+        settle(20);
+        check(ans && !ans->property("text").toString().contains("[["), "omni: a partial tag never flashes while streaming");
+        omni->setProperty("busy", false);
+
+        // The header is quiet: no model slug, one close control.
+        const QString slug = backend.openaiCompatModel();
+        QStringList texts;
+        visibleWords(win, &texts);
+        check((slug.isEmpty() || !texts.join(' ').contains(slug)) && visibleCount(win, "omnibarClose") == 1,
+              "omni: the header names no model slug and has exactly one close",
+              QStringLiteral("%1 closes, slug '%2'").arg(visibleCount(win, "omnibarClose")).arg(slug));
+        sendKey(win, Qt::Key_Escape);
+        settle(20);
+    }
+
+    // L2 (focusForVoice) opens a centred command bar even over a target; the chip still names it.
+    reg->clearPinnedTargets();
+    reg->setHoverTarget("table_cell", key0, "0", "row=2/col=3", "tok/s: 126", "Table: sweep\n> Row 2: c1 | 126",
+                        300, 200, 110, 30);
+    QMetaObject::invokeMethod(omni, "focusForVoice");
+    settle(30);
+    check(isOpen() && std::abs(card->x() - (1920 - card->width()) / 2) < 1 && std::abs(card->y() - 173) < 1
+              && omni->property("chips").toList().value(0).toMap().value("kind") == "table_cell",
+          "omni: L2 opens the bar centred upper third, the hovered target as its chip", rectText(cardRect()));
+    sendKey(win, Qt::Key_Escape);
+    settle(20);
+
+    // Every controller button as a vector PadIcon (idle and active): each draws ink, all on palette.
+    {
+        const QStringList buttons = padIconProbeButtons();
+        QObject *obj = nullptr;
+        QQuickItem *sheet = makePadIconSheet(engine, win->contentItem(), 28, &obj);
+        settle(120);
+        const QImage shot = win->grabWindow();
+        const QList<QQuickItem *> icons = findItems(win->contentItem(), QStringLiteral("padIconProbe"));
+        int blank = 0, unknown = 0;
+        QStringList blankNames;
+        for (QQuickItem *ic : icons) {
+            if (ic->property("kind").toString().isEmpty())
+                ++unknown;
+            const QRect r = ic->mapRectToScene(QRectF(0, 0, ic->width(), ic->height())).toAlignedRect();
+            int lit = 0;
+            for (int y = r.top(); y <= r.bottom() && y < shot.height(); ++y)
+                for (int x = r.left(); x <= r.right() && x < shot.width(); ++x)
+                    lit += qGray(shot.pixel(x, y)) > 110;
+            if (lit < 6) {
+                ++blank;
+                blankNames << ic->property("button").toString();
+            }
+        }
+        const QImage crop = shot.copy(sheet ? sheet->mapRectToScene(QRectF(0, 0, sheet->width(), sheet->height())).toAlignedRect()
+                                            : QRect());
+        check(sheet && icons.size() == 2 * buttons.size() && unknown == 0 && blank == 0,
+              "pad icons: every controller button and glyph draws a vector icon (idle + active)",
+              QStringLiteral("%1 icons, %2 unknown, blank: %3").arg(icons.size()).arg(unknown).arg(blankNames.join(',')));
+        check(forbiddenPixels(crop) == 0, "pad icons: zero blue/green pixels in the gold theme",
+              QString::number(forbiddenPixels(crop)));
+        delete obj;
+        settle(20);
+    }
     backend.setLlmRouter(nullptr);
     reg->clearPinnedTargets();
     reg->clearHoverTarget();
@@ -4551,8 +4702,42 @@ int snapOmnibar(const QString &outPath)
                 saved ? "saved" : "FAILED to save", img.width(), img.height(), r.x(), r.y(), r.width(), r.height(),
                 backend.targets()->pinnedCount(), omni->property("pinnedCardCount").toInt(), forbiddenPixels(img),
                 qPrintable(omni->property("answer").toString()));
+
+    // OUT-pad.png: controller mode, L2's centred command bar with a closed-loop CUA reply (the
+    // tag between the two turns must not show). OUT-padicons.png: every PadIcon, idle and active.
+    auto sibling = [&](const char *tag) {
+        QString p = outPath;
+        p.insert(outPath.endsWith(QLatin1String(".png"), Qt::CaseInsensitive) ? outPath.size() - 4 : outPath.size(),
+                 QLatin1Char('-') + QLatin1String(tag));
+        return p;
+    };
+    sendKey(win, Qt::Key_Escape);
+    backend.targets()->clearPinnedTargets();
+    backend.setNavMode("controller");
+    settle(60);
+    QMetaObject::invokeMethod(omni, "focusForVoice");
+    settle(40);
+    omni->setProperty("question", QStringLiteral("open x.com in chrome"));
+    omni->setProperty("answer", QStringLiteral("Typing x.com into Chrome's address bar. "
+                                               "[[ACTION:cua_type:Chrome address bar|x.com\n]]\n\n"
+                                               "x.com is loaded in Chrome. Your home timeline is up; "
+                                               "the first post is from 4 minutes ago."));
+    settle(300);
+    const QImage pad = win->grabWindow();
+    const bool padSaved = pad.save(sibling("pad"));
+    QObject *sheetObj = nullptr;
+    QQuickItem *sheet = makePadIconSheet(engine, win->contentItem(), 44, &sheetObj);
+    settle(150);
+    const QImage icons = sheet ? win->grabWindow().copy(sheet->mapRectToScene(QRectF(0, 0, sheet->width(), sheet->height()))
+                                                            .toAlignedRect())
+                               : QImage();
+    const bool iconsSaved = !icons.isNull() && icons.save(sibling("padicons"));
+    delete sheetObj;
+    std::printf("snap-omnibar: %s %s (%d blue/green px); %s %s (%d blue/green px)\n", padSaved ? "saved" : "FAILED",
+                qPrintable(sibling("pad")), forbiddenPixels(pad), iconsSaved ? "saved" : "FAILED",
+                qPrintable(sibling("padicons")), icons.isNull() ? -1 : forbiddenPixels(icons));
     backend.setLlmRouter(nullptr);
-    return saved ? 0 : 1;
+    return saved && padSaved && iconsSaved ? 0 : 1;
 }
 
 // Music overlay (slowmix) on the mock backend: a dry run, never an external process.
@@ -5496,7 +5681,7 @@ void studioControlTests()
               overlay->property("tab").toString() + " " + QString::number(backend.uiScale()));
         QQuickItem *badge = nullptr;
         for (QQuickItem *it : findItems(qobject_cast<QQuickItem *>(overlay), "padBadge"))
-            if (it->isVisible() && it->childItems().value(0) && it->childItems()[0]->property("text").toString() == "R3")
+            if (it->isVisible() && it->property("glyph").toString() == "R3" && it->property("kind").toString() == "r3")
                 badge = it;
         check(badge != nullptr, "pad music: the header shows an R3 glyph badge in controller mode");
         const int n0 = int(sp->commandLog().size());
@@ -6985,7 +7170,7 @@ void voiceSpotlightTests()
         input->setProperty("text", QStringLiteral("what changed in this run"));
         pad->processSnapshot(S(), t += 20);
         settle(20);
-        check(hint && hint->property("text").toString() == QStringLiteral("R2 ⏎"), "studio voice: typed text shows the R2 hint",
+        check(hint && hint->property("text").toString() == QStringLiteral("R2 send"), "studio voice: typed text shows the R2 hint",
               hint ? hint->property("text").toString() : QString());
         pad->processSnapshot([] { S s; s.r2 = 1.0; return s; }(), t += 20);
         pad->processSnapshot(S(), t += 20);

@@ -20,6 +20,7 @@
 #include <curl/curl.h>
 #include <unistd.h>
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <mutex>
 
@@ -104,13 +105,22 @@ QSizeF jpegSize(const QByteArray &jpeg)
 
 // Process-lifetime overlay, created and used on the main thread only. Deliberately never
 // destroyed: AppKit teardown order at exit is not ours to fight.
+std::atomic<bool> g_overlayLapisBlue{false};      // default: Gold, like the live app
+std::atomic<CuaReticle *> g_sharedReticle{nullptr};  // set once, on the main thread
+
 CuaReticle *sharedReticle()
 {
-    static CuaReticle *r = new CuaReticle();
+    static CuaReticle *r = [] {
+        auto *made = new CuaReticle();
+        made->setGoldTheme(!g_overlayLapisBlue.load());
+        g_sharedReticle.store(made);
+        return made;
+    }();
     return r;
 }
 
-constexpr int kGlideSettleMs = 170;  // the reticle glide (140 ms) plus a beat, so the click lands visibly
+// The longest reticle glide plus a beat, so the click lands visibly after the cartoon hand settles.
+constexpr int kGlideSettleMs = int(kGlideMaxSec * 1000) + 30;
 constexpr int kPulseLeadMs = 60;
 
 // Apps a target may name, with the short hint each maps to. Bare generic words ("code",
@@ -325,6 +335,20 @@ void hideCuaHud(double afterSeconds)
 {
     runOnMainThread([&] { sharedReticle()->hideHud(afterSeconds); });
 }
+
+void setOverlayTheme(bool lapisBlue)
+{
+    g_overlayLapisBlue.store(lapisBlue);
+    setSpotlightLapisBlue(lapisBlue);  // the flag only; the live bar re-renders below
+    // Never constructs the shared overlay: one made later picks the flag up in sharedReticle().
+    runOnMainThread([lapisBlue] {
+        if (CuaReticle *r = g_sharedReticle.load())
+            r->setGoldTheme(!lapisBlue);
+        refreshSpotlightTheme();
+    });
+}
+
+bool overlayLapisBlue() { return g_overlayLapisBlue.load(); }
 
 QVector<uint32_t> overlayWindowIds()
 {

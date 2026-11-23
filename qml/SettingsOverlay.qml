@@ -75,7 +75,7 @@ FocusScope {
             if (glyph.length > 0)
                 out.push([glyph, r[2]]);
         }
-        return out.concat([["L-Stick", "nav"], ["R-Stick", "scroll"]]);
+        return out.concat([["lstick", "nav"], ["rstick", "scroll"]]);
     }
 
     function show() {
@@ -504,7 +504,24 @@ FocusScope {
                         required property var modelData
                         spacing: 16
                         width: 366
+                        // Controller mode: the buttons as vector keycaps ("L1 R1" is two).
+                        Row {
+                            visible: root.mode === "controller"
+                            width: 110
+                            spacing: 6
+                            anchors.verticalCenter: parent.verticalCenter
+                            Repeater {
+                                model: root.mode === "controller" ? String(modelData[0]).split(" ") : []
+                                PadIcon {
+                                    required property string modelData
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    button: modelData
+                                    size: 22
+                                }
+                            }
+                        }
                         Text {
+                            visible: root.mode !== "controller"
                             width: 110
                             text: modelData[0]
                             color: Theme.gold
@@ -572,12 +589,24 @@ FocusScope {
                         required property var modelData
                         spacing: 10
                         width: 188
-                        Text {
-                            width: 62
-                            text: modelData[0]
-                            color: Theme.gold
-                            font.family: Theme.mono
-                            font.pixelSize: 16
+                        Item {
+                            width: 44
+                            height: 22
+                            anchors.verticalCenter: parent.verticalCenter
+                            PadIcon {
+                                id: bindIcon
+                                anchors.verticalCenter: parent.verticalCenter
+                                button: modelData[0]
+                                size: 22
+                            }
+                            Text {
+                                visible: bindIcon.kind.length === 0
+                                anchors.verticalCenter: parent.verticalCenter
+                                text: modelData[0]
+                                color: Theme.gold
+                                font.family: Theme.mono
+                                font.pixelSize: 16
+                            }
                         }
                         Text {
                             text: modelData[1]

@@ -212,26 +212,13 @@ FocusScope {
         font.letterSpacing: 1.6
         font.capitalization: Font.AllUppercase
     }
-    // Controller glyph badge ("□", "L1", "R3"): hairline, mono, only in controller mode.
-    component PadBadge: Rectangle {
-        id: badge
+    // Controller button ("□", "L1", "R3") as its vector keycap, only in controller mode.
+    component PadBadge: PadIcon {
         property string glyph: ""
         objectName: "padBadge"
         visible: root.padHints && glyph.length > 0
-        width: badgeText.implicitWidth + 10
-        height: 18
-        radius: 5
-        color: "transparent"
-        border.width: 1
-        border.color: Theme.line
-        Text {
-            id: badgeText
-            anchors.centerIn: parent
-            text: badge.glyph
-            color: Theme.dim
-            font.family: Theme.mono
-            font.pixelSize: 11
-        }
+        button: glyph
+        size: 18
     }
     // Hairline chip: gold border + gold text while on. `glyph` adds a pad badge in controller mode.
     component Chip: Rectangle {

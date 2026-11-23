@@ -69,6 +69,7 @@ add_library(lapis_mac STATIC
   src/mac/cua_executor.hpp src/mac/cua_executor.cpp
   src/mac/cua_shadow.hpp src/mac/cua_shadow.mm
   src/mac/cua_spotlight.hpp src/mac/cua_spotlight.mm
+  src/mac/cua_pad_icon.hpp src/mac/cua_pad_icon.mm
 )
 target_include_directories(lapis_mac PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(lapis_mac PUBLIC lapis_core Qt6::Core Qt6::Gui Qt6::Quick
@@ -124,6 +125,7 @@ qt_add_qml_module(lapis_studio
     qml/SessionReviewOverlay.qml
     qml/SlowmixOverlay.qml
     qml/FloatingOmnibar.qml
+    qml/PadIcon.qml
 )
 
 lapis_warnings(lapis_studio)

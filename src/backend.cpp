@@ -1375,6 +1375,8 @@ void Backend::setTheme(const QString &theme)
     if (!themes().contains(t) || t == m_theme)
         return;
     m_theme = t;
+    if (m_mode == Mode::Live)
+        studio::cua::setOverlayTheme(m_theme == QLatin1String("lapis"));
     emit prefsChanged();
     if (!m_prefsPath.isEmpty())
         m_prefsSave.start();
@@ -1635,6 +1637,8 @@ void Backend::setPrefsPath(const QString &path)
     m_prefsPath = path;
     m_firstLaunch = !path.isEmpty() && !QFileInfo::exists(path);
     loadPrefs();
+    if (m_mode == Mode::Live)
+        studio::cua::setOverlayTheme(m_theme == QLatin1String("lapis"));  // desktop overlays match Theme.qml
     emit prefsChanged();
     syncShadowRecorder();  // the prefs toggle is known now
 }
@@ -5014,6 +5018,56 @@ QList<StudioCommand> extractActionTags(QString *answer)
     return out;
 }
 
+QString answerDisplayText(const QString &raw, bool streaming)
+{
+    if (raw.contains(QLatin1String("[[IGNORE]]")))
+        return {};
+    QString src = raw;
+    if (streaming) {
+        // A tag still streaming in never flashes: cut an unclosed "[[" and a lone trailing "[".
+        const qsizetype open = src.lastIndexOf(QLatin1String("[["));
+        if (open >= 0 && src.indexOf(QLatin1String("]]"), open) < 0)
+            src.truncate(open);
+        else if (src.endsWith(QLatin1Char('[')))
+            src.chop(1);
+    }
+    static const QRegularExpression kTag(QStringLiteral(R"(\[\[ACTION:[^\]]*\]\])"));
+    QString out;
+    qsizetype last = 0;
+    auto it = kTag.globalMatch(src);
+    while (it.hasNext()) {
+        const QRegularExpressionMatch m = it.next();
+        out += src.mid(last, m.capturedStart() - last);
+        last = m.capturedEnd();
+        QString head = out;
+        while (head.endsWith(u' ') || head.endsWith(u'\t'))
+            head.chop(1);
+        const QChar next = last < src.size() ? src.at(last) : QChar(u'\n');
+        const bool proseBefore = !head.isEmpty() && !head.endsWith(u'\n');
+        if (proseBefore && !next.isSpace() && next != u'[') {
+            out = head + QStringLiteral("\n\n");  // "bar. [[..]]x.com" -> two paragraphs
+        } else if (next.isSpace() || next.isPunct()) {
+            out = head;  // "a [[..]] b" -> "a b"
+        }
+    }
+    out += src.mid(last);
+    static const QRegularExpression kTrailing(QStringLiteral("[ \\t]+\\n"));
+    static const QRegularExpression kBlankRuns(QStringLiteral("\\n{3,}"));
+    out.replace(kTrailing, QStringLiteral("\n"));
+    out.replace(kBlankRuns, QStringLiteral("\n\n"));
+    return out.trimmed();
+}
+
+QString cuaFollowupBreak(const QString &shownSoFar)
+{
+    QString s = shownSoFar;
+    while (s.endsWith(u' ') || s.endsWith(u'\t'))
+        s.chop(1);
+    if (s.trimmed().isEmpty() || s.endsWith(QLatin1String("\n\n")))
+        return {};
+    return s.endsWith(u'\n') ? QStringLiteral("\n") : QStringLiteral("\n\n");
+}
+
 int matchSlowmixTrack(const QVariantList &tracks, const QString &query)
 {
     static const QSet<QString> stop{QStringLiteral("the"), QStringLiteral("song"), QStringLiteral("track"),
@@ -5446,6 +5500,7 @@ void Backend::runAnswerTags(QString *answer)
     m_cuaBatch.streamId = m_cuaAnswerStream;
     m_cuaBatch.projectKey = m_commandProject;
     m_cuaBatch.goal = m_cuaAnswerStream.isEmpty() ? m_quickQuestion : m_cuaAnswerGoal;
+    m_cuaBatch.shownRaw = *answer;
     ++m_cuaBatchId;
     const QStringList replies = runStudioActions(parsed.actions);
     m_cuaBatch.open = false;
@@ -5501,10 +5556,11 @@ void Backend::maybeFinishCuaBatch()
                      .section(QLatin1Char('\n'), 0, 0);
     const QString note = heads.join(QLatin1Char(' '));  // history keeps the headers, never the AX dump
     const QString streamId = m_cuaBatch.streamId, project = m_cuaBatch.projectKey, goal = m_cuaBatch.goal;
+    const QString shown = m_cuaBatch.shownRaw;
     const quint64 id = m_cuaBatchId;
     m_cuaFollowupScheduled = true;
     // Next event-loop turn: the answer that started this batch has been recorded by then.
-    QTimer::singleShot(0, this, [this, id, streamId, project, prompt, note, goal] {
+    QTimer::singleShot(0, this, [this, id, streamId, project, prompt, note, goal, shown] {
         m_cuaFollowupScheduled = false;
         if (id != m_cuaBatchId) {
             syncSpotlightTurn();
@@ -5517,6 +5573,12 @@ void Backend::maybeFinishCuaBatch()
             m_quickNote = note;
             ask(project, m_quickArtifact, prompt);
         } else {
+            // The card keeps appending on this stream: the follow-up's prose opens a fresh
+            // paragraph instead of running into the last turn ("...bar.x.com is loaded").
+            // The Spotlight bar shows only the newest reply, so it needs no break.
+            const QString gap = cuaFollowupBreak(shown);
+            if (!gap.isEmpty() && streamId != QLatin1String(kSpotlightStreamId))
+                emit streamDelta(streamId, gap, QString());
             startConversation(streamId, project, QString(), prompt);
         }
         m_cuaFollowupAsk = false;
@@ -5629,13 +5691,8 @@ void Backend::onSpotlightDelta()
 {
     if (!m_spotlight)
         return;
-    QString shown = m_spotlightRaw;
-    // A tag still streaming in ("[[ACTION:cua_cl") never flashes on screen.
-    const qsizetype open = shown.lastIndexOf(QLatin1String("[["));
-    if (open >= 0 && shown.indexOf(QLatin1String("]]"), open) < 0)
-        shown.truncate(open);
-    const ParsedModelOutput out = parseStudioModelOutput(shown);
-    m_spotlight->setAnswer(out.ignore ? QString() : out.cleanText);
+    // Every tag anywhere is hidden, and one still streaming in ("[[ACTION:cua_cl") never flashes.
+    m_spotlight->setAnswer(answerDisplayText(m_spotlightRaw, true));
 }
 
 void Backend::onSpotlightFinished(const QString &error)
@@ -5645,8 +5702,7 @@ void Backend::onSpotlightFinished(const QString &error)
     if (!error.isEmpty()) {
         m_spotlight->setStatusLine(QStringLiteral("Error \u00B7 ") + oneLine(error, 14));
     } else {
-        const ParsedModelOutput out = parseStudioModelOutput(m_spotlightRaw);
-        QString clean = out.ignore ? QString() : out.cleanText.trimmed();
+        QString clean = answerDisplayText(m_spotlightRaw);
         // A tag-only reply: the action's own confirmation (what the history recorded).
         if (clean.isEmpty()) {
             const QVector<ChatTurn> h = m_streamHistory.value(QLatin1String(kSpotlightStreamId));

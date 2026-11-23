@@ -85,7 +85,11 @@ Item {
         if (suppressed || !backend)
             return;
         if (!open) {
+            // Snapshot the target (its chip names what the question is about), but sit centred
+            // upper third like a command bar rather than off to the side of the island.
             openAt(-1, -1);
+            card.x = clampX(Math.round((width - card.width) / 2));
+            card.y = clampY(Math.max(margin, Math.round(height * 0.16)));
             return;
         }
         if (targets && targets.hasActiveTarget && targets.pinnedCount === 0)
@@ -119,8 +123,37 @@ Item {
     }
     // Send what is typed (✕ / R2 on the pad, Enter on the keyboard).
     function submit() { ask(input.text); }
-    // A model's leading [[ACTION:..]] tag ran in the backend; it never shows as text.
-    function displayAnswer(a) { return String(a).replace(/^\s*(\[\[ACTION:[^\]]*\]\]\s*)+/, ""); }
+    // A model's [[ACTION:..]] tags (anywhere in the reply) ran in the backend; they never show as
+    // text. A tag between two runs of prose becomes a paragraph break (a CUA follow-up's reply
+    // reads as its own paragraph); streaming, a tag still arriving at the tail is cut so it never
+    // flashes. [[IGNORE]] shows nothing. Mirrors answerDisplayText() in backend.cpp.
+    function displayAnswer(a, streaming) {
+        let s = String(a);
+        if (s.indexOf("[[IGNORE]]") >= 0)
+            return "";
+        if (streaming !== false) {
+            const open = s.lastIndexOf("[[");
+            if (open >= 0 && s.indexOf("]]", open) < 0)
+                s = s.substring(0, open);
+            else if (s.endsWith("["))
+                s = s.substring(0, s.length - 1);
+        }
+        const tag = /\[\[ACTION:[^\]]*\]\]/g;
+        let out = "", last = 0, m;
+        while ((m = tag.exec(s)) !== null) {
+            out += s.substring(last, m.index);
+            last = m.index + m[0].length;
+            const head = out.replace(/[ \t]+$/, "");
+            const next = last < s.length ? s.charAt(last) : "\n";
+            const space = /\s/.test(next);
+            if (head.length > 0 && !head.endsWith("\n") && !space && next !== "[")
+                out = head + "\n\n";
+            else if (space || /[!-\/:-@\[-`{-~]/.test(next))
+                out = head;
+        }
+        out += s.substring(last);
+        return out.replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+    }
     function toggle() {
         if (open)
             close();
@@ -382,17 +415,20 @@ Item {
     }
 
     // --- The live ask card -------------------------------------------------------------------------
+    // A command bar: a quiet header (Lapis, Pin, one close), the target chips, the prompt with
+    // its pad hints inside it, and the answer drawer under a hairline.
     Rectangle {
         id: card
         objectName: "omnibarCard"
         visible: root.open
         width: Math.min(620, root.width - 2 * root.margin)
-        height: col.implicitHeight + 30
-        radius: 18
+        height: col.implicitHeight + 32
+        radius: 16
         color: Theme.card
         border.width: 1
-        border.color: Theme.goldA(0.4)
+        border.color: Theme.goldA(root.voiceListening ? 0.75 : 0.38)
         onHeightChanged: if (root.open) y = root.clampY(y)
+        Behavior on border.color { ColorAnimation { duration: 140 } }
 
         // Swallow clicks and hover on the card so they never reach the lens underneath.
         MouseArea {
@@ -400,15 +436,23 @@ Item {
             hoverEnabled: true
             acceptedButtons: Qt.AllButtons
         }
+        // The inner top highlight: a hairline of light along the card's upper edge.
+        Rectangle {
+            x: 14
+            y: 1
+            width: parent.width - 28
+            height: 1
+            color: Theme.goldA(0.08)
+        }
 
         Column {
             id: col
             x: 18
-            y: 14
+            y: 16
             width: parent.width - 36
             spacing: 12
 
-            // Header: drag handle, title, Pin card, close.
+            // Header: drag handle, title, Pin, one close control.
             Item {
                 objectName: "omnibarHeader"
                 width: parent.width
@@ -425,49 +469,51 @@ Item {
                     anchors.verticalCenter: parent.verticalCenter
                     spacing: 9
                     Rectangle {
-                        width: 8; height: 8; radius: 4
+                        width: 7; height: 7; radius: 3.5
                         anchors.verticalCenter: parent.verticalCenter
                         color: Theme.gold
                     }
                     Text {
-                        text: "Ask"
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: "Lapis"
                         color: Theme.ink
                         font.family: Theme.sans
-                        font.pixelSize: Theme.px(16)
+                        font.pixelSize: Theme.px(14)
                         font.weight: Font.DemiBold
-                    }
-                    PadBadge { anchors.verticalCenter: parent.verticalCenter; action: "confirm" }
-                    Text {
-                        anchors.verticalCenter: parent.verticalCenter
-                        text: root.backend && root.backend.openaiCompatModel ? root.backend.openaiCompatModel : ""
-                        color: Theme.faint
-                        font.family: Theme.mono
-                        font.pixelSize: 12
                     }
                 }
                 Row {
                     anchors.right: parent.right
                     anchors.verticalCenter: parent.verticalCenter
-                    spacing: 14
+                    spacing: 16
                     Text {
                         objectName: "omnibarPinCard"
                         anchors.verticalCenter: parent.verticalCenter
-                        text: "Pin card"
+                        text: "Pin"
                         visible: root.question.length > 0
                         color: Theme.gold
                         font.family: Theme.mono
-                        font.pixelSize: 13
+                        font.pixelSize: 12
                         Click { onClicked: root.pinCard() }
                     }
-                    Text {
+                    // One close: the pad's back button when it is bound, else a quiet ×.
+                    PadBadge {
+                        id: closeBadge
+                        objectName: "omnibarClose"
                         anchors.verticalCenter: parent.verticalCenter
+                        action: "back"
+                        Click { onClicked: root.close() }
+                    }
+                    Text {
+                        objectName: "omnibarClose"
+                        anchors.verticalCenter: parent.verticalCenter
+                        visible: !closeBadge.visible
                         text: "×"
                         color: Theme.dim
                         font.family: Theme.sans
-                        font.pixelSize: 20
+                        font.pixelSize: 19
                         Click { onClicked: root.close() }
                     }
-                    PadBadge { anchors.verticalCenter: parent.verticalCenter; action: "back" }
                 }
             }
 
@@ -484,12 +530,12 @@ Item {
                         required property int index
                         readonly property var t: root.chips[index] || ({ label: "", kind: "" })
                         readonly property bool pinned: root.targets && root.targets.pinnedCount > 0
-                        height: 28
-                        width: chipRow.implicitWidth + 22
-                        radius: 14
-                        color: pinned ? Theme.goldA(0.12) : "transparent"
+                        height: 26
+                        width: chipRow.implicitWidth + 20
+                        radius: 13
+                        color: pinned ? Theme.goldA(0.10) : Theme.cardHi
                         border.width: 1
-                        border.color: pinned ? Theme.gold : Theme.copper
+                        border.color: pinned ? Theme.goldA(0.6) : Theme.line
                         Row {
                             id: chipRow
                             anchors.centerIn: parent
@@ -507,16 +553,16 @@ Item {
                                 text: parent.parent.t.label || parent.parent.t.path || ""
                                 width: Math.min(implicitWidth, 240)
                                 elide: Text.ElideRight
-                                color: Theme.ink
+                                color: Theme.text
                                 font.family: Theme.mono
-                                font.pixelSize: 13
+                                font.pixelSize: 12
                             }
                             Text {
                                 anchors.verticalCenter: parent.verticalCenter
                                 text: "×"
                                 color: Theme.dim
                                 font.family: Theme.sans
-                                font.pixelSize: 15
+                                font.pixelSize: 14
                                 Click { onClicked: root.removeChip(index) }
                             }
                         }
@@ -525,71 +571,134 @@ Item {
                 Rectangle {
                     objectName: "omnibarPinChip"
                     visible: root.canPin
-                    height: 28
-                    width: pinRow.implicitWidth + 22
-                    radius: 14
+                    height: 26
+                    width: pinRow.implicitWidth + 20
+                    radius: 13
                     color: "transparent"
                     border.width: 1
-                    border.color: Theme.faint
+                    border.color: Theme.line
                     Row {
                         id: pinRow
                         anchors.centerIn: parent
-                        spacing: 8
+                        spacing: 7
                         Text {
-                            id: pinText
                             anchors.verticalCenter: parent.verticalCenter
-                            text: "+ Pin  ⇥"
+                            text: "+ Pin"
                             color: Theme.dim
                             font.family: Theme.mono
-                            font.pixelSize: 13
+                            font.pixelSize: 12
                         }
-                        PadBadge { anchors.verticalCenter: parent.verticalCenter; action: "accept_prediction" }
+                        PadBadge {
+                            id: pinBadge
+                            anchors.verticalCenter: parent.verticalCenter
+                            action: "accept_prediction"
+                            size: 15
+                        }
+                        Text {
+                            anchors.verticalCenter: parent.verticalCenter
+                            visible: !pinBadge.visible
+                            text: "⇥"
+                            color: Theme.faint
+                            font.family: Theme.mono
+                            font.pixelSize: 12
+                        }
                     }
                     Click { onClicked: root.pinActive() }
                 }
             }
 
-            // The prompt.
+            // The prompt: an inset field with its live hint on the right.
             Rectangle {
                 width: parent.width
-                height: Theme.px(44)
-                radius: 12
-                color: Theme.bg
-                border.width: root.voiceListening ? 1.5 : 1
-                border.color: root.voiceListening ? Theme.gold : (input.activeFocus ? Theme.goldA(0.55) : Theme.line)
-                // Right-aligned live hint: "● Listening…" while L2 is held, else the pad keys.
-                Text {
+                height: Theme.px(46)
+                radius: 11
+                color: "#050504"
+                border.width: 1
+                border.color: root.voiceListening ? Theme.gold : (input.activeFocus ? Theme.goldA(0.5) : Theme.line)
+                // "● Listening…" while L2 is held, else the pad keys: [L2] voice · [R2] send.
+                Row {
                     id: voiceHint
                     objectName: "omnibarVoiceHint"
+                    readonly property string voiceKey: root.padGlyphs["voice_hold"] || "L2"
+                    readonly property string sendKey: root.padGlyphs["send"] || "R2"
+                    readonly property bool typed: input.text.length > 0
+                    // What the hint says, as text (tests and accessibility read it).
+                    readonly property string text: root.voiceListening ? "● Listening…"
+                                                 : (typed ? sendKey + " send" : voiceKey + " voice · " + sendKey + " send")
                     anchors.right: parent.right
                     anchors.rightMargin: 14
                     anchors.verticalCenter: parent.verticalCenter
                     visible: root.voiceListening || root.padHints
-                    text: root.voiceListening ? "\u25CF Listening\u2026"
-                                              : (input.text.length === 0 ? "L2 voice \u00B7 R2 send" : "R2 \u23CE")
-                    color: root.voiceListening ? Theme.gold : Theme.faint
-                    font.family: Theme.mono
-                    font.pixelSize: 12
-                    SequentialAnimation on opacity {
-                        running: root.voiceListening
-                        loops: Animation.Infinite
-                        onStopped: voiceHint.opacity = 1
-                        NumberAnimation { from: 1; to: 0.45; duration: 600; easing.type: Easing.InOutSine }
-                        NumberAnimation { from: 0.45; to: 1; duration: 600; easing.type: Easing.InOutSine }
+                    spacing: 6
+                    Rectangle {
+                        id: listenDot
+                        visible: root.voiceListening
+                        width: 7; height: 7; radius: 3.5
+                        anchors.verticalCenter: parent.verticalCenter
+                        color: Theme.gold
+                        SequentialAnimation on opacity {
+                            running: root.voiceListening
+                            loops: Animation.Infinite
+                            onStopped: listenDot.opacity = 1
+                            NumberAnimation { from: 1; to: 0.35; duration: 600; easing.type: Easing.InOutSine }
+                            NumberAnimation { from: 0.35; to: 1; duration: 600; easing.type: Easing.InOutSine }
+                        }
+                    }
+                    Text {
+                        visible: root.voiceListening
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: "Listening…"
+                        color: Theme.gold
+                        font.family: Theme.mono
+                        font.pixelSize: 12
+                    }
+                    PadIcon {
+                        visible: !root.voiceListening && !voiceHint.typed
+                        anchors.verticalCenter: parent.verticalCenter
+                        button: voiceHint.voiceKey
+                        size: 17
+                    }
+                    Text {
+                        visible: !root.voiceListening && !voiceHint.typed
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: "voice"
+                        color: Theme.dim
+                        font.family: Theme.mono
+                        font.pixelSize: 12
+                    }
+                    Item {
+                        visible: !root.voiceListening && !voiceHint.typed
+                        width: 6
+                        height: 1
+                    }
+                    PadIcon {
+                        visible: !root.voiceListening
+                        anchors.verticalCenter: parent.verticalCenter
+                        button: voiceHint.sendKey
+                        size: 17
+                        active: voiceHint.typed
+                    }
+                    Text {
+                        visible: !root.voiceListening
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: "send"
+                        color: voiceHint.typed ? Theme.ink : Theme.dim
+                        font.family: Theme.mono
+                        font.pixelSize: 12
                     }
                 }
                 TextInput {
                     id: input
                     objectName: "omnibarInput"
                     anchors.fill: parent
-                    anchors.leftMargin: 14
-                    anchors.rightMargin: voiceHint.visible ? voiceHint.implicitWidth + 26 : 14
+                    anchors.leftMargin: 16
+                    anchors.rightMargin: voiceHint.visible ? voiceHint.implicitWidth + 28 : 16
                     verticalAlignment: TextInput.AlignVCenter
                     clip: true
                     color: Theme.ink
                     selectionColor: Theme.copper
                     font.family: Theme.sans
-                    font.pixelSize: Theme.px(19)
+                    font.pixelSize: Theme.px(18)
                     cursorDelegate: Caret {}
                     Keys.priority: Keys.BeforeItem
                     Keys.onPressed: (e) => {
@@ -615,27 +724,39 @@ Item {
                         visible: input.text.length === 0
                         text: root.chips.length > 1 ? "Ask about these " + root.chips.length + " targets…"
                                                     : (root.chips.length === 1 ? "Ask about this…" : "Ask anything…")
-                        color: Theme.faint
+                        color: Theme.muted
                         font: input.font
                     }
                 }
             }
 
-            AnswerBody {
-                objectName: "omnibarAnswerBody"
+            // The answer drawer, under a hairline.
+            Column {
                 width: parent.width
+                spacing: 12
                 visible: root.question.length > 0
-                backend: root.backend
-                question: root.question
-                answer: root.answer
-                thinking: root.thinking
-                busy: root.busy
-                error: root.error
-                maxH: 300
+                Rectangle {
+                    width: parent.width
+                    height: 1
+                    color: Theme.line
+                }
+                AnswerBody {
+                    objectName: "omnibarAnswerBody"
+                    width: parent.width
+                    backend: root.backend
+                    question: root.question
+                    answer: root.answer
+                    thinking: root.thinking
+                    busy: root.busy
+                    error: root.error
+                    maxH: 300
+                }
             }
 
+            // Keyboard / mouse only, and only before the first ask.
             Text {
-                text: "⏎ ask · ⇥ pin target · Esc close · drag header to move"
+                visible: !root.padHints && root.question.length === 0
+                text: "⏎ ask · ⇥ pin · esc"
                 color: Theme.faint
                 font.family: Theme.mono
                 font.pixelSize: 12
@@ -643,29 +764,17 @@ Item {
         }
     }
 
-    // A small button's hit area (a little larger than its glyph).
-    // Mono hairline pad glyph ("✕", "R1", "○") for the bound action, controller mode only.
-    component PadBadge: Rectangle {
+    // The bound pad button for an action, as its vector icon (controller mode only).
+    component PadBadge: PadIcon {
         id: badge
         property string action: ""
         readonly property string glyph: root.padGlyphs[action] || ""
         objectName: "omnibarPadBadge"
         visible: root.padHints && glyph.length > 0
-        width: badgeText.implicitWidth + 10
-        height: 18
-        radius: 5
-        color: "transparent"
-        border.width: 1
-        border.color: Theme.line
-        Text {
-            id: badgeText
-            anchors.centerIn: parent
-            text: badge.glyph
-            color: Theme.dim
-            font.family: Theme.mono
-            font.pixelSize: 11
-        }
+        button: glyph
+        size: 18
     }
+    // A small button's hit area (a little larger than its glyph).
     component Click: MouseArea {
         anchors.fill: parent
         anchors.margins: -6
@@ -682,21 +791,23 @@ Item {
         property bool busy: false
         property string error
         property real maxH: 300
+        // The reply as shown: harness tags removed, follow-up turns as their own paragraphs.
+        readonly property string shownAnswer: root.displayAnswer(answer, busy)
         spacing: 8
         Text {
             width: ab.width
-            text: ab.question
+            text: "› " + ab.question
             wrapMode: Text.Wrap
             maximumLineCount: 3
             elide: Text.ElideRight
             color: Theme.gold
             font.family: Theme.sans
-            font.pixelSize: Theme.px(17)
+            font.pixelSize: Theme.px(14)
             font.weight: Font.Medium
         }
         Row {
             objectName: "omnibarThinking"
-            visible: ab.busy && ab.answer.length === 0
+            visible: ab.busy && ab.shownAnswer.length === 0
             spacing: 8
             Rectangle {
                 id: thinkDot
@@ -722,7 +833,7 @@ Item {
             id: answerFlick
             width: ab.width
             height: Math.min(ab.maxH, answerText.implicitHeight)
-            visible: ab.answer.length > 0
+            visible: ab.shownAnswer.length > 0
             contentHeight: answerText.implicitHeight
             clip: true
             boundsBehavior: Flickable.StopAtBounds
@@ -733,14 +844,13 @@ Item {
                 id: answerText
                 objectName: "omnibarAnswer"
                 width: answerFlick.width
-                text: ab.backend ? ab.backend.markdownHtml(root.displayAnswer(ab.answer), Theme.px(15))
-                                 : root.displayAnswer(ab.answer)
+                text: ab.backend ? ab.backend.markdownHtml(ab.shownAnswer, Theme.px(14)) : ab.shownAnswer
                 textFormat: ab.backend ? Text.RichText : Text.PlainText
                 wrapMode: Text.Wrap
-                color: Theme.ink
+                color: Theme.text
                 linkColor: Theme.gold
                 font.family: Theme.sans
-                font.pixelSize: Theme.px(18)
+                font.pixelSize: Theme.px(16)
                 onLinkActivated: link => Qt.openUrlExternally(link)
             }
         }

@@ -3,7 +3,12 @@
 #include "mac/cua_executor.hpp"
 #include "mac/cua_shadow.hpp"
 #include "mac/cua_spotlight.hpp"
+#include "mac/cua_pad_icon.hpp"
 #include <CoreGraphics/CGEventTypes.h>
+#include <QPainter>
+#include <functional>
+#include <iterator>
+#include <utility>
 #include <QCoreApplication>
 #include <QDateTime>
 #include <QDir>
@@ -120,16 +125,54 @@ void reticleOffscreenTests() {
     auto st = r.state();
     check(st.visible && close(st.tip, {100, 100}) && !st.gliding && st.label == "Looking", "reticle: first moveTo appears in place");
     check(!st.pillRect.isEmpty() && disp.contains(st.pillRect), "reticle: pill beside the pointer, on screen");
+    // Cartoon palette pixel classes (unpremultiplied). Gold is the Lapis accent #e09f3e, kept apart
+    // from the warm cel shadows (#dfc79a, #cfa96e) and parchment text by g < 190 and r > b + 110.
+    const auto cream = [](const QColor &c) { return c.alpha() > 200 && c.red() > 210 && c.green() > 190; };
+    const auto gold = [](const QColor &c) {
+        return c.alpha() > 100 && c.red() > 180 && c.green() > 110 && c.green() < 190 && c.red() > c.blue() + 110;
+    };
+    const auto ink = [](const QColor &c) { return c.alpha() > 180 && c.red() < 35 && c.green() < 35 && c.blue() < 35; };
+    const auto lapisBlue = [](const QColor &c) { return c.alpha() > 100 && c.blue() > 180 && c.blue() > c.red() + 60; };
+    // Counts pixels of a class inside `pts` (global points) of a 2x render.
+    const auto count = [](const QImage &im, const QRectF &pts, auto pred) {
+        int n = 0;
+        const QRect px = QRectF(pts.topLeft() * 2, pts.size() * 2).toAlignedRect() & im.rect();
+        for (int y = px.top(); y <= px.bottom(); ++y)
+            for (int x = px.left(); x <= px.right(); ++x)
+                n += pred(im.pixelColor(x, y));
+        return n;
+    };
+    check(std::abs(glideDuration({0, 0}, {50, 0}) - kGlideMinSec) < 1e-9
+              && std::abs(glideDuration({0, 0}, {2000, 0}) - kGlideMaxSec) < 1e-9
+              && glideDuration({0, 0}, {300, 0}) > kGlideMinSec && glideDuration({0, 0}, {300, 0}) < kGlideMaxSec,
+        "reticle: glide 0.24 s short, eases up to a 0.36 s cap with distance");
+    check(std::abs(r.state().handAngleDeg + 28) < 1e-9 && std::abs(r.state().stretch - 1) < 1e-9, "reticle: hand rests at -28°, unstretched");
     r.advanceClock(0.5);
     r.moveTo({600, 300}, "Going");
-    r.advanceClock(0.07);
+    const double glide = glideDuration({100, 100}, {600, 300});
+    r.advanceClock(0.02);
+    check(r.state().tip.x() < 100, "reticle: glide winds up (anticipation) before the swoosh");
+    r.advanceClock(glide / 2 - 0.02);
     st = r.state();
     check(st.gliding && st.tip.x() > 100 && st.tip.x() < 600 && close(st.target, {600, 300}), "reticle: glides mid-arc");
     // Half time is eased progress 0.5: the straight line would be at (350, 200).
     check(st.tip.y() < 200 - 10, "reticle: glide arcs upward, not a straight line");
-    r.advanceClock(0.2);
+    check(st.stretch > 1.2 && st.stretch <= 1.26 + 1e-9, "reticle: hand stretches along the motion at peak speed");
+    check(st.handAngleDeg > 0, "reticle: hand banks toward the motion mid-glide");
+    {
+        // Mid-glide pixels: the swoosh ribbon and speed lines behind the hand, the glove itself.
+        const QImage mid = r.render(2);
+        const QPointF tip = st.tip;
+        const int ribbon = count(mid, QRectF(110, 60, tip.x() - 60 - 110, 120), gold);
+        const int glove = count(mid, QRectF(tip.x() - 50, tip.y() - 50, 100, 100), cream);
+        const int outline = count(mid, QRectF(tip.x() - 50, tip.y() - 50, 100, 100), ink);
+        check(ribbon > 150 && glove > 150 && outline > 150, "reticle: mid-glide renders the gold swoosh behind a cream, ink-outlined glove");
+        std::printf("reticle mid-glide: ribbon=%d glove=%d outline=%d\n", ribbon, glove, outline);
+    }
+    r.advanceClock(glide / 2 + 0.05);
     st = r.state();
     check(!st.gliding && close(st.tip, {600, 300}), "reticle: glide lands exactly");
+    check(std::abs(st.stretch - 1) < 1e-9 && std::abs(st.handAngleDeg + 28) < 1e-9, "reticle: landed hand back at rest");
     check(r.highlightRect({560, 280, 100, 40}, "Clicking Send"), "reticle: valid highlight accepted");
     st = r.state();
     check(st.focusRect == QRectF(560, 280, 100, 40) && st.label == "Clicking Send", "reticle: focus ring on the target");
@@ -139,21 +182,39 @@ void reticleOffscreenTests() {
     check(r.pulseClick({610, 300}), "reticle: pulse accepted");
     st = r.state();
     check(st.label == "Low" && st.gliding, "reticle: pulse keeps label, glides to the click point first");
-    r.advanceClock(0.15);
-    check(r.state().rippleActive && close(r.state().tip, {610, 300}), "reticle: ripple runs once landed");
+    r.advanceClock(glideDuration({600, 300}, {610, 300}) + 0.07);
+    check(r.state().rippleActive && close(r.state().tip, {610, 300}), "reticle: click burst runs once landed");
     const QImage img = r.render(2);
-    int sapphire = 0, dark = 0;
-    for (int y = 0; y < img.height(); y += 2)
-        for (int x = 0; x < img.width(); x += 2) {
-            const QColor c = img.pixelColor(x, y);
-            sapphire += c.alpha() > 100 && c.blue() > 180 && c.blue() > c.red() + 60;
-            dark += c.alpha() > 200 && c.red() < 40 && c.blue() < 50;
-        }
     check(img.width() == 1600 && img.height() == 1000, "reticle: render at 2x");
-    check(sapphire > 50 && dark > 20, "reticle: render has sapphire rim/ring and obsidian body");
-    std::printf("reticle render: sapphire=%d dark=%d samples\n", sapphire, dark);
+    // The resting hand extends down-right of the fingertip, so up-left of the click point is all burst.
+    const int burst = count(img, QRectF(580, 270, 28, 28), gold) + count(img, QRectF(580, 270, 28, 28), cream);
+    const int glove = count(img, QRectF(600, 290, 50, 50), cream);
+    const int cuff = count(img, QRectF(600, 290, 50, 50), gold);
+    const int outline = count(img, QRectF(570, 260, 80, 80), ink);
+    int blue = 0;
+    for (int y = 0; y < img.height(); y += 2)
+        for (int x = 0; x < img.width(); x += 2)
+            blue += lapisBlue(img.pixelColor(x, y));
+    check(burst > 200 && glove > 150 && cuff > 40 && outline > 200 && blue == 0,
+        "reticle: click renders the comic starburst, cream glove, gold cuff, ink outline, no blue");
+    std::printf("reticle click: burst=%d glove=%d cuff=%d outline=%d blue=%d\n", burst, glove, cuff, outline, blue);
     r.advanceClock(0.4);
-    check(!r.state().rippleActive, "reticle: ripple ends");
+    check(!r.state().rippleActive, "reticle: click burst ends");
+    {
+        // Lapis-blue theme: the accents shift to #4f8cff / #2d5aa8; glove and ink stay.
+        CuaReticle b(CuaReticle::Mode::Offscreen, disp);
+        b.setGoldTheme(false);
+        b.moveTo({300, 200});
+        b.highlightRect({280, 190, 120, 40}, "Clicking Send");
+        b.pulseClick({300, 200});
+        b.advanceClock(0.07);
+        const QImage bi = b.render(2);
+        const QRectF area(200, 120, 300, 200);
+        const int bBlue = count(bi, area, lapisBlue), bGold = count(bi, area, gold), bCream = count(bi, area, cream);
+        const int bInk = count(bi, area, ink);
+        check(bBlue > 300 && bGold == 0 && bCream > 150 && bInk > 150, "reticle: setGoldTheme(false) swaps the accent to Lapis blue only");
+        std::printf("reticle blue theme: blue=%d gold=%d cream=%d ink=%d\n", bBlue, bGold, bCream, bInk);
+    }
     r.advanceClock(3.0);
     st = r.state();
     check(st.visible && st.focusRect.isEmpty() && st.pillRect.isEmpty(), "reticle: ring and pill fade after idle, pointer stays");
@@ -690,22 +751,47 @@ void hudTests() {
     st = r.state();
     check(st.hudTone == HudTone::Working && st.hudRect == QRectF(550, 818, 340, 38) && std::abs(st.hudAlpha - 1) < 1e-9,
         "hud: a new status updates in place, no re-fade");
-    // Rendered: frosted obsidian body with a sapphire dot in the capsule, nothing above it.
+    // Rendered: Lapis espresso-obsidian #0d0c0b body, #e09f3e gold star mark and gold rim, no cold
+    // blue anywhere in it, and nothing above it.
     const QImage img = r.render(2);
-    int body = 0, dot = 0, strayAbove = 0;
+    const auto gold = [](const QColor &c) {
+        return c.alpha() > 150 && c.red() > 180 && c.green() > 110 && c.green() < 190 && c.red() > c.blue() + 110;
+    };
+    int body = 0, dot = 0, rim = 0, blue = 0, strayAbove = 0;
     for (int y = 0; y < img.height(); ++y)
         for (int x = 0; x < img.width(); x += 2) {
             const QColor c = img.pixelColor(x, y);
             const QPointF pt(x / 2.0, y / 2.0);
             if (QRectF(560, 822, 320, 30).contains(pt)) {
-                body += c.alpha() > 200 && c.red() < 40 && c.blue() < 50;
-                dot += c.alpha() > 150 && c.blue() > 180 && c.blue() > c.red() + 60 && pt.x() < 580;
+                body += c.alpha() > 230 && c.red() < 20 && c.green() < 20 && c.blue() < 20;
+                dot += gold(c) && pt.x() < 580;
+                blue += c.blue() > c.red() + 30;
+            } else if (QRectF(600, 817, 240, 3).contains(pt)) {
+                rim += gold(c);
             } else if (QRectF(400, 600, 640, 180).contains(pt)) {
                 strayAbove += c.alpha() > 0;
             }
         }
-    check(body > 1000 && dot > 4 && strayAbove == 0, "hud: render draws the capsule and sapphire dot, only there");
-    std::printf("hud render: body=%d dot=%d stray=%d\n", body, dot, strayAbove);
+    check(body > 1000 && dot > 4 && rim > 100 && blue == 0 && strayAbove == 0,
+        "hud: render draws the obsidian capsule, gold mark and gold rim, only there");
+    std::printf("hud render: body=%d dot=%d rim=%d blue=%d stray=%d\n", body, dot, rim, blue, strayAbove);
+    {
+        // Lapis-blue theme: the HUD rim and mark follow the accent.
+        CuaReticle b(CuaReticle::Mode::Offscreen, disp);
+        b.setGoldTheme(false);
+        b.showHud(QStringLiteral("Working"), HudTone::Working);
+        b.advanceClock(0.3);
+        const QImage bi = b.render(2);
+        int bBlue = 0, bGold = 0;
+        for (int y = int(818 * 2); y < int(856 * 2); ++y)
+            for (int x = int(550 * 2); x < int(890 * 2); ++x) {
+                const QColor c = bi.pixelColor(x, y);
+                bBlue += c.alpha() > 100 && c.blue() > 180 && c.blue() > c.red() + 60;
+                bGold += gold(c);
+            }
+        check(bBlue > 100 && bGold == 0, "hud: setGoldTheme(false) turns the rim and mark Lapis blue");
+        std::printf("hud blue theme: blue=%d gold=%d\n", bBlue, bGold);
+    }
     // Hiding the cursor leaves the HUD alone.
     r.hide();
     check(!r.state().visible && r.state().hudVisible, "hud: cursor hide() keeps the HUD up");
@@ -1514,8 +1600,257 @@ void spotlightTests() {
             "spotlight exec: an explicit app still wins over the default");
     }
 }
+// Mirrors forbiddenPixels in src/demo.cpp: blue- or green-tinted pixels (after flattening on black).
+int forbiddenPixels(const QImage &src) {
+    const QImage img = src.convertToFormat(QImage::Format_RGB32);
+    int bad = 0;
+    for (int y = 0; y < img.height(); ++y) {
+        const auto *row = reinterpret_cast<const QRgb *>(img.constScanLine(y));
+        for (int x = 0; x < img.width(); ++x) {
+            const int r = qRed(row[x]), g = qGreen(row[x]), b = qBlue(row[x]);
+            bad += (b > r + 24 && b > g + 8) || (g > r + 30 && g > b + 30);
+        }
+    }
+    return bad;
+}
+// Amber Gold #e09f3e-ish (and its glow): warm, saturated, bright.
+bool goldish(const QColor &c) {
+    return c.alpha() > 100 && c.red() > 140 && c.red() - c.blue() > 70 && c.green() > c.red() * 0.5 && c.green() < c.red();
+}
+int countIn(const QImage &img, const QRectF &pts, double scale, const std::function<bool(const QColor &)> &pred) {
+    int n = 0;
+    const QRect px = QRectF(pts.x() * scale, pts.y() * scale, pts.width() * scale, pts.height() * scale).toAlignedRect() & img.rect();
+    for (int y = px.top(); y <= px.bottom(); ++y)
+        for (int x = px.left(); x <= px.right(); ++x)
+            n += pred(img.pixelColor(x, y));
+    return n;
+}
+constexpr PadButton kAllPadButtons[] = {PadButton::Cross, PadButton::Circle, PadButton::Square, PadButton::Triangle,
+                                        PadButton::L1, PadButton::R1, PadButton::L2, PadButton::R2,
+                                        PadButton::L3, PadButton::R3, PadButton::Options, PadButton::Touchpad};
+void padIconTests() {
+    check(std::size(kAllPadButtons) == size_t(kPadButtonCount), "pad icon: all 12 buttons covered");
+    const CGSize face = padIconSize(PadButton::Cross, 20), bump = padIconSize(PadButton::L1, 20),
+                 trig = padIconSize(PadButton::R2, 20), opt = padIconSize(PadButton::Options, 20),
+                 pad = padIconSize(PadButton::Touchpad, 20), stick = padIconSize(PadButton::L3, 20);
+    check(face.width == 20 && face.height == 20 && stick.width == 20, "pad icon: face buttons and sticks are 1:1");
+    check(std::abs(bump.width / 20 - 1.45) < 0.03 && std::abs(trig.width / 20 - 1.45) < 0.03 && std::abs(pad.width / 20 - 1.45) < 0.03,
+        "pad icon: bumpers, triggers, touchpad ~1.45:1");
+    check(opt.width < opt.height && opt.width > 10, "pad icon: Options is a vertical stadium");
+    check(renderPadIcon(PadButton::Cross, 0, 2).isNull() && renderPadIcon(PadButton::Cross, 20, -1).isNull(),
+        "pad icon: invalid size / scale render null");
+    int okInk = 0, okForbidden = 0, okActiveGold = 0, okBlue = 0;
+    for (PadButton b : kAllPadButtons) {
+        for (bool active : {false, true}) {
+            const QImage img = renderPadIcon(b, 24, 3, active, false);
+            const CGSize sz = padIconSize(b, 24);
+            int ink = 0, gold = 0, edge = 0;
+            for (int y = 0; y < img.height(); ++y)
+                for (int x = 0; x < img.width(); ++x) {
+                    const QColor c = img.pixelColor(x, y);
+                    // Idle ink #e8d5b5: bright and warm. Active: gold.
+                    ink += c.alpha() > 180 && c.red() > 170 && c.red() >= c.blue();
+                    gold += goldish(c);
+                    edge += (x == 0 || y == 0 || x == img.width() - 1 || y == img.height() - 1) && c.alpha() > 200;
+                }
+            const bool sized = img.width() == int(std::ceil(sz.width * 3)) && img.height() == 72;
+            okInk += sized && ink > 12 && edge < img.width();  // visible glyph, not clipped into a solid edge
+            okForbidden += forbiddenPixels(img) == 0;
+            if (active)
+                okActiveGold += gold > 20;
+            if (!(ink > 12 && forbiddenPixels(img) == 0))
+                std::printf("pad icon %s active=%d: ink=%d forbidden=%d edge=%d\n", qPrintable(padButtonName(b)), int(active),
+                    ink, forbiddenPixels(img), edge);
+        }
+        const QImage blue = renderPadIcon(b, 24, 2, true, true);
+        int bluePx = 0;
+        for (int y = 0; y < blue.height(); ++y)
+            for (int x = 0; x < blue.width(); ++x) {
+                const QColor c = blue.pixelColor(x, y);
+                bluePx += c.alpha() > 150 && c.blue() > 180 && c.blue() > c.red() + 60;
+            }
+        okBlue += bluePx > 10;
+    }
+    check(okInk == 24, "pad icon: all 12 icons, idle + active, have visible ink and fit their box");
+    check(okForbidden == 24, "pad icon: zero blue/green pixels in gold mode (idle + active)");
+    check(okActiveGold == 12, "pad icon: active icons are Amber Gold");
+    check(okBlue == 12, "pad icon: lapis-blue active icons take #4f8cff");
+    std::printf("pad icons: ink=%d/24 forbidden-free=%d/24 gold=%d/12 blue=%d/12\n", okInk, okForbidden, okActiveGold, okBlue);
+}
+void goldThemeTests() {
+    const QRectF disp(0, 0, 800, 500);
+    {
+        CuaReticle plain(CuaReticle::Mode::Offscreen, disp);
+        check(plain.goldTheme(), "gold: a plain CuaReticle starts in Lapis Gold");
+        plain.setGoldTheme(false);
+        check(!plain.goldTheme() && plain.windowNumber() == 0, "gold: setGoldTheme(false) flips to blue, still no window");
+        plain.setGoldTheme(true);
+    }
+    const QRectF hud = cuaHudRect(disp);
+    const std::pair<HudTone, QString> tones[] = {{HudTone::Listening, QStringLiteral("Listening…")},
+                                                 {HudTone::Working, QStringLiteral("Mail · Clicking Send")},
+                                                 {HudTone::Done, QStringLiteral("Done · Send in Mail")},
+                                                 {HudTone::Error, QStringLiteral("Couldn't find Send")}};
+    int okForbidden = 0, okDot = 0, okBody = 0;
+    for (const auto &[tone, status] : tones) {
+        CuaReticle r(CuaReticle::Mode::Offscreen, disp);
+        r.setGoldTheme(true);
+        r.moveTo({100, 100});
+        r.advanceClock(0.5);
+        r.highlightRect({560, 280, 100, 40}, QStringLiteral("Clicking Send"));
+        r.showHud(status, tone);
+        r.advanceClock(0.1);
+        r.pulseClick({610, 300});
+        r.advanceClock(0.46);
+        const QImage img = r.render(2);
+        const int bad = forbiddenPixels(img);
+        okForbidden += bad == 0;
+        // The dot / check sits in the left 36 pt of the capsule.
+        const QRectF dotArea(hud.x() + 8, hud.y() + 6, 26, hud.height() - 12);
+        const int dot = tone == HudTone::Error
+            ? countIn(img, dotArea, 2, [](const QColor &c) { return c.alpha() > 150 && c.red() > 180 && c.green() > 80 && c.green() < 130 && c.blue() < 90; })
+            : countIn(img, dotArea, 2, goldish);
+        okDot += dot > 4;
+        // Warm obsidian body: dark, red >= blue (no cold slate), fully covering the middle.
+        const int body = countIn(img, QRectF(hud.center().x() + 40, hud.y() + 8, 60, hud.height() - 16), 2,
+            [](const QColor &c) { return c.alpha() > 230 && c.red() < 30 && c.red() >= c.blue() && c.green() >= c.blue(); });
+        okBody += body > 1500;
+        if (bad || dot <= 4 || body <= 1500)
+            std::printf("gold hud tone %d: forbidden=%d dot=%d body=%d\n", int(tone), bad, dot, body);
+        if (tone == HudTone::Working) {
+            const int rimRing = countIn(img, QRectF(550, 270, 120, 60), 2, goldish);
+            const int pointer = countIn(img, QRectF(600, 290, 30, 40), 2, goldish);
+            check(rimRing > 50 && pointer > 10, "gold: focus ring, ripple and pointer rim are Amber Gold");
+            const QRectF pill = r.state().pillRect;
+            check(!pill.isEmpty() && countIn(img, pill, 2, goldish) > 10
+                      && countIn(img, pill.adjusted(30, 6, -8, -6), 2, [](const QColor &c) { return c.alpha() > 200 && c.red() > 170 && c.red() > c.blue() + 25; }) > 20,
+                "gold: the pill has a gold rim/dot and #e8d5b5 text");
+        }
+    }
+    check(okForbidden == 4, "gold: reticle + ring + pill + HUD in every tone have zero blue/green pixels");
+    check(okDot == 4, "gold: HUD dot/check is gold (Listening, Working, Done), copper-coral on Error");
+    check(okBody == 4, "gold: HUD capsule body is warm obsidian");
+    {
+        // A trailing "L3+R3 Run" turns into controller badges on the right of the capsule.
+        const auto rightInk = [&](const QString &status) {
+            CuaReticle r(CuaReticle::Mode::Offscreen, disp);
+            r.setGoldTheme(true);
+            r.showHud(status, HudTone::Working);
+            r.advanceClock(0.5);
+            const QImage img = r.render(2);
+            return std::make_pair(countIn(img, QRectF(hud.right() - 90, hud.y() + 4, 80, hud.height() - 8), 2,
+                                      [](const QColor &c) { return c.alpha() > 200 && c.red() > 90; }),
+                                  forbiddenPixels(img));
+        };
+        const auto plain = rightInk(QStringLiteral("Draft ready"));
+        const auto badge = rightInk(QStringLiteral("Draft ready · L3+R3 Run"));
+        check(badge.first > plain.first + 150 && badge.second == 0, "gold: \"L3+R3 Run\" draws [L3]+[R3] badges at the right");
+        std::printf("hud run badge: right-ink plain=%d badge=%d\n", plain.first, badge.first);
+    }
+    {
+        // Lapis blue: the accent is #4f8cff (forbidden pixels are expected there).
+        CuaReticle r(CuaReticle::Mode::Offscreen, disp);
+        r.setGoldTheme(false);
+        r.showHud(QStringLiteral("Working"), HudTone::Working);
+        r.advanceClock(0.5);
+        const QImage img = r.render(2);
+        check(countIn(img, QRectF(hud.x() + 8, hud.y() + 6, 26, hud.height() - 12), 2,
+                  [](const QColor &c) { return c.alpha() > 150 && c.blue() > 200 && c.blue() > c.red() + 100; }) > 4
+                  && countIn(img, hud, 2, goldish) == 0,
+            "gold: lapis-blue mode swaps the accent to #4f8cff, no gold");
+    }
+}
+void themeSyncTests() {
+    check(!overlayLapisBlue() && !spotlightLapisBlue(), "theme: overlays default to Gold");
+    setOverlayTheme(true);
+    check(overlayLapisBlue() && spotlightLapisBlue(), "theme: setOverlayTheme(true) -> lapis blue everywhere");
+    setOverlayTheme(false);
+    check(!overlayLapisBlue() && !spotlightLapisBlue(), "theme: back to Gold");
+}
+void spotlightRenderTests() {
+    CuaSpotlight sp(CuaSpotlight::Mode::Offscreen);
+    sp.setFrontmostProbe([](int *pid, QString *name) { *pid = 77; *name = QStringLiteral("Google Chrome"); });
+    sp.openOrFocus();
+    QImage idle = sp.render(2);
+    check(!idle.isNull() && idle.width() == int(kSpotlightWidth * 2) && idle.height() == int(kSpotlightBaseHeight * 2),
+        "spotlight render: 2x image of the base bar");
+    check(forbiddenPixels(idle) == 0, "spotlight render: idle bar has zero blue/green pixels");
+    check(countIn(idle, QRectF(0, 0, kSpotlightWidth, kSpotlightBaseHeight), 2, goldish) > 100,
+        "spotlight render: idle bar has its gold border");
+    // The hint draws vector controller icons: warm ink in the top-right, gold only while listening.
+    const QRectF hintArea(kSpotlightWidth - 230, 12, 214, 22);
+    const int hintInk = countIn(idle, hintArea, 2, [](const QColor &c) { return c.alpha() > 200 && c.red() > 150 && c.red() > c.blue(); });
+    check(hintInk > 40 && countIn(idle, hintArea, 2, goldish) < 10, "spotlight render: idle hint is [L2] [R2] [○] icons in Lapis ink");
+    // The context pill: #14120f body.
+    check(countIn(idle, QRectF(90, 15, 20, 16), 2, [](const QColor &c) {
+              return c.alpha() > 240 && std::abs(c.red() - 0x14) <= 3 && std::abs(c.green() - 0x12) <= 3 && std::abs(c.blue() - 0x0F) <= 3; }) > 8,
+        "spotlight render: the context pill is #14120f");
+    sp.setListening(true);
+    const QImage listening = sp.render(2);
+    check(forbiddenPixels(listening) == 0 && countIn(listening, hintArea, 2, goldish) > 40,
+        "spotlight render: listening shows the gold dot + Listening… and no blue/green");
+    sp.setListening(false);
+    sp.beginTurn(QStringLiteral("why does the sign in page keep reloading?"));
+    sp.setAnswer(QStringLiteral("The page wants a cookie the browser blocks, so the form never gets its session token.\n\n"
+                                "Allow third-party cookies for the accounts site, then reload the tab."));
+    sp.setBusy(false);
+    const SpotlightState st = sp.state();
+    const QImage drawer = sp.render(2);
+    check(!drawer.isNull() && std::abs(drawer.height() / 2.0 - st.frame.height()) <= 1 && st.frame.height() > kSpotlightBaseHeight + 60,
+        "spotlight render: the drawer image matches the state frame height (two paragraphs)");
+    const int bad = forbiddenPixels(drawer);
+    check(bad == 0, "spotlight render: drawer with question + answer has zero blue/green pixels");
+    const int q = countIn(drawer, QRectF(16, kSpotlightBaseHeight + 10, 300, 20), 2, goldish);
+    const int body = countIn(drawer, QRectF(16, kSpotlightBaseHeight + 35, kSpotlightWidth - 32, st.frame.height() - kSpotlightBaseHeight - 40), 2,
+        [](const QColor &c) { return c.alpha() > 200 && c.red() > 160 && std::abs(c.red() - c.blue()) < 40; });
+    check(q > 30 && body > 300, "spotlight render: gold question line and #d9cfc3 answer body");
+    std::printf("spotlight render: forbidden=%d question-gold=%d body=%d\n", bad, q, body);
+    check(sp.windowNumber() == 0 && spotlightWindowNumber() == 0, "spotlight render: Offscreen still never creates a window");
+    check(sp.render(0).isNull() && sp.render(std::numeric_limits<double>::quiet_NaN()).isNull(), "spotlight render: invalid scale");
+    setSpotlightLapisBlue(true);
+    const QImage blue = sp.render(2);
+    setSpotlightLapisBlue(false);
+    check(countIn(blue, QRectF(16, kSpotlightBaseHeight + 10, 300, 20), 2,
+              [](const QColor &c) { return c.alpha() > 150 && c.blue() > 200 && c.blue() > c.red() + 100; }) > 30
+              && countIn(blue, QRectF(0, 0, kSpotlightWidth, st.frame.height()), 2, goldish) == 0,
+        "spotlight render: lapis-blue mode swaps every accent to #4f8cff");
+}
+// --proofs DIR: the snap PNGs plus a pad-icon sheet, for eyeballing.
+void writeProofs(const QString &dir) {
+    QDir().mkpath(dir);
+    check(snapCursor(dir + "/snap-cursor.png") == 0, "proofs: snap-cursor");
+    check(snapSpotlight(dir + "/snap-spotlight.png") == 0, "proofs: snap-spotlight");
+    const double scale = 3, rowH = 64, cell = 64, h = 28;
+    QImage sheet(int((cell * 12 + 32) * scale), int((rowH * 4 + 32) * scale), QImage::Format_ARGB32_Premultiplied);
+    sheet.fill(QColor(0, 0, 0));
+    QPainter p(&sheet);
+    p.setRenderHint(QPainter::SmoothPixmapTransform);
+    p.scale(scale, scale);
+    const QColor rowBg[] = {QColor(0, 0, 0), QColor(0x0D, 0x0C, 0x0B), QColor(0x0D, 0x0C, 0x0B), QColor(0, 0, 0)};
+    for (int row = 0; row < 4; ++row) {
+        p.fillRect(QRectF(16, 16 + row * rowH, cell * 12, rowH), rowBg[row]);
+        for (int i = 0; i < 12; ++i) {
+            const double height = row == 3 ? 16 : h;  // the last row at hint-bar size
+            QImage img = renderPadIcon(kAllPadButtons[i], height, scale, row == 1 || row == 2, row == 2);
+            const CGSize sz = padIconSize(kAllPadButtons[i], height);
+            p.drawImage(QRectF(16 + i * cell + (cell - sz.width) / 2, 16 + row * rowH + (rowH - sz.height) / 2, sz.width, sz.height), img);
+        }
+    }
+    p.end();
+    check(sheet.save(dir + "/pad-icons.png"), "proofs: pad icon sheet");
+    std::printf("proofs: %s\n", qPrintable(dir));
+}
 int main(int argc, char **argv) {
     QCoreApplication app(argc, argv);
+    if (const int i = int(app.arguments().indexOf("--proofs")); i > 0 && i + 1 < app.arguments().size()) {
+        writeProofs(app.arguments().at(i + 1));
+        std::printf("test_cua: %d passed, %d failed\n", passed, failed);
+        return failed ? 1 : 0;
+    }
+    padIconTests();
+    goldThemeTests();
+    themeSyncTests();
+    spotlightRenderTests();
     traceTests();
     shadowTests();
     geometryTests(); leaseTests(); formattingTests(); cancellationTests(); liveTests();

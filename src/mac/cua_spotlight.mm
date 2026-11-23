@@ -1,11 +1,18 @@
 #include "mac/cua_spotlight.hpp"
+#include "mac/cua_pad_icon.hpp"
 
 #import <AppKit/AppKit.h>
 #import <QuartzCore/QuartzCore.h>
 
+#include <QDir>
+#include <QFileInfo>
+#include <QPainter>
 #include <QVector>
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <cstdio>
+#include <iterator>
 #include <unistd.h>
 
 // ---- Pure helpers --------------------------------------------------------------------------------
@@ -47,7 +54,11 @@ bool studioAppIsActive()
 
 }  // namespace studio::cua
 
+// ---- Lapis palette and the shared painter ---------------------------------------------------------
+
 namespace {
+
+std::atomic<bool> g_lapisBlue{false};
 
 NSColor *hex(uint32_t rgb, double a = 1.0)
 {
@@ -60,10 +71,110 @@ NSString *ns(const QString &s)
     return s.toNSString();
 }
 
-constexpr uint32_t kGold = 0xF5C451, kSapphire = 0x4DA3FF, kDimGold = 0xC5A049, kBorderGold = 0xD4AF37;
+// Lapis Gold (qml/Theme.qml); lapis-blue mode swaps only the accent pair.
+constexpr uint32_t kCard = 0x0D0C0B, kCardHi = 0x14120F, kHairline = 0x1D1915, kInputBg = 0x050404;
+constexpr uint32_t kInk = 0xE8D5B5, kBodyText = 0xD9CFC3, kDim = 0x6E665E, kMuted = 0x4C453D;
+constexpr uint32_t kGold = 0xE09F3E, kCopper = 0xB5653B, kBlue = 0x4F8CFF, kBlueDeep = 0x2D5AA8;
 constexpr double kW = studio::cua::kSpotlightWidth;
+constexpr double kHintIcon = 16, kHintTop = 12, kHintH = 22;
+
+uint32_t accentRgb() { return g_lapisBlue.load() ? kBlue : kGold; }
+uint32_t secondaryRgb() { return g_lapisBlue.load() ? kBlueDeep : kCopper; }
+
+NSFont *avenir(NSString *name, double size, NSFontWeight fallback)
+{
+    NSFont *f = [NSFont fontWithName:name size:size];
+    return f ?: [NSFont systemFontOfSize:size weight:fallback];
+}
+NSFont *menlo(double size, bool bold = false)
+{
+    NSFont *f = [NSFont fontWithName:bold ? @"Menlo-Bold" : @"Menlo-Regular" size:size];
+    return f ?: [NSFont monospacedSystemFontOfSize:size weight:bold ? NSFontWeightBold : NSFontWeightRegular];
+}
+NSFont *promptFont() { return avenir(@"AvenirNext-Regular", 18, NSFontWeightRegular); }
+
+void fillRounded(CGContextRef ctx, CGRect r, double radius, NSColor *fill, NSColor *stroke = nil, double lw = 1)
+{
+    if (fill) {
+        CGPathRef p = CGPathCreateWithRoundedRect(r, radius, radius, nullptr);
+        CGContextAddPath(ctx, p);
+        CGContextSetFillColorWithColor(ctx, fill.CGColor);
+        CGContextFillPath(ctx);
+        CGPathRelease(p);
+    }
+    if (stroke) {
+        const CGRect e = CGRectInset(r, lw / 2, lw / 2);
+        const double er = std::max(0.0, radius - lw / 2);
+        CGPathRef p = CGPathCreateWithRoundedRect(e, er, er, nullptr);
+        CGContextAddPath(ctx, p);
+        CGContextSetLineWidth(ctx, lw);
+        CGContextSetStrokeColorWithColor(ctx, stroke.CGColor);
+        CGContextStrokePath(ctx);
+        CGPathRelease(p);
+    }
+}
+
+// ---- The top-right hint: [L2] voice  [R2] send  [○] close, or a pulsing dot + Listening… ----
+struct HintItem {
+    studio::cua::PadButton button;
+    NSString *label;
+};
+const HintItem kHintItems[] = {{studio::cua::PadButton::L2, @"voice"},
+                               {studio::cua::PadButton::R2, @"send"},
+                               {studio::cua::PadButton::Circle, @"close"}};
+constexpr double kHintIconGap = 5, kHintItemGap = 12;
+
+NSDictionary *hintAttrs(bool listening)
+{
+    return @{NSFontAttributeName: menlo(11), NSForegroundColorAttributeName: listening ? hex(accentRgb()) : hex(kDim)};
+}
+NSString *listeningText() { return @"Listening…"; }
+
+double hintWidth(bool listening)
+{
+    NSDictionary *attrs = hintAttrs(listening);
+    if (listening)
+        return 7 + 7 + std::ceil([listeningText() sizeWithAttributes:attrs].width);
+    double w = 0;
+    for (const HintItem &it : kHintItems)
+        w += studio::cua::padIconSize(it.button, kHintIcon).width + kHintIconGap + std::ceil([it.label sizeWithAttributes:attrs].width);
+    return w + kHintItemGap * (std::size(kHintItems) - 1);
+}
+
+// Draws the hint right-aligned in `r` (y-down, an NSGraphicsContext current). `phase` in [0, 1)
+// drives the listening pulse.
+void paintHint(CGContextRef ctx, CGRect r, bool listening, double phase)
+{
+    NSDictionary *attrs = hintAttrs(listening);
+    const double cy = CGRectGetMidY(r);
+    const double lineH = std::ceil(menlo(11).ascender - menlo(11).descender);
+    double x = CGRectGetMaxX(r) - hintWidth(listening);
+    if (listening) {
+        const double breathe = 0.5 + 0.5 * std::cos(2 * M_PI * phase);
+        CGContextSaveGState(ctx);
+        const double hr = 3.5 + 4.5 * (1 - std::pow(1 - phase, 3));
+        CGContextSetLineWidth(ctx, 1);
+        CGContextSetStrokeColorWithColor(ctx, hex(accentRgb(), 0.5 * (1 - phase)).CGColor);
+        CGContextStrokeEllipseInRect(ctx, CGRectMake(x + 3.5 - hr, cy - hr, 2 * hr, 2 * hr));
+        CGContextSetShadowWithColor(ctx, CGSizeZero, 3 + 4 * breathe, hex(accentRgb(), 0.45 + 0.4 * breathe).CGColor);
+        CGContextSetFillColorWithColor(ctx, hex(accentRgb(), 0.85 + 0.15 * breathe).CGColor);
+        CGContextFillEllipseInRect(ctx, CGRectMake(x, cy - 3.5, 7, 7));
+        CGContextRestoreGState(ctx);
+        [listeningText() drawAtPoint:NSMakePoint(x + 14, cy - lineH / 2) withAttributes:attrs];
+        return;
+    }
+    const studio::cua::PadIconColors colors = studio::cua::padIconColors(false, g_lapisBlue.load());
+    for (const HintItem &it : kHintItems) {
+        const CGSize sz = studio::cua::padIconSize(it.button, kHintIcon);
+        studio::cua::drawPadIcon(ctx, it.button, CGRectMake(x, cy - sz.height / 2, sz.width, sz.height), colors);
+        x += sz.width + kHintIconGap;
+        [it.label drawAtPoint:NSMakePoint(x, cy - lineH / 2) withAttributes:attrs];
+        x += std::ceil([it.label sizeWithAttributes:attrs].width) + kHintItemGap;
+    }
+}
 
 studio::cua::CuaSpotlight *g_liveSpotlight = nullptr;  // the Visible instance (capture exclusion)
+studio::cua::CuaSpotlight::Impl *g_liveImpl = nullptr;  // ... and its state, for theme refreshes
 
 }  // namespace
 
@@ -71,10 +182,15 @@ studio::cua::CuaSpotlight *g_liveSpotlight = nullptr;  // the Visible instance (
 @property(nonatomic, assign) studio::cua::CuaSpotlight::Impl *owner;
 @end
 
-@interface LapisSpotlightFlipped : NSView
+// The card itself: everything that is not a live control, drawn by the same painter render() uses.
+@interface LapisSpotlightSurface : NSView
+@property(nonatomic, assign) studio::cua::CuaSpotlight::Impl *owner;
 @end
-@implementation LapisSpotlightFlipped
-- (BOOL)isFlipped { return YES; }
+
+// The top-right controller hint, vector [L2] [R2] [○] icons (cua_pad_icon).
+@interface LapisSpotlightHintBar : NSView
+@property(nonatomic, assign) BOOL listening;
+@property(nonatomic, assign) double phase;
 @end
 
 @interface LapisSpotlightFieldDelegate : NSObject <NSTextFieldDelegate>
@@ -84,26 +200,31 @@ studio::cua::CuaSpotlight *g_liveSpotlight = nullptr;  // the Visible instance (
 namespace studio::cua {
 
 struct CuaSpotlight::Impl {
+    // Where everything sits for the current state (flipped card points).
+    struct Layout {
+        bool drawer = false;
+        bool pill = false;
+        CGRect pillRect = CGRectZero;
+        CGRect hintRect = CGRectZero;
+        double answerShown = 0;
+        double height = kSpotlightBaseHeight;
+    };
+
     CuaSpotlight *q = nullptr;
     bool offscreen = false;
     SpotlightState s;
+    Layout lay;
     std::function<void(int *, QString *)> probe;
     QRectF virtualScreen{0, 0, 1440, 900};
 
     LapisSpotlightPanel *panel = nil;
     LapisSpotlightFieldDelegate *delegate = nil;
-    NSView *card = nil;            // tinted overlay carrying the border
-    NSView *dot = nil;
-    NSTextField *title = nil;
-    NSView *pill = nil;
-    NSTextField *pillText = nil;
-    NSTextField *hint = nil;
-    NSView *inputBox = nil;
+    LapisSpotlightSurface *surface = nil;
+    LapisSpotlightHintBar *hintBar = nil;
     NSTextField *input = nil;
-    NSView *divider = nil;
-    NSTextField *question = nil;
     NSScrollView *answerScroll = nil;
     NSTextView *answerView = nil;
+    NSTimer *pulseTimer = nil;         // redraws the hint's listening pulse
     NSMutableArray *orderedOut = nil;  // Studio windows ordered out so activation stays on this Space
     id activeObserver = nil;
     id resignObserver = nil;
@@ -126,17 +247,172 @@ struct CuaSpotlight::Impl {
             s.alpha = !s.open ? 0.0 : (s.actionRunning ? 0.0 : 1.0);
         }
     }
-    // Offscreen: a rough line estimate (14 pt text, ~7.4 pt per glyph, 18 pt lines).
-    double estimateAnswerHeight() const
+
+    // ---- text styles -------------------------------------------------------------------------
+    // The answer: Avenir Next Regular 15 pt #d9cfc3 with 4 pt line spacing. A bare status line
+    // ("Thinking…") is the accent while busy, else dim.
+    NSAttributedString *bodyAttributed() const
     {
-        const QString t = bodyText();
-        if (t.isEmpty())
+        NSMutableParagraphStyle *style = [[[NSMutableParagraphStyle alloc] init] autorelease];
+        style.lineSpacing = 4;
+        const bool status = s.answer.isEmpty();
+        NSColor *color = status ? ((s.busy || s.actionRunning) ? hex(accentRgb(), 0.9) : hex(kDim)) : hex(kBodyText);
+        return [[[NSAttributedString alloc]
+            initWithString:ns(bodyText())
+                attributes:@{NSForegroundColorAttributeName: color,
+                             NSFontAttributeName: avenir(@"AvenirNext-Regular", 15, NSFontWeightRegular),
+                             NSParagraphStyleAttributeName: style}] autorelease];
+    }
+    static double measure(NSAttributedString *as, double width)
+    {
+        if (as.length == 0)
             return 0;
-        const double perLine = std::max(1.0, std::floor((kW - 32) / 7.4));
-        double lines = 0;
-        for (const QString &para : t.split(QLatin1Char('\n')))
-            lines += std::max(1.0, std::ceil(para.size() / perLine));
-        return lines * 18;
+        const NSRect r = [as boundingRectWithSize:NSMakeSize(width, 1e5)
+                                          options:NSStringDrawingUsesLineFragmentOrigin | NSStringDrawingUsesFontLeading];
+        return std::ceil(r.size.height);
+    }
+    NSAttributedString *pillAttributed() const
+    {
+        NSFont *f = menlo(11.5);
+        NSMutableAttributedString *as = [[[NSMutableAttributedString alloc]
+            initWithString:@"in "
+                attributes:@{NSFontAttributeName: f, NSForegroundColorAttributeName: hex(kDim)}] autorelease];
+        [as appendAttributedString:[[[NSAttributedString alloc]
+                                       initWithString:ns(s.targetApp)
+                                           attributes:@{NSFontAttributeName: f, NSForegroundColorAttributeName: hex(kInk)}] autorelease]];
+        return as;
+    }
+    NSDictionary *questionAttrs() const
+    {
+        NSMutableParagraphStyle *style = [[[NSMutableParagraphStyle alloc] init] autorelease];
+        style.lineBreakMode = NSLineBreakByTruncatingTail;
+        return @{NSFontAttributeName: avenir(@"AvenirNext-Medium", 13.5, NSFontWeightMedium),
+                 NSForegroundColorAttributeName: hex(accentRgb()), NSParagraphStyleAttributeName: style};
+    }
+    NSAttributedString *placeholderAttributed() const
+    {
+        return [[[NSAttributedString alloc]
+            initWithString:ns(s.placeholder)
+                attributes:@{NSForegroundColorAttributeName: hex(kMuted), NSFontAttributeName: promptFont()}] autorelease];
+    }
+
+    // The layout for `answerH` points of answer body.
+    Layout layoutFor(double answerH) const
+    {
+        Layout l;
+        l.drawer = s.drawerVisible;
+        const double hw = std::min(300.0, hintWidth(s.listening));
+        l.hintRect = CGRectMake(kW - 16 - hw, kHintTop, hw, kHintH);
+        l.pill = !s.targetApp.isEmpty();
+        if (l.pill) {
+            const double textW = std::ceil([pillAttributed() size].width);
+            const double maxPill = kW - 16 - hw - 12 - 84;
+            const double tw = std::max(0.0, std::min(maxPill - 18, textW));
+            l.pillRect = CGRectMake(84, 13, tw + 18, 20);
+        }
+        if (l.drawer)
+            l.answerShown = std::min(kSpotlightAnswerMaxHeight, std::max(18.0, answerH));
+        l.height = spotlightHeight(l.drawer, l.drawer ? l.answerShown : 0);
+        return l;
+    }
+
+    // The card and every non-control element, y-down card points; `withControls` also draws the
+    // hint, prompt and answer (offscreen render) that live views draw themselves on screen.
+    void paint(CGContextRef ctx, const Layout &l, bool withControls, double now) const
+    {
+        @autoreleasepool {
+            const CGRect card = CGRectMake(0, 0, kW, l.height);
+            // Card #0d0c0b at 95%, radius 16, a 1 pt accent border (42%, 72% while listening).
+            fillRounded(ctx, card, 16, hex(kCard, 0.95), hex(accentRgb(), s.listening ? 0.72 : 0.42));
+            // Top row: the status dot (secondary at rest, accent while live), "Lapis", the pill.
+            const bool live = s.listening || s.busy || s.actionRunning;
+            CGContextSetFillColorWithColor(ctx, hex(live ? accentRgb() : secondaryRgb()).CGColor);
+            CGContextFillEllipseInRect(ctx, CGRectMake(16, 19, 8, 8));
+            NSFont *titleFont = avenir(@"AvenirNext-DemiBold", 13.5, NSFontWeightSemibold);
+            const double titleH = std::ceil(titleFont.ascender - titleFont.descender);
+            [@"Lapis" drawAtPoint:NSMakePoint(32, 23 - titleH / 2)
+                   withAttributes:@{NSFontAttributeName: titleFont, NSForegroundColorAttributeName: hex(kInk)}];
+            if (l.pill) {
+                fillRounded(ctx, l.pillRect, 10, hex(kCardHi), hex(kHairline));
+                NSAttributedString *pt = pillAttributed();
+                const double ph = std::ceil(menlo(11.5).ascender - menlo(11.5).descender);
+                [pt drawWithRect:NSMakeRect(l.pillRect.origin.x + 9, CGRectGetMidY(l.pillRect) - ph / 2,
+                                            l.pillRect.size.width - 18, ph)
+                         options:NSStringDrawingTruncatesLastVisibleLine | NSStringDrawingUsesLineFragmentOrigin];
+            }
+            // The prompt box: #050404, #1d1915 hairline (accent 65% while listening).
+            const CGRect box = CGRectMake(12, 44, kW - 24, 42);
+            fillRounded(ctx, box, 10, hex(kInputBg), s.listening ? hex(accentRgb(), 0.65) : hex(kHairline));
+            if (l.drawer) {
+                CGContextSetFillColorWithColor(ctx, hex(kHairline).CGColor);
+                CGContextFillRect(ctx, CGRectMake(1, kSpotlightBaseHeight, kW - 2, 1));
+                if (!s.lastQuestion.isEmpty())
+                    [ns(QStringLiteral("› ") + s.lastQuestion) drawInRect:NSMakeRect(16, kSpotlightBaseHeight + 10, kW - 32, 20)
+                                                           withAttributes:questionAttrs()];
+            }
+            if (!withControls)
+                return;
+            const double period = 1.2, phase = std::fmod(std::max(0.0, now), period) / period;
+            paintHint(ctx, l.hintRect, s.listening, phase);
+            // Prompt text (or placeholder) where the field draws it, with the caret when key.
+            NSFont *pf = promptFont();
+            const double lineH = std::ceil(pf.ascender - pf.descender);
+            const NSPoint at = NSMakePoint(box.origin.x + 16, CGRectGetMidY(box) - lineH / 2);
+            double caretX = at.x - 3;  // before the placeholder, not over its first glyph
+            if (!s.inputText.isEmpty()) {
+                NSDictionary *a = @{NSFontAttributeName: pf, NSForegroundColorAttributeName: hex(kInk)};
+                [ns(s.inputText) drawAtPoint:at withAttributes:a];
+                caretX = at.x + std::ceil([ns(s.inputText) sizeWithAttributes:a].width) + 1;
+            } else {
+                [placeholderAttributed() drawAtPoint:at];
+            }
+            if (s.open && s.key && !s.actionRunning) {
+                CGContextSetFillColorWithColor(ctx, hex(accentRgb()).CGColor);
+                CGContextFillRect(ctx, CGRectMake(caretX, CGRectGetMidY(box) - 10, 2, 20));
+            }
+            if (l.drawer) {
+                const CGRect ar = CGRectMake(16, kSpotlightBaseHeight + 35, kW - 32, l.answerShown);
+                CGContextSaveGState(ctx);
+                CGContextClipToRect(ctx, ar);
+                [bodyAttributed() drawWithRect:NSMakeRect(ar.origin.x, ar.origin.y, ar.size.width, 1e5)
+                                       options:NSStringDrawingUsesLineFragmentOrigin | NSStringDrawingUsesFontLeading];
+                CGContextRestoreGState(ctx);
+            }
+        }
+    }
+
+    QImage renderImage(double scale) const
+    {
+        if (!std::isfinite(scale) || scale <= 0 || scale > 8)
+            return {};
+        Impl copy;  // never touches the live views: a pure function of the state
+        copy.s = s;
+        copy.s.inputText = fieldText();
+        copy.offscreen = true;
+        copy.syncDerived();
+        copy.s.key = s.open && (offscreen || (panel && panel.keyWindow));
+        const Layout l = copy.layoutFor(measure(copy.bodyAttributed(), kW - 32));
+        const int w = int(std::ceil(kW * scale)), h = int(std::ceil(l.height * scale));
+        QImage img(w, h, QImage::Format_RGBA8888_Premultiplied);
+        img.fill(Qt::transparent);
+        @autoreleasepool {
+            CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+            CGContextRef ctx = CGBitmapContextCreate(img.bits(), size_t(w), size_t(h), 8, size_t(img.bytesPerLine()), cs,
+                                                     uint32_t(kCGImageAlphaPremultipliedLast) | uint32_t(kCGBitmapByteOrder32Big));
+            CGColorSpaceRelease(cs);
+            if (!ctx)
+                return {};
+            CGContextTranslateCTM(ctx, 0, h);
+            CGContextScaleCTM(ctx, scale, -scale);
+            NSGraphicsContext *previous = [[NSGraphicsContext currentContext] retain];
+            [NSGraphicsContext setCurrentContext:[NSGraphicsContext graphicsContextWithCGContext:ctx flipped:YES]];
+            copy.paint(ctx, l, true, 0.15);
+            [NSGraphicsContext setCurrentContext:previous];
+            [previous release];
+            CGContextRelease(ctx);
+        }
+        img.setDevicePixelRatio(scale);
+        return img;
     }
 
     void currentScreen(QRectF *out) const
@@ -159,28 +435,6 @@ struct CuaSpotlight::Impl {
     }
 
     // ---- AppKit ------------------------------------------------------------------------------
-    NSTextField *makeLabel(NSFont *font, NSColor *color)
-    {
-        NSTextField *l = [NSTextField labelWithString:@""];
-        l.font = font;
-        l.textColor = color;
-        l.drawsBackground = NO;
-        l.bezeled = NO;
-        l.editable = NO;
-        l.selectable = NO;
-        l.lineBreakMode = NSLineBreakByTruncatingTail;
-        l.usesSingleLineMode = YES;
-        return l;
-    }
-    NSView *makeLayerView(Class cls, NSRect frame, NSColor *bg, double radius)
-    {
-        NSView *v = [[[cls alloc] initWithFrame:frame] autorelease];
-        v.wantsLayer = YES;
-        v.layer.backgroundColor = bg.CGColor;
-        v.layer.cornerRadius = radius;
-        return v;
-    }
-
     void build()
     {
         @autoreleasepool {
@@ -198,66 +452,37 @@ struct CuaSpotlight::Impl {
             panel.becomesKeyOnlyIfNeeded = NO;
             panel.level = NSStatusWindowLevel;
             panel.sharingType = NSWindowSharingNone;  // never in ScreenCaptureKit or the shadow recorder
+            panel.appearance = [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
             // CanJoinAllSpaces and MoveToActiveSpace are mutually exclusive (AppKit raises on
             // both): all-Spaces wins, so the bar is already on whichever Space is active.
             panel.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces
                                        | NSWindowCollectionBehaviorFullScreenAuxiliary
                                        | NSWindowCollectionBehaviorIgnoresCycle;
 
-            NSVisualEffectView *fx = [[[NSVisualEffectView alloc] initWithFrame:NSMakeRect(0, 0, kW, kSpotlightBaseHeight)] autorelease];
-            fx.material = NSVisualEffectMaterialHUDWindow;
-            fx.blendingMode = NSVisualEffectBlendingModeBehindWindow;
-            fx.state = NSVisualEffectStateActive;
-            fx.appearance = [NSAppearance appearanceNamed:NSAppearanceNameVibrantDark];
-            fx.wantsLayer = YES;
-            fx.layer.cornerRadius = 16;
-            fx.layer.masksToBounds = YES;
-            fx.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-            panel.contentView = fx;
+            surface = [[[LapisSpotlightSurface alloc] initWithFrame:NSMakeRect(0, 0, kW, kSpotlightBaseHeight)] autorelease];
+            surface.owner = this;
+            surface.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+            panel.contentView = surface;
 
-            card = makeLayerView([LapisSpotlightFlipped class], fx.bounds, hex(0x12141A, 0.90), 16);
-            card.layer.borderWidth = 1;
-            card.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-            [fx addSubview:card];
+            hintBar = [[[LapisSpotlightHintBar alloc] initWithFrame:NSMakeRect(kW - 16 - 200, kHintTop, 200, kHintH)] autorelease];
+            [surface addSubview:hintBar];
 
-            dot = makeLayerView([NSView class], NSMakeRect(16, 19, 8, 8), hex(kDimGold), 4);
-            [card addSubview:dot];
-            title = makeLabel([NSFont systemFontOfSize:13 weight:NSFontWeightSemibold], hex(0xF3EFE6));
-            title.stringValue = @"Lapis";
-            [card addSubview:title];
-            pill = makeLayerView([LapisSpotlightFlipped class], NSZeroRect, hex(0x1D212B), 9);
-            [card addSubview:pill];
-            pillText = makeLabel([NSFont monospacedSystemFontOfSize:12 weight:NSFontWeightRegular], hex(0x9AA4B2));
-            [pill addSubview:pillText];
-            hint = makeLabel([NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightRegular], hex(0x7D8590));
-            hint.alignment = NSTextAlignmentRight;
-            [card addSubview:hint];
-
-            inputBox = makeLayerView([LapisSpotlightFlipped class], NSMakeRect(12, 44, kW - 24, 42), hex(0x0B0D12), 10);
-            inputBox.layer.borderWidth = 1;
-            inputBox.layer.borderColor = hex(0x262B36).CGColor;
-            [card addSubview:inputBox];
-            input = [[[NSTextField alloc] initWithFrame:NSMakeRect(14, 9, kW - 24 - 28, 24)] autorelease];
+            input = [[[NSTextField alloc] initWithFrame:NSMakeRect(12 + 14, 44 + 9, kW - 24 - 28, 24)] autorelease];
             input.editable = YES;
             input.selectable = YES;
             input.bezeled = NO;
             input.bordered = NO;
             input.drawsBackground = NO;
             input.focusRingType = NSFocusRingTypeNone;
-            input.font = [NSFont systemFontOfSize:18];
-            input.textColor = hex(0xF3EFE6);
+            input.font = promptFont();
+            input.textColor = hex(kInk);
             input.usesSingleLineMode = YES;
             input.cell.scrollable = YES;
             input.cell.wraps = NO;
             delegate = [[LapisSpotlightFieldDelegate alloc] init];
             delegate.owner = this;
             input.delegate = delegate;
-            [inputBox addSubview:input];
-
-            divider = makeLayerView([NSView class], NSZeroRect, hex(0x222630), 0);
-            [card addSubview:divider];
-            question = makeLabel([NSFont systemFontOfSize:12.5], hex(0x8B949E));
-            [card addSubview:question];
+            [surface addSubview:input];
 
             answerScroll = [[[NSScrollView alloc] initWithFrame:NSMakeRect(16, 130, kW - 32, 20)] autorelease];
             answerScroll.drawsBackground = NO;
@@ -265,6 +490,7 @@ struct CuaSpotlight::Impl {
             answerScroll.hasVerticalScroller = YES;
             answerScroll.autohidesScrollers = YES;
             answerScroll.scrollerStyle = NSScrollerStyleOverlay;
+            answerScroll.scrollerKnobStyle = NSScrollerKnobStyleLight;
             answerView = [[[NSTextView alloc] initWithFrame:NSMakeRect(0, 0, kW - 32, 20)] autorelease];
             answerView.editable = NO;
             answerView.selectable = YES;
@@ -276,7 +502,7 @@ struct CuaSpotlight::Impl {
             answerView.horizontallyResizable = NO;
             answerView.autoresizingMask = NSViewWidthSizable;
             answerScroll.documentView = answerView;
-            [card addSubview:answerScroll];
+            [surface addSubview:answerScroll];
 
             orderedOut = [[NSMutableArray alloc] init];
             Impl *owner = this;
@@ -303,8 +529,34 @@ struct CuaSpotlight::Impl {
         }
     }
 
+    void stopPulse()
+    {
+        [pulseTimer invalidate];
+        [pulseTimer release];
+        pulseTimer = nil;
+    }
+    // The hint's listening dot breathes: redraw only the hint bar, ~30 fps, only while listening.
+    void syncPulse()
+    {
+        const bool want = panel && s.open && s.listening;
+        if (!want) {
+            stopPulse();
+            return;
+        }
+        if (pulseTimer)
+            return;
+        LapisSpotlightHintBar *bar = hintBar;
+        pulseTimer = [[NSTimer timerWithTimeInterval:1.0 / 30 repeats:YES block:^(NSTimer *t) {
+            (void)t;
+            bar.phase = std::fmod([[NSProcessInfo processInfo] systemUptime], 1.2) / 1.2;
+            [bar setNeedsDisplay:YES];
+        }] retain];
+        [[NSRunLoop mainRunLoop] addTimer:pulseTimer forMode:NSRunLoopCommonModes];
+    }
+
     void teardown()
     {
+        stopPulse();
         if (activeObserver) {
             [[NSNotificationCenter defaultCenter] removeObserver:activeObserver];
             [activeObserver release];
@@ -317,6 +569,7 @@ struct CuaSpotlight::Impl {
         }
         if (panel) {
             input.delegate = nil;
+            surface.owner = nullptr;
             panel.owner = nullptr;
             [panel orderOut:nil];
             [panel close];
@@ -342,62 +595,40 @@ struct CuaSpotlight::Impl {
     {
         syncDerived();
         double answerH = 0;
-        if (offscreen) {
-            answerH = estimateAnswerHeight();
-        } else if (panel) {
+        if (offscreen || !panel) {
+            if (s.drawerVisible)
+                answerH = measure(bodyAttributed(), kW - 32);
+        } else {
             @autoreleasepool {
-                const uint32_t dotRgb = s.listening ? kGold : ((s.busy || s.actionRunning) ? kSapphire : kDimGold);
-                dot.layer.backgroundColor = hex(dotRgb).CGColor;
-                card.layer.borderColor = hex(kBorderGold, s.listening ? 0.65 : 0.35).CGColor;
-                inputBox.layer.borderColor = (s.listening ? hex(kBorderGold, 0.65) : hex(0x262B36)).CGColor;
-                // Top row: dot, "Lapis", the context pill, the hint on the right.
-                title.frame = NSMakeRect(32, 14, 44, 18);
-                const bool hasPill = !s.targetApp.isEmpty();
-                pill.hidden = !hasPill;
-                hint.stringValue = ns(s.hint);
-                hint.textColor = s.listening ? hex(kGold) : hex(0x7D8590);
-                [hint sizeToFit];
-                const double hintW = std::min(260.0, double(hint.frame.size.width));
-                hint.frame = NSMakeRect(kW - 16 - hintW, 15, hintW, 16);
-                if (hasPill) {
-                    pillText.stringValue = ns(QStringLiteral("in ") + s.targetApp);
-                    [pillText sizeToFit];
-                    const double maxPill = kW - 16 - hintW - 12 - 84;
-                    const double tw = std::min(maxPill - 18, double(pillText.frame.size.width));
-                    pill.frame = NSMakeRect(84, 13, tw + 18, 20);
-                    pillText.frame = NSMakeRect(9, 2, tw, 16);
-                }
-                NSString *ph = ns(s.placeholder);
-                input.placeholderAttributedString = [[[NSAttributedString alloc]
-                    initWithString:ph
-                        attributes:@{NSForegroundColorAttributeName: hex(0x5C6370),
-                                     NSFontAttributeName: [NSFont systemFontOfSize:18]}] autorelease];
-                // Drawer.
+                input.placeholderAttributedString = placeholderAttributed();
+                input.textColor = hex(kInk);
                 const bool d = s.drawerVisible;
-                divider.hidden = question.hidden = answerScroll.hidden = !d;
+                answerScroll.hidden = !d;
                 if (d) {
-                    divider.frame = NSMakeRect(0, kSpotlightBaseHeight, kW, 1);
-                    question.stringValue = s.lastQuestion.isEmpty() ? @"" : ns(QStringLiteral("› ") + s.lastQuestion);
-                    question.frame = NSMakeRect(16, kSpotlightBaseHeight + 11, kW - 32, 18);
-                    const bool status = s.answer.isEmpty();
-                    NSColor *color = status ? (s.busy || s.actionRunning ? hex(0x58A6FF) : hex(0x8B949E)) : hex(0xE6EDF3);
-                    NSAttributedString *body = [[[NSAttributedString alloc]
-                        initWithString:ns(bodyText())
-                            attributes:@{NSForegroundColorAttributeName: color,
-                                         NSFontAttributeName: [NSFont systemFontOfSize:14]}] autorelease];
-                    [answerView.textStorage setAttributedString:body];
+                    [answerView.textStorage setAttributedString:bodyAttributed()];
+                    answerView.selectedTextAttributes = @{NSBackgroundColorAttributeName: hex(accentRgb(), 0.28)};
                     answerView.frame = NSMakeRect(0, 0, kW - 32, answerView.frame.size.height);
                     [answerView.layoutManager ensureLayoutForTextContainer:answerView.textContainer];
                     answerH = std::ceil([answerView.layoutManager usedRectForTextContainer:answerView.textContainer].size.height);
-                    const double shown = std::min(kSpotlightAnswerMaxHeight, std::max(18.0, answerH));
-                    answerScroll.frame = NSMakeRect(16, kSpotlightBaseHeight + 35, kW - 32, shown);
-                    if (s.busy)
-                        [answerView scrollRangeToVisible:NSMakeRange(answerView.string.length, 0)];
-                    answerH = shown;
                 }
             }
         }
-        const double h = spotlightHeight(s.drawerVisible, s.drawerVisible ? std::max(18.0, answerH) : 0);
+        lay = layoutFor(answerH);
+        if (panel) {
+            @autoreleasepool {
+                hintBar.frame = NSRectFromCGRect(lay.hintRect);
+                hintBar.listening = s.listening;
+                [hintBar setNeedsDisplay:YES];
+                if (lay.drawer) {
+                    answerScroll.frame = NSMakeRect(16, kSpotlightBaseHeight + 35, kW - 32, lay.answerShown);
+                    if (s.busy)
+                        [answerView scrollRangeToVisible:NSMakeRange(answerView.string.length, 0)];
+                }
+                [surface setNeedsDisplay:YES];
+            }
+            syncPulse();
+        }
+        const double h = lay.height;
         QRectF f;
         if (reposition || !s.frame.isValid()) {
             QRectF screen;
@@ -420,8 +651,14 @@ struct CuaSpotlight::Impl {
             return;
         [panel makeKeyWindow];
         [panel makeFirstResponder:input];
-        if (NSText *ed = [input currentEditor])
+        if (NSText *ed = [input currentEditor]) {
             [ed setSelectedRange:NSMakeRange(input.stringValue.length, 0)];
+            if ([ed isKindOfClass:[NSTextView class]]) {
+                NSTextView *tv = (NSTextView *)ed;
+                tv.insertionPointColor = hex(accentRgb());
+                tv.selectedTextAttributes = @{NSBackgroundColorAttributeName: hex(accentRgb(), 0.28)};
+            }
+        }
     }
 
     void snapshotTarget()
@@ -534,6 +771,7 @@ struct CuaSpotlight::Impl {
         if (was)
             ++s.dismissals;
         syncDerived();
+        stopPulse();
         if (panel) {
             [panel orderOut:nil];
             panel.alphaValue = 1.0;
@@ -621,6 +859,29 @@ struct CuaSpotlight::Impl {
 }
 @end
 
+@implementation LapisSpotlightSurface
+- (BOOL)isFlipped { return YES; }
+- (BOOL)isOpaque { return NO; }
+- (void)drawRect:(NSRect)dirtyRect
+{
+    CGContextRef ctx = [NSGraphicsContext currentContext].CGContext;
+    CGContextClearRect(ctx, dirtyRect);
+    if (self.owner)
+        self.owner->paint(ctx, self.owner->lay, false, 0);
+}
+@end
+
+@implementation LapisSpotlightHintBar
+- (BOOL)isFlipped { return YES; }
+- (BOOL)isOpaque { return NO; }
+- (NSView *)hitTest:(NSPoint)point { (void)point; return nil; }
+- (void)drawRect:(NSRect)dirtyRect
+{
+    (void)dirtyRect;
+    paintHint([NSGraphicsContext currentContext].CGContext, NSRectToCGRect(self.bounds), self.listening, self.phase);
+}
+@end
+
 @implementation LapisSpotlightFieldDelegate
 - (BOOL)control:(NSControl *)control textView:(NSTextView *)textView doCommandBySelector:(SEL)selector
 {
@@ -647,19 +908,33 @@ uint32_t spotlightWindowNumber()
     return g_liveSpotlight ? g_liveSpotlight->windowNumber() : 0;
 }
 
+void setSpotlightLapisBlue(bool lapisBlue) { g_lapisBlue.store(lapisBlue); }
+
+bool spotlightLapisBlue() { return g_lapisBlue.load(); }
+
+void refreshSpotlightTheme()
+{
+    if (g_liveImpl && g_liveImpl->panel)
+        g_liveImpl->render(false);
+}
+
 CuaSpotlight::CuaSpotlight(Mode mode) : impl(std::make_unique<Impl>())
 {
     impl->q = this;
     impl->offscreen = mode == Mode::Offscreen;
     impl->syncDerived();
-    if (!impl->offscreen)
+    if (!impl->offscreen) {
         g_liveSpotlight = this;
+        g_liveImpl = impl.get();
+    }
 }
 
 CuaSpotlight::~CuaSpotlight()
 {
-    if (g_liveSpotlight == this)
+    if (g_liveSpotlight == this) {
         g_liveSpotlight = nullptr;
+        g_liveImpl = nullptr;
+    }
     impl->teardown();
 }
 
@@ -796,6 +1071,66 @@ SpotlightState CuaSpotlight::state() const
         out.alpha = impl->s.open ? impl->panel.alphaValue : 0.0;
     }
     return out;
+}
+
+QImage CuaSpotlight::render(double scale) const { return impl->renderImage(scale); }
+
+// ---- --snap-spotlight ----------------------------------------------------------------------------
+
+int snapSpotlight(const QString &outPath)
+{
+    const auto chrome = [](int *pid, QString *name) { *pid = 4242; *name = QStringLiteral("Google Chrome"); };
+    const QString answer = QStringLiteral(
+        "That error means the page asked for a cookie the browser has blocked, so the sign-in "
+        "form never gets its session token and quietly reloads.\n\n"
+        "Open Settings, Privacy, Third-party cookies, and allow them for accounts.example.com, then "
+        "reload the tab. If it still loops, clear that site's data and sign in again.");
+    QVector<QImage> shots;
+    const bool wasBlue = spotlightLapisBlue();
+    for (int i = 0; i < 4; ++i) {
+        setSpotlightLapisBlue(i == 3);
+        CuaSpotlight sp(CuaSpotlight::Mode::Offscreen);
+        sp.setFrontmostProbe(chrome);
+        sp.openOrFocus();
+        if (i == 1) {
+            sp.setListening(true);
+            sp.setInputText(QStringLiteral("summarize this thread and draft a reply"));
+        } else if (i >= 2) {
+            sp.beginTurn(QStringLiteral("why does the sign in page keep reloading?"));
+            sp.setAnswer(answer);
+            sp.setBusy(false);
+        }
+        shots.push_back(sp.render(2));
+    }
+    setSpotlightLapisBlue(wasBlue);
+    double h = 32;
+    for (const QImage &s : shots) {
+        if (s.isNull()) {
+            std::fprintf(stderr, "snap-spotlight: render failed\n");
+            return 2;
+        }
+        h += s.height() / 2.0 + 32;
+    }
+    const double scale = 2, margin = 32;
+    QImage out(int((kSpotlightWidth + 2 * margin) * scale), int(h * scale), QImage::Format_RGBA8888_Premultiplied);
+    out.fill(QColor(0, 0, 0));
+    QPainter p(&out);
+    p.setRenderHint(QPainter::SmoothPixmapTransform);
+    p.scale(scale, scale);
+    double y = margin;
+    for (QImage &s : shots) {
+        s.setDevicePixelRatio(scale);
+        p.drawImage(QPointF(margin, y), s);
+        y += s.height() / scale + 32;
+    }
+    p.end();
+    QDir().mkpath(QFileInfo(outPath).absolutePath());
+    if (!out.save(outPath)) {
+        std::fprintf(stderr, "snap-spotlight: could not write %s\n", qPrintable(outPath));
+        return 1;
+    }
+    std::printf("snap-spotlight: %s (%dx%d)\n", qPrintable(outPath), out.width(), out.height());
+    return 0;
 }
 
 }  // namespace studio::cua

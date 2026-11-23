@@ -224,6 +224,16 @@ StudioCommand parseStudioCommand(const QString &text);
 // Strips every leading [[ACTION:...]] tag from *answer (and the whitespace after it) and returns
 // the known actions in order. Unknown action names are dropped (still stripped).
 QList<StudioCommand> extractActionTags(QString *answer);
+// What a card shows for a model's raw reply: every [[ACTION:..]] tag anywhere is removed (the
+// backend runs it); a tag sitting between two runs of prose ("bar. [[ACTION:..]]x.com is ...")
+// becomes a paragraph break; [[IGNORE]] shows nothing. streaming: a tag still arriving at the
+// tail ("[[ACTION:cua_cl", "[[", a lone "[") is cut so it never flashes for a frame. Mirrors
+// FloatingOmnibar.qml displayAnswer().
+QString answerDisplayText(const QString &raw, bool streaming = false);
+// The delta a closed-loop CUA follow-up turn emits on its stream before the model's next reply,
+// so the follow-up prose starts a fresh paragraph: "\n\n" after prose, "\n" after a single
+// newline, "" when nothing is shown yet or it already ends in a blank line.
+QString cuaFollowupBreak(const QString &shownSoFar);
 // A visible computer-use action from a cua_click / cua_type / cua_scroll tag. cua_type's arg is
 // "<target>|<text>" (split at the first '|'); cua_scroll's is "<target>|<deltaY>" (split at the
 // last '|'; deltaY is an integer line count, positive scrolls up, or "up" / "down" for +-5).
@@ -754,6 +764,7 @@ private:
         int outstanding = 0;
         QVector<CuaStepResult> steps;
         QString goal;  // the user's own prompt (follow-ups keep it), for the CUA trace log
+        QString shownRaw;  // the raw reply that started it (what its card is showing at the tail)
     };
     CuaBatch m_cuaBatch;
     quint64 m_cuaBatchId = 0;  // bumped per batch and per reset: a stale action's result is dropped
