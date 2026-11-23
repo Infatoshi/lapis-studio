@@ -2976,6 +2976,8 @@ void Backend::finishQuick(bool ok)
     m_quickSeconds = m_quickClock.isValid() ? m_quickClock.elapsed() / 1000.0 : 0;
     m_quickElapsed = m_quickSeconds;
     m_quickTicker.stop();
+    if (m_cuaHud && m_cuaPending == 0 && !m_cuaFollowupScheduled && !m_spotlightTurn)
+        studio::cua::hideCuaReticle(studio::cua::kStepHideSec);
     emit quickChanged();
     emit quickTick();
 }
@@ -3386,6 +3388,9 @@ void Backend::onRouterFinished(const QString &streamId, const QString &error)
             h.remove(0, 2);  // drop the oldest exchange (re-prefills Tier 2 once)
         noteExchange(done.projectKey, compatModel(), userTurn, histAnswer);
     }
+    if (streamId != QLatin1String(kSpotlightStreamId) && m_cuaHud && m_cuaPending == 0 && !m_cuaFollowupScheduled
+        && !m_spotlightTurn && !m_quickBusy)
+        studio::cua::hideCuaReticle(studio::cua::kStepHideSec);
     emit streamFinished(streamId, error);
 }
 
@@ -6404,8 +6409,10 @@ void Backend::onCuaActionDone()
     // The queue drained: an interrupt's latch has done its job.
     if (studio::cua::cancelFlag.load())
         releaseCuaCancel();
-    // No step left: the cursor pops out (the last step's own 0.45 s fade, never left parked).
-    if (m_cuaHud && !m_cuaFollowupScheduled)
+    // Only hide the cursor here when no spotlight/quick/card turn or follow-up is still active;
+    // multi-step sessions keep the cursor visible between actions until the whole task finishes.
+    const bool batchStreaming = !m_cuaBatch.streamId.isEmpty() && m_streamAsks.contains(m_cuaBatch.streamId);
+    if (m_cuaHud && !m_cuaFollowupScheduled && !m_spotlightTurn && !m_quickBusy && !batchStreaming)
         studio::cua::hideCuaReticle(studio::cua::kStepHideSec);
     syncEscapeWatch();
 }
@@ -6475,7 +6482,7 @@ void Backend::syncSpotlightTurn()
     m_spotlightTurn = false;
     syncEscapeWatch();
     if (m_cuaHud)
-        studio::cua::hideCuaReticle(0);  // the turn is over: no cursor left on screen
+        studio::cua::hideCuaReticle(studio::cua::kStepHideSec);  // the session is over: fade the cursor out cleanly
     if (m_spotlightTurnRanCua) {
         // Acted on the app behind: leave that app frontmost; the exchange waits for the next L2.
         m_spotlight->finishAfterAction(m_spotlightLastAction.isEmpty() ? QStringLiteral("Done") : m_spotlightLastAction);

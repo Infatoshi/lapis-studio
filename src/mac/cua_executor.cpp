@@ -1030,8 +1030,8 @@ bool CuaExecutor::waitFrontmost(int pid, bool launched, int selfPid)
 
 void CuaExecutor::endStep() const
 {
-    if (m_hooks.reticleHideAfter)
-        m_hooks.reticleHideAfter(kStepHideSec);
+    // Leave the cursor visible between steps inside a multi-step CUA session;
+    // the session owner (Backend) hides it once the full interaction finishes or is interrupted.
 }
 
 void CuaExecutor::hud(const QString &status, HudTone tone) const

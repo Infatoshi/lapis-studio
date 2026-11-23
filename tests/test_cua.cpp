@@ -416,8 +416,8 @@ void executorTests() {
         check(close(res.globalPt, button.center()) && close(m.clickPt, button.center()), "exec L1: clicks the AXButton centre");
         check(m.highlightRect == button && close(m.pulsePt, button.center()), "exec L1: ring on the button, pulse at its centre");
         check(m.effects() == QStringList({"reticleHighlight", "reticlePulse", "click"}), "exec L1: highlight -> pulse -> click only");
-        check(m.hideAfters == QVector<double>({kStepHideSec}) && kStepHideSec == 0.45,
-            "exec hide: a finished click arms the cursor's 0.45 s pop-out");
+        check(m.hideAfters.isEmpty() && kStepHideSec == 0.45,
+            "exec hide: a finished click leaves the cursor up until the session ends");
         check(!m.calls.contains("capture") && !m.calls.contains("ground"), "exec L1: no capture, no grounding");
         check(m.calls.contains("inspectDisplay:7"), "exec L1: inspects the primary display");
         check(!m.clickDouble, "exec L1: single click by default");
@@ -518,7 +518,7 @@ void executorTests() {
         check(res.ok && res.tier == "L1_AX" && m.typed == "hello world", "exec type: ok, text typed");
         check(m.effects() == QStringList({"reticleHighlight", "reticlePulse", "click", "clear", "type"}),
             "exec type: highlight -> pulse -> click -> clear -> type");
-        check(m.hideAfters == QVector<double>({kStepHideSec}), "exec hide: a finished type arms the pop-out once");
+        check(m.hideAfters.isEmpty(), "exec hide: a finished type leaves the cursor up until the session ends");
         MockRig f;
         f.ground.ok = false;
         CuaExecutor exf(f.hooks());
@@ -630,7 +630,7 @@ void executorTests() {
         const auto res = ex.scrollTarget("results", -5);
         check(res.ok && res.tier == "L1_AX" && close(m.scrollPt, list.center()) && m.scrollDy == -5, "exec scroll: scrolls the AX target");
         check(m.effects() == QStringList({"reticleHighlight", "reticleMove", "scroll"}), "exec scroll: highlight -> move -> scroll");
-        check(m.hideAfters == QVector<double>({kStepHideSec}), "exec hide: a finished scroll arms the pop-out");
+        check(m.hideAfters.isEmpty(), "exec hide: a finished scroll leaves the cursor up until the session ends");
         MockRig c;
         c.ground.ok = false;
         CuaExecutor exc(c.hooks());
@@ -1319,7 +1319,7 @@ void hotkeyDragTests() {
         const QStringList fx = m.effects();
         check(fx == QStringList({"reticleHighlight", "reticleHighlight", "reticleMove", "reticlePulse", "reticleMove", "drag"}),
             "drag exec: locate both, glide to from, pulse, glide to to, drag");
-        check(m.hideAfters == QVector<double>({kStepHideSec}), "exec hide: a finished drag arms the pop-out");
+        check(m.hideAfters.isEmpty(), "exec hide: a finished drag leaves the cursor up until the session ends");
         check(close(m.pulsePt, {110, 410}) && close(m.movePt, {620, 410}), "drag exec: pulse at from, reticle ends at to");
         check(m.huds.contains("working|Dragging slider handle to volume max")
                   && m.huds.last() == "done|Done · Dragged slider handle to volume max",

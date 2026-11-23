@@ -90,9 +90,10 @@ constexpr double kPoke = 0.42;        // click poke and rebound
 constexpr double kBurst = 0.46;       // click starburst, ticks, stars, puffs
 constexpr double kFocusIn = 0.22, kIdle = 1.8, kFade = 0.45;
 // The cursor's own pop-out: once hideAt passes, the glove fades over kCursorOut, then the panel
-// orders out. Visible mode arms it on its own: kAutoHideAfterPulse once a click burst ends, or
-// kAutoHideAfterMove once a glide or a frame settles with no newer cursor command.
-constexpr double kCursorOut = 0.16, kAutoHideAfterPulse = 0.55, kAutoHideAfterMove = 0.65;
+// orders out. The session owner hides the cursor explicitly when a CUA task finishes; these long
+// Visible-mode timers only act as an orphan safety guard so the cursor never blinks away between
+// multi-step actions while waiting on a follow-up model turn.
+constexpr double kCursorOut = 0.16, kAutoHideAfterPulse = 30.0, kAutoHideAfterMove = 30.0;
 constexpr double kNever = -1e9, kForever = 1e18;
 constexpr double kHudIn = 0.22, kHudOut = 0.40, kHudLinger = studio::cua::kHudLingerSec, kHudPad = 30;
 constexpr double kRestAngle = -28;    // degrees; the hand's natural tilt (finger up-left)
