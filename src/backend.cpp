@@ -3133,10 +3133,14 @@ QVector<JarvisLeg> Backend::chatLegs(const QString &streamId) const
 QString Backend::legEffort(const QVector<JarvisLeg> &legs, bool followup) const
 {
     QString base = isInklingModel(m_chatModel) ? m_chatEffort : compatEffort();
-    // Inkling 2 Mini at zero-think (0.0) drops [[ACTION:...]] tags on multi-turn CUA loops;
-    // low (0.2) keeps ~425 ms E2E on fast hardware while reliably emitting action tags.
-    if (!legs.isEmpty() && isInklingModel(legs.first().model) && (base.isEmpty() || isNoThinkEffort(base)))
-        base = QStringLiteral("low");
+    if (!legs.isEmpty() && isInklingModel(legs.first().model)) {
+        // Empirical sweet spot on Inkling 2 Mini: forced zero-think (0.0) for clean Turn-0 reflexes
+        // (~160 ms), 0.05 ("micro") for visual CUA follow-ups, L2 interrupts, and ERR recoveries.
+        if (followup || m_jarvisSupersedes != 0 || m_cuaPrevStepErr)
+            base = QStringLiteral("micro");
+        else if (base.isEmpty() || base == QLatin1String("low") || isNoThinkEffort(base))
+            base = QStringLiteral("fast");
+    }
     return jarvisEscalatedEffort(base, m_cuaLoopDepth, followup && m_cuaPrevStepErr);
 }
 

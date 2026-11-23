@@ -77,6 +77,8 @@ bool isInklingModel(const QString &model)
 
 double inklingReasoningEffort(const QString &effort)
 {
+    if (effort == QLatin1String("micro"))
+        return 0.05;
     if (effort == QLatin1String("low"))
         return 0.2;
     if (effort == QLatin1String("medium"))
@@ -179,7 +181,9 @@ QByteArray buildOpenRouterChatRequest(const TieredPrompt &p)
     body.insert(QStringLiteral("model"), p.model);
     body.insert(QStringLiteral("stream"), true);
     body.insert(QStringLiteral("messages"), msgs);
-    const QString effort = p.effort.isEmpty() || isNoThinkEffort(p.effort) ? QStringLiteral("none") : p.effort;
+    const QString effort = p.effort.isEmpty() || isNoThinkEffort(p.effort) ? QStringLiteral("none")
+                           : p.effort == QLatin1String("micro")            ? QStringLiteral("minimal")
+                                                                           : p.effort;
     body.insert(QStringLiteral("reasoning"), QJsonObject{{QStringLiteral("effort"), effort}});
     if (isInklingModel(p.model)) {
         // Inkling: PrimeIntellect's FP4 deployment only (the one measured for Jarvis), greedy,

@@ -7398,7 +7398,7 @@ void jarvisFailoverTests()
     check(body.value("model") == "thinkingmachines/inkling-2-mini"
               && body.value("provider").toObject().value("order").toArray() == QJsonArray{"PrimeIntellect"}
               && hungBody.value("model") == "Infatoshi/Inkling-2-Mini-heretic"
-              && hungBody.value("chat_template_kwargs").toObject().value("reasoning_effort").toDouble(-1) == 0.2,
+              && hungBody.value("chat_template_kwargs").toObject().value("reasoning_effort").toDouble(-1) == 0.0,
           "jarvis failover: each leg sent its own model and request shape");
     check(b.jarvisBreakerOpen() && b.jarvisLegs().size() == 1 && b.jarvisLegs().value(0).name == "inkling",
           "jarvis failover: leg 1's breaker is open, the next plan skips it");
@@ -7465,11 +7465,12 @@ void inklingUniversalTests()
           "inkling universal: an island card asks the self-hosted Inkling leg first",
           QStringLiteral("%1/%2 %3").arg(self.bodies.size()).arg(backup.bodies.size()).arg(errors.join(';')));
     const QJsonObject first = QJsonDocument::fromJson(self.bodies.value(0)).object();
-    const QJsonObject firstLeaf = first.value("messages").toArray().last().toObject();
+    const QJsonArray firstMsgs = first.value("messages").toArray();
+    const QJsonObject firstLeaf = firstMsgs.size() >= 2 ? firstMsgs.at(firstMsgs.size() - 2).toObject() : QJsonObject();
     check(first.value("model") == "Infatoshi/Inkling-2-Mini-heretic" && firstLeaf.value("role") == "user"
-              && firstLeaf.value("content").isString()
-              && first.value("chat_template_kwargs").toObject().value("reasoning_effort").toDouble(-1) == 0.2,
-          "inkling universal: a plain card turn sends Inkling a text-only leaf at low effort");
+              && firstLeaf.value("content").isString() && first.value("continue_final_message").toBool()
+              && first.value("chat_template_kwargs").toObject().value("reasoning_effort").toDouble(-1) == 0.0,
+          "inkling universal: a plain card turn sends Inkling a text-only leaf at 0.0 forced zero-think");
 
     const QByteArray jpeg("\xff\xd8\xff\xe0 FAKE-SCREENSHOT-BYTES for the leaf", 40);
     const QString b64 = QString::fromLatin1(jpeg.toBase64());
