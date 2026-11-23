@@ -3278,11 +3278,14 @@ void Backend::onRouterFinished(const QString &streamId, const QString &error)
         m_cuaAnswerGoal.clear();
         m_commandProject = keep;
         const QString userTurn = done.note.isEmpty() ? done.question : done.note;
+        // Keep the raw [[ACTION:...]] tags in Jarvis history so multi-turn CUA never imitates
+        // tag-stripped prose narration ("Opening Chrome...", "Doing it now.") on follow-up turns.
+        const QString histAnswer = streamId == QLatin1String(kSpotlightStreamId) ? done.answer.trimmed() : answer;
         QVector<ChatTurn> &h = m_streamHistory[streamId];
-        h << ChatTurn{QStringLiteral("user"), userTurn} << ChatTurn{QStringLiteral("assistant"), answer};
+        h << ChatTurn{QStringLiteral("user"), userTurn} << ChatTurn{QStringLiteral("assistant"), histAnswer};
         while (h.size() > kMaxStreamHistory)
             h.remove(0, 2);  // drop the oldest exchange (re-prefills Tier 2 once)
-        noteExchange(done.projectKey, compatModel(), userTurn, answer);
+        noteExchange(done.projectKey, compatModel(), userTurn, histAnswer);
     }
     emit streamFinished(streamId, error);
 }
@@ -3343,7 +3346,11 @@ void Backend::startConversation(const QString &streamId, const QString &projectK
     if (!legs.isEmpty()) {
         // Jarvis: the self-hosted leg first, then OpenRouter, all on this one stream id.
         TieredPrompt p = tieredPrompt(projectKey, slice, q, m_sharedHistory);
-        const QString base = isInklingModel(m_chatModel) ? m_chatEffort : compatEffort();
+        QString base = isInklingModel(m_chatModel) ? m_chatEffort : compatEffort();
+        // Inkling 2 Mini at zero-think (0.0) drops [[ACTION:...]] tags on multi-turn CUA loops;
+        // low (0.2) keeps ~425 ms E2E on fast hardware while reliably emitting action tags.
+        if (isInklingModel(legs.first().model) && (base.isEmpty() || isNoThinkEffort(base)))
+            base = QStringLiteral("low");
         p.effort = jarvisEscalatedEffort(base, m_cuaLoopDepth, followup && m_cuaPrevStepErr);
         const QString goal = followup ? m_cuaFollowupGoal : q;
         m_streamAsks.insert(streamId, StreamAsk{q, QString(), projectKey, followup ? m_cuaFollowupNote : QString(), goal});

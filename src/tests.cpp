@@ -5409,7 +5409,7 @@ void studioControlTests()
         check(b.dispatchStudioAction("cua_open", "Chrome|not a url").isEmpty() && b.cuaLog().size() == 3,
               "cua open: an invalid URL is not dispatched");
         check(studioActionNames().contains("cua_open") && kCompatSystemPrompt.contains("cua_open:<app>|<url>")
-                  && kCompatSystemPrompt.contains("[[ACTION:cua_open:Chrome|https://x.com/elonmusk]]")
+                  && kCompatSystemPrompt.contains("[[ACTION:cua_open:Chrome|https://example.com]]")
                   && kCompatSystemPrompt.contains("[[ACTION:cua_scroll:Chrome|down]]")
                   && kCompatSystemPrompt.contains("never ask permission"),
               "cua open: the system prompt teaches cua_open, page scrolling and acting without asking");
@@ -7398,7 +7398,7 @@ void jarvisFailoverTests()
     check(body.value("model") == "thinkingmachines/inkling-2-mini"
               && body.value("provider").toObject().value("order").toArray() == QJsonArray{"PrimeIntellect"}
               && hungBody.value("model") == "Infatoshi/Inkling-2-Mini-heretic"
-              && hungBody.value("chat_template_kwargs").toObject().value("reasoning_effort").toDouble(-1) == 0.0,
+              && hungBody.value("chat_template_kwargs").toObject().value("reasoning_effort").toDouble(-1) == 0.2,
           "jarvis failover: each leg sent its own model and request shape");
     check(b.jarvisBreakerOpen() && b.jarvisLegs().size() == 1 && b.jarvisLegs().value(0).name == "inkling",
           "jarvis failover: leg 1's breaker is open, the next plan skips it");
