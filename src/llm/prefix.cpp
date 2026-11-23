@@ -257,6 +257,13 @@ QByteArray buildTieredWarmRequest(const TieredPrompt &p)
     body.insert(QStringLiteral("max_tokens"), 1);
     body.insert(QStringLiteral("messages"),
                 tieredPrefixMessages(tier0SystemText(p.systemPrompt, p.model, p.extraSystemContext), p.trunk, p.history));
+    if (isInklingModel(p.model)) {
+        // Inkling's template writes "Thinking effort level: X" right after the system message, so
+        // the warm must carry the ask's effort or its KV diverges after Tier 0 (the default is 0.9).
+        body.insert(QStringLiteral("chat_template_kwargs"),
+                    QJsonObject{{QStringLiteral("reasoning_effort"), inklingReasoningEffort(p.effort)}});
+        body.insert(QStringLiteral("add_generation_prompt"), false);
+    }
     return QJsonDocument(body).toJson(QJsonDocument::Compact);
 }
 

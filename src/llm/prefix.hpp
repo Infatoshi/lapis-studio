@@ -82,7 +82,8 @@ QString tieredLeafText(const TieredPrompt &p);
 // Streamed chat request: Tiers 0-2 then the Tier 3 leaf as the final user message. With an
 // Inkling model and a non-empty imageJpeg, that message's content is [image_url, text].
 QByteArray buildTieredChatRequest(const TieredPrompt &p);
-// Prefix warm: Tiers 0-2 only, max_tokens 1, stream false, no reasoning_effort.
+// Prefix warm: Tiers 0-2 only, max_tokens 1, stream false, no reasoning_effort. An Inkling model
+// also sends chat_template_kwargs.reasoning_effort (its template renders the effort into the prefix).
 QByteArray buildTieredWarmRequest(const TieredPrompt &p);
 
 // Compatibility wrappers (Tier 2 empty, Tier 3 = question).

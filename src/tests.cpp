@@ -7487,6 +7487,19 @@ void inklingUniversalTests()
     check(leafParts.size() == 2 && leafParts[0].toObject().value("image_url").toObject().value("url") == "data:image/jpeg;base64," + b64
               && leafParts[1].toObject().value("text").toString().contains("CUA observation after cua_open"),
           "inkling universal: the follow-up's leaf carries the screenshot then the observation text");
+    {
+        // legPrompt: every follow-up drops recall (its question is an AX dump); a card keeps its
+        // trunk; a Spotlight desktop step with a screenshot drops the Studio-only tiers too.
+        const QVector<JarvisLeg> legs = b.chatLegs(card);
+        const TieredPrompt cardStep = b.legPrompt(card, legs, key, QString(), QStringLiteral("obs"), true, jpeg);
+        const TieredPrompt spotStep = b.legPrompt(QStringLiteral("spotlight"), legs, key, QString(), QStringLiteral("obs"), true, jpeg);
+        const TieredPrompt spotText = b.legPrompt(QStringLiteral("spotlight"), legs, key, QString(), QStringLiteral("obs"), true, {});
+        check(cardStep.memory.isEmpty() && !cardStep.trunk.isEmpty() && cardStep.trunk == b.contextTrunk(key)
+                  && spotStep.memory.isEmpty() && spotStep.trunk.isEmpty() && spotStep.liveState.isEmpty()
+                  && spotStep.phononTail.isEmpty() && spotStep.recentActions.isEmpty() && spotStep.imageJpeg == jpeg
+                  && spotText.trunk == b.contextTrunk(key) && spotText.imageJpeg.isEmpty(),
+              "inkling universal: lean follow-ups (no recall; a Spotlight visual step drops the Studio tiers)");
+    }
     bool clean = !b.sharedHistory().isEmpty() && !b.streamHistory(card).isEmpty();
     for (const ChatTurn &t : b.sharedHistory() + b.streamHistory(card))
         clean = clean && !t.content.contains(b64) && !t.content.contains(QLatin1String("data:image"));

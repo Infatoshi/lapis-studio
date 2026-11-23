@@ -3,6 +3,8 @@
 #include "mac/cua.hpp"
 #include "mac/cua_reticle.hpp"
 #include <QByteArray>
+#include <QElapsedTimer>
+#include <QMap>
 #include <QPointF>
 #include <QRectF>
 #include <QSizeF>
@@ -71,6 +73,8 @@ struct AppActivation {
     uint32_t displayId = 0;
     int pid = 0;
     bool launched = false;
+    // The app was already frontmost before this activation: no Space slide to wait out.
+    bool wasFrontmost = false;
     QString appName = {};  // openUrl: the app that took the URL (the default browser when unnamed)
 };
 
@@ -132,6 +136,9 @@ struct CuaHooks {
     // LAPIS_CUA_TRACE=0). The log keeps the newest traceMaxSteps steps.
     QString traceDir = {};
     int traceMaxSteps = 1500;
+    // The capture hooks may run on several threads at once: the post-action AX read, the model's
+    // screenshot and the trace's after frame then overlap. Test rigs leave it off (sequential).
+    bool concurrentCapture = false;
 };
 CuaHooks defaultCuaHooks();
 // ~/.lapis-next/cua_traces, or empty when LAPIS_CUA_TRACE=0 (or off/false/no).
@@ -182,8 +189,10 @@ constexpr int kObserveSettleMs = 220;
 // then re-read up to kNavPolls more times, kNavPollMs apart, while the page still looks blank
 // (fewer than kNavMinNodes nodes in the app, or no text or link yet). At most ~1.85 s.
 constexpr int kNavSettleMs = 650, kNavPollMs = 300, kNavPolls = 4, kNavMinNodes = 25;
-constexpr int kObserveChars = 14000;     // observeApp's budget for formatted AX nodes
-constexpr int kPostActionChars = 11000;  // the post-action observation's budget
+// Compact lines (~65 chars a node): 8000 / 6000 chars hold ~120 / ~90 nodes, more than the old
+// JSON lines did in 14000 / 11000, at under half the prompt tokens.
+constexpr int kObserveChars = 8000;     // observeApp's budget for formatted AX nodes
+constexpr int kPostActionChars = 6000;  // the post-action observation's budget
 
 struct CuaExecResult {
     bool ok = false;
@@ -288,7 +297,15 @@ private:
         bool hasToPt = false;  // drags: where the button was released
         QPointF toPt;
         QByteArray obsJpeg;    // the post-action screenshot (attach screenshots only)
+        QByteArray after;      // the trace's after frame, grabbed with the post-action read
+        uint32_t afterDisplayId = 0;
+        // Where the step's wall time went ("route", "locate", "glide", "input", "settle",
+        // "observe", "trace"), logged as timing_ms with each trace line.
+        QElapsedTimer clock;
+        QMap<QString, qint64> phaseMs;
     };
+    // Adds t's elapsed ms to the step's phase (starting the step clock on first use).
+    void addPhase(const QString &phase, const QElapsedTimer &t);
     struct Located {
         bool ok = false;
         QString tier;
@@ -324,12 +341,14 @@ private:
     // followWindow: re-route to the display of the app's frontmost window first (cmd+n opened
     // one on another monitor).
     QString observeAfterAction(const Route &rt, bool waitPageLoad = false, bool followWindow = false);
+    // Concurrent capture: the observation screenshot and the trace's after frame in parallel.
+    void captureSettledFrames(const Route &rt, uint32_t displayId);
     // `verb` ("Clicking") builds the HUD status once the route is known.
     Located locate(const QString &targetDesc, bool refineCrop, const QString &label, const QString &verb,
                    Route *routeOut = nullptr);
     // Polls frontmostPid until pid (else anything but Lapis) is in front, then lets the Space
     // slide finish. False on timeout.
-    bool waitFrontmost(int pid, bool launched, int selfPid);
+    bool waitFrontmost(int pid, bool launched, int selfPid, bool wasFrontmost = false);
     CuaExecResult click(const QString &targetDesc, bool doubleClick, bool refineCrop, bool finish, Route *routeOut);
     // The public calls' bodies; the wrappers reset m_step and trace the result.
     CuaExecResult typeImpl(const QString &targetDesc, const QString &text, bool clearFirst, Route *rt);

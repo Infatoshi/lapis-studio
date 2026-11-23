@@ -7,6 +7,8 @@
 //   lapis_studio --bench-fps [--metal [DIR]]  frame-time profiler; --metal: QQuickRenderControl on Metal, 240 Hz
 //   lapis_studio --record-demo OUT   deterministic 44 s 1920x1080 60 fps demo (mock backend)
 //   lapis_studio --probe-chat MODEL [EFFORT [Q]]  two real asks through one persistent daemon, no window
+//   lapis_studio --probe-jarvis OUTDIR APP JPEG  Jarvis Turn 0 + visual follow-up payloads as JSON, no send
+//   lapis_studio --bench-cua "APP|TARGET" [RUNS [VLM_URL]]  times the real click path, no input or overlay
 //   lapis_studio --snap-omnibar OUT.png  offscreen dark frame: Stage + hovered cell + floating ask card
 //   lapis_studio --snap-review OUT.png   offscreen dark frames: session review card, plus
 //                                        OUT-constellation.png (dragged card, Needs Me) and OUT-stage.png
@@ -27,6 +29,7 @@
 
 #include "backend.hpp"
 #include "demo.hpp"
+#include "mac/cua_bench.hpp"
 #include "mac/cua_reticle.hpp"
 #include "mac/window_state.hpp"
 #include "qml_host.hpp"
@@ -59,6 +62,9 @@ int main(int argc, char **argv)
     QString mapOut;
     QString halfOut;
     QString cursorOut;
+    QString cuaBenchTarget, cuaBenchVlm;
+    int cuaBenchRuns = 3;
+    QStringList jarvisProbe;  // OUTDIR APP JPEG
     QString quickHarness = QStringLiteral("claude");
     bool hotReload = qEnvironmentVariableIntValue("LAPIS_HOT_RELOAD") == 1;
     QString chatModel;
@@ -77,6 +83,16 @@ int main(int argc, char **argv)
             metal = true;
             if (i + 1 < argc && argv[i + 1][0] != '-')
                 metalShots = QString::fromLocal8Bit(argv[++i]);
+        } else if (std::strcmp(argv[i], "--bench-cua") == 0 && i + 1 < argc) {
+            cuaBenchTarget = QString::fromLocal8Bit(argv[++i]);
+            if (i + 1 < argc && argv[i + 1][0] != '-')
+                cuaBenchRuns = std::atoi(argv[++i]);
+            if (i + 1 < argc && argv[i + 1][0] != '-')
+                cuaBenchVlm = QString::fromLocal8Bit(argv[++i]);
+        } else if (std::strcmp(argv[i], "--probe-jarvis") == 0 && i + 3 < argc) {
+            jarvisProbe = {QString::fromLocal8Bit(argv[i + 1]), QString::fromLocal8Bit(argv[i + 2]),
+                           QString::fromLocal8Bit(argv[i + 3])};
+            i += 3;
         } else if (std::strcmp(argv[i], "--probe-live") == 0) {
             probe = true;
             if (i + 1 < argc && argv[i + 1][0] != '-')
@@ -143,6 +159,7 @@ int main(int argc, char **argv)
         }
     }
     const bool offscreen = test || smoke || probe || bench || !demoOut.isEmpty() || !chatModel.isEmpty()
+                           || !cuaBenchTarget.isEmpty() || !jarvisProbe.isEmpty()
                            || !snapOut.isEmpty() || !reviewOut.isEmpty() || !slowmixOut.isEmpty() || !mapOut.isEmpty()
                            || !halfOut.isEmpty() || !cursorOut.isEmpty();
     const bool metalBench = bench && metal;
@@ -193,6 +210,10 @@ int main(int argc, char **argv)
         return studio::benchFps();
     if (!chatModel.isEmpty())
         return studio::probeChat(chatModel, chatEffort, chatQuestion);
+    if (!jarvisProbe.isEmpty())
+        return studio::probeJarvis(jarvisProbe[0], jarvisProbe[1], jarvisProbe[2]);
+    if (!cuaBenchTarget.isEmpty())
+        return studio::cua::benchCua(cuaBenchTarget, std::max(1, cuaBenchRuns), cuaBenchVlm);
     if (!demoOut.isEmpty())
         return studio::recordDemo(demoOut);
     if (!snapOut.isEmpty())

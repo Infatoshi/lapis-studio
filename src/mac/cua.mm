@@ -579,21 +579,49 @@ QString formatNodesForModel(const QVector<AxNode> &nodes, int maxChars) {
         const int n = std::min(maxChars, kTextCap);
         return s.size() > n ? s.left(n - 1) + QChar(0x2026) : s;
     };
-    const auto num = [](double v) { return std::round(v * 10.0) / 10.0; };
+    // A JSON-style string literal: quotes, backslashes and control characters escaped, so every
+    // node stays on one physical line.
+    const auto quoted = [](const QString &s) {
+        QString out; out.reserve(s.size() + 2); out += QLatin1Char('"');
+        for (const QChar c : s) {
+            if (c == QLatin1Char('"') || c == QLatin1Char('\\')) { out += QLatin1Char('\\'); out += c; }
+            else if (c == QLatin1Char('\n')) out += QStringLiteral("\\n");
+            else if (c == QLatin1Char('\r')) out += QStringLiteral("\\r");
+            else if (c == QLatin1Char('\t')) out += QStringLiteral("\\t");
+            else if (c.unicode() < 0x20) out += QStringLiteral("\\u%1").arg(uint(c.unicode()), 4, 16, QLatin1Char('0'));
+            else out += c;
+        }
+        out += QLatin1Char('"');
+        return out;
+    };
+    const auto bare = [](const QString &ax) { return ax.startsWith(QLatin1String("AX")) ? ax.mid(2) : ax; };
+    // Compact lines, about a third of the tokens of a JSON object per node: an app header when the
+    // app changes, then `Role "title" = "value" @x,y wxh {Press}` (actions every node has dropped).
     QString out;
+    QString lastApp;
+    int lastPid = -1;
     for (const auto &n : nodes) {
-        QJsonObject obj{{"id", n.id}, {"pid", n.pid}, {"app", n.appName.left(maxChars)}, {"role", n.role.left(maxChars)},
-            {"title", cap(n.title)}, {"value", cap(n.value)},
-            {"rect", QJsonArray{num(n.globalRect.x()), num(n.globalRect.y()), num(n.globalRect.width()), num(n.globalRect.height())}}};
-        QJsonArray actions; for (const auto &a : n.actions.mid(0, 32)) actions.append(a.left(maxChars));
-        obj.insert("actions", actions);
-        QString line = QString::fromUtf8(QJsonDocument(obj).toJson(QJsonDocument::Compact)) + '\n';
-        if (out.size() + line.size() > maxChars) {
-            // Keep complete JSON lines; a standalone marker signals omitted nodes.
+        QString block;
+        if (n.appName != lastApp || n.pid != lastPid)
+            block += QStringLiteral("[%1 pid %2]\n").arg(n.appName.left(maxChars)).arg(n.pid);
+        QString line = bare(n.role.left(maxChars));
+        if (!n.title.isEmpty()) line += QLatin1Char(' ') + quoted(cap(n.title));
+        if (!n.value.isEmpty()) line += QStringLiteral(" = ") + quoted(cap(n.value));
+        const QRectF &r = n.globalRect;
+        line += QStringLiteral(" @%1,%2 %3x%4").arg(qRound(r.x())).arg(qRound(r.y())).arg(qRound(r.width())).arg(qRound(r.height()));
+        QStringList acts;
+        for (const auto &a : n.actions.mid(0, 32))
+            if (a != QLatin1String("AXShowMenu") && a != QLatin1String("AXScrollToVisible")) acts << bare(a.left(maxChars));
+        if (!acts.isEmpty()) line += QStringLiteral(" {") + acts.join(QLatin1Char(',')) + QLatin1Char('}');
+        block += line + QLatin1Char('\n');
+        if (out.size() + block.size() > maxChars) {
+            // Keep complete lines; a standalone marker signals omitted nodes.
             if (out.size() < maxChars) out += QChar(0x2026);
             break;
         }
-        out += line;
+        out += block;
+        lastApp = n.appName;
+        lastPid = n.pid;
     }
     return out;
 }

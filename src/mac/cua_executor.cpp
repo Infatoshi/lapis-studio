@@ -23,6 +23,7 @@
 #include <atomic>
 #include <cmath>
 #include <mutex>
+#include <thread>
 
 namespace studio::cua {
 
@@ -571,7 +572,11 @@ CuaHooks defaultCuaHooks()
     h.listAppWindows = [] { return studio::cua::listAppWindows(); };
     h.activateApp = [](const QString &hint) {
         AppActivation a;
-        runOnMainThread([&] { a.ok = activateAppByName(hint, &a.displayId, &a.pid, &a.launched); });
+        runOnMainThread([&] {
+            const int before = frontmostAppPid();
+            a.ok = activateAppByName(hint, &a.displayId, &a.pid, &a.launched);
+            a.wasFrontmost = a.ok && !a.launched && a.pid > 0 && a.pid == before;
+        });
         return a;
     };
     h.openUrl = [](const QString &hint, const QString &url) {
@@ -593,6 +598,7 @@ CuaHooks defaultCuaHooks()
     };
     // lapisDisplayId stays unset: the executor derives it from the listAppWindows it already has.
     h.traceDir = defaultTraceDir();
+    h.concurrentCapture = true;  // ScreenCaptureKit and AX reads are safe on parallel workers
     return h;
 }
 
@@ -727,8 +733,13 @@ void CuaExecutor::traceStep(const QString &action, const QString &target, const 
     }
     if (m_step.before.isEmpty())
         return;  // no frame (capture denied): nothing worth training on
-    // The action path already settled kObserveSettleMs inside observeAfterAction.
-    const QByteArray after = observe ? QByteArray() : captureFrame(d.displayId);
+    // The action path already settled kObserveSettleMs inside observeAfterAction (and, with
+    // concurrent capture, grabbed this frame alongside its AX read).
+    QElapsedTimer phase;
+    phase.start();
+    const QByteArray after = observe                                                            ? QByteArray()
+                             : !m_step.after.isEmpty() && m_step.afterDisplayId == d.displayId ? m_step.after
+                                                                                               : captureFrame(d.displayId);
 
     const QString dir = m_hooks.traceDir;
     if (!QDir().mkpath(dir + QStringLiteral("/frames")))
@@ -782,6 +793,12 @@ void CuaExecutor::traceStep(const QString &action, const QString &target, const 
     o[QStringLiteral("before_image")] = beforeRel;
     o[QStringLiteral("after_image")] = afterRel;
     o[QStringLiteral("detail")] = r.detail;
+    addPhase(QStringLiteral("trace"), phase);
+    QJsonObject timing;
+    for (auto it = m_step.phaseMs.cbegin(); it != m_step.phaseMs.cend(); ++it)
+        timing[it.key()] = it.value();
+    timing[QStringLiteral("total")] = m_step.clock.isValid() ? m_step.clock.elapsed() : 0;
+    o[QStringLiteral("timing_ms")] = timing;
     QFile log(dir + QLatin1Char('/') + QLatin1String(kTraceLog));
     if (!log.open(QIODevice::WriteOnly | QIODevice::Append))
         return;
@@ -910,6 +927,13 @@ CuaExecutor::CuaExecutor(CuaHooks hooks) : m_hooks(std::move(hooks)) {}
 
 bool CuaExecutor::route(const QString &targetDesc, bool activate, Route *r, QString *err, const QString &hintOverride)
 {
+    QElapsedTimer phase;
+    phase.start();
+    struct Done {
+        CuaExecutor *ex;
+        QElapsedTimer *t;
+        ~Done() { ex->addPhase(QStringLiteral("route"), *t); }
+    } done{this, &phase};
     *r = Route{};
     const QVector<DisplayInfo> displays = m_hooks.listDisplays ? m_hooks.listDisplays() : QVector<DisplayInfo>();
     if (displays.isEmpty()) {
@@ -953,7 +977,7 @@ bool CuaExecutor::route(const QString &targetDesc, bool activate, Route *r, QStr
                 r->appPid = a.pid;
                 // On one screen this is the fullscreen Space slide: wait for the app to be in
                 // front and the slide to finish before anything is inspected or captured.
-                waitFrontmost(a.pid, a.launched, r->selfPid);
+                waitFrontmost(a.pid, a.launched, r->selfPid, a.wasFrontmost);
                 if (m_hooks.listAppWindows)
                     windows = m_hooks.listAppWindows();  // its windows may only just have come on screen
                 if (a.pid > 0)
@@ -1005,7 +1029,7 @@ bool CuaExecutor::route(const QString &targetDesc, bool activate, Route *r, QStr
     return true;
 }
 
-bool CuaExecutor::waitFrontmost(int pid, bool launched, int selfPid)
+bool CuaExecutor::waitFrontmost(int pid, bool launched, int selfPid, bool wasFrontmost)
 {
     const auto pause = [&](int ms) {
         if (m_hooks.pause)
@@ -1019,7 +1043,8 @@ bool CuaExecutor::waitFrontmost(int pid, bool launched, int selfPid)
     for (int waited = 0;; waited += kFrontPollMs) {
         const int front = m_hooks.frontmostPid();
         if (pid > 0 ? front == pid : (front > 0 && front != selfPid)) {
-            pause(kSpaceSlideMs);
+            if (!(wasFrontmost && pid > 0 && front == pid))
+                pause(kSpaceSlideMs);  // an app already in front never slides a Space in
             return true;
         }
         if (waited + kFrontPollMs > timeout)
@@ -1062,6 +1087,13 @@ CuaExecutor::Located CuaExecutor::locate(const QString &targetDesc, bool refineC
     // L1: Accessibility trees of every display in route order, never Lapis's own nodes unless
     // the target names Lapis. With an app hint, a hit inside that app beats any other hit.
     QVector<AxNode> primaryNodes;
+    QElapsedTimer phase;
+    phase.start();
+    struct Done {
+        CuaExecutor *ex;
+        QElapsedTimer *t;
+        ~Done() { ex->addPhase(QStringLiteral("locate"), *t); }
+    } done{this, &phase};
     if (m_hooks.inspectDisplay) {
         const QString query = rt.appHint.isEmpty() ? targetDesc : stripAppHint(targetDesc, rt.appHint);
         AxNode fallback;
@@ -1241,13 +1273,19 @@ CuaExecResult CuaExecutor::click(const QString &targetDesc, bool doubleClick, bo
         // A miss shows the model what is there instead, so its next try names a real control.
         return {false, QStringLiteral("ERR"), {}, loc.detail, observeAfterAction(rt)};
     }
+    QElapsedTimer glide;
+    glide.start();
+    // The before frame (cursor and HUD excluded) is grabbed while the glide plays, not after it.
+    traceBefore(rt, loc.pt, true);
     if (m_hooks.pause)
-        m_hooks.pause(kGlideSettleMs);
+        m_hooks.pause(std::max<int>(0, kGlideSettleMs - int(glide.elapsed())));
     if (m_hooks.reticlePulse)
         m_hooks.reticlePulse(loc.pt, label);
     if (m_hooks.pause)
         m_hooks.pause(kPulseLeadMs);
-    traceBefore(rt, loc.pt, true);  // the last frame before the input lands
+    addPhase(QStringLiteral("glide"), glide);
+    QElapsedTimer input;
+    input.start();
     ActionResult act{false, QStringLiteral("No actuator")};
     if (loc.tier == QLatin1String("L1_AX") && m_preferAxPress && m_hooks.axPress && !doubleClick) {
         const QString key = loc.node.title.isEmpty() ? loc.node.role : loc.node.title;
@@ -1255,6 +1293,7 @@ CuaExecResult CuaExecutor::click(const QString &targetDesc, bool doubleClick, bo
     } else if (m_hooks.clickAt) {
         act = m_hooks.clickAt(loc.pt, doubleClick);
     }
+    addPhase(QStringLiteral("input"), input);
     if (!act.ok) {
         hudFail(target, QStringLiteral("Click failed · %1").arg(target));
         return {false, QStringLiteral("ERR"), loc.pt, QStringLiteral("%1: %2").arg(loc.tier, act.detail)};
@@ -1311,8 +1350,13 @@ QString CuaExecutor::observeAfterAction(const Route &routed, bool waitPageLoad, 
 {
     if (!m_hooks.inspectDisplay || routed.displays.isEmpty())
         return {};
+    QElapsedTimer settle;
+    settle.start();
     if (m_hooks.pause)
         m_hooks.pause(waitPageLoad ? kNavSettleMs : kObserveSettleMs);  // let the UI repaint before reading
+    addPhase(QStringLiteral("settle"), settle);
+    QElapsedTimer phase;
+    phase.start();
     Route rt = routed;
     if (followWindow) {
         AppWindowInfo w;
@@ -1320,6 +1364,15 @@ QString CuaExecutor::observeAfterAction(const Route &routed, bool waitPageLoad, 
             preferDisplay(&rt, w.displayId);
     }
     const uint32_t displayId = rt.displays.first().displayId;
+    if (!waitPageLoad && m_hooks.concurrentCapture) {
+        // The settled screen: the AX read here while the model's screenshot and the trace's
+        // after frame are grabbed on other workers, all at the same moment.
+        std::thread shots([&] { captureSettledFrames(rt, displayId); });
+        QVector<AxNode> nodes = visibleNodes(rt, displayId);
+        shots.join();
+        addPhase(QStringLiteral("observe"), phase);
+        return formatNodesForModel(nodes, kPostActionChars);
+    }
     QVector<AxNode> nodes = visibleNodes(rt, displayId);
     if (waitPageLoad) {
         // A page that just started loading shows a spinner and an empty web area: re-read until
@@ -1342,8 +1395,35 @@ QString CuaExecutor::observeAfterAction(const Route &routed, bool waitPageLoad, 
             nodes = visibleNodes(rt, displayId);
         }
     }
-    captureObservationShot(displayId);  // the settled screen, same moment as the AX read
+    if (m_hooks.concurrentCapture)
+        captureSettledFrames(rt, displayId);  // the loaded page: both frames at once
+    else
+        captureObservationShot(displayId);  // the settled screen, same moment as the AX read
+    addPhase(QStringLiteral("observe"), phase);
     return formatNodesForModel(nodes, kPostActionChars);
+}
+
+void CuaExecutor::captureSettledFrames(const Route &rt, uint32_t displayId)
+{
+    // Same privacy gate as traceBefore: a step that will not be traced never grabs its frame.
+    const bool traceAfter = tracing()
+                            && !traceBlocked(m_trace.redacted, {m_trace.goal, m_trace.projectKey, m_step.target,
+                                                                m_step.text, m_step.app, rt.appHint});
+    if (!traceAfter) {
+        captureObservationShot(displayId);
+        return;
+    }
+    std::thread obs([&] { captureObservationShot(displayId); });
+    m_step.after = captureFrame(displayId);
+    m_step.afterDisplayId = displayId;
+    obs.join();
+}
+
+void CuaExecutor::addPhase(const QString &phase, const QElapsedTimer &t)
+{
+    if (!m_step.clock.isValid())
+        m_step.clock.start();
+    m_step.phaseMs[phase] += t.elapsed();
 }
 
 void CuaExecutor::captureObservationShot(uint32_t displayId)
@@ -1521,9 +1601,12 @@ CuaExecResult CuaExecutor::scrollImpl(const QString &targetDesc, int deltaY, Rou
     } else if (loc.tier == QLatin1String("L1_AX") && m_hooks.reticleMove) {
         m_hooks.reticleMove(loc.pt, label);  // the ring is up; bring the pointer onto it
     }
+    QElapsedTimer glide;
+    glide.start();
+    traceBefore(rt, loc.pt, true);  // grabbed while the glide plays
     if (m_hooks.pause)
-        m_hooks.pause(kGlideSettleMs);
-    traceBefore(rt, loc.pt, true);
+        m_hooks.pause(std::max<int>(0, kGlideSettleMs - int(glide.elapsed())));
+    addPhase(QStringLiteral("glide"), glide);
     const ActionResult s = m_hooks.scrollAt ? m_hooks.scrollAt(loc.pt, deltaY) : ActionResult{false, QStringLiteral("No scroller")};
     if (!s.ok) {
         hudFail(target, QStringLiteral("Scroll failed · %1").arg(s.detail));

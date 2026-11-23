@@ -3387,6 +3387,8 @@ void Backend::onRouterFinished(const QString &streamId, const QString &error)
         while (h.size() > kMaxStreamHistory)
             h.remove(0, 2);  // drop the oldest exchange (re-prefills Tier 2 once)
         noteExchange(done.projectKey, compatModel(), userTurn, histAnswer);
+        if (streamId == QLatin1String(kSpotlightStreamId))
+            warmJarvisPrefix();  // the next Turn 0's prefix, prefilled while the steps run locally
     }
     if (streamId != QLatin1String(kSpotlightStreamId) && m_cuaHud && m_cuaPending == 0 && !m_cuaFollowupScheduled
         && !m_spotlightTurn && !m_quickBusy)
@@ -3451,10 +3453,8 @@ void Backend::startConversation(const QString &streamId, const QString &projectK
     if (!legs.isEmpty()) {
         // Jarvis and every island card: the self-hosted leg first, then OpenRouter, all on this
         // one stream id. A CUA follow-up's screenshot rides on the leaf only (never history).
-        TieredPrompt p = tieredPrompt(projectKey, slice, q, m_sharedHistory);
-        p.effort = legEffort(legs, followup);
-        if (followup)
-            p.imageJpeg = m_cuaFollowupImage;
+        const TieredPrompt p = legPrompt(streamId, legs, projectKey, slice, q, followup,
+                                         followup ? m_cuaFollowupImage : QByteArray());
         const QString goal = followup ? m_cuaFollowupGoal : q;
         m_streamAsks.insert(streamId, StreamAsk{q, QString(), projectKey, followup ? m_cuaFollowupNote : QString(), goal});
         if (streamId == QLatin1String(kSpotlightStreamId)) {
@@ -3500,6 +3500,56 @@ TieredPrompt Backend::tieredPrompt(const QString &projectKey, const QString &sli
     p.currentTime = currentTimeLine(QDateTime::currentDateTime());  // Tier 3 only: Tiers 0/1 stay APC-hot
     p.question = question;
     return p;
+}
+
+TieredPrompt Backend::legPrompt(const QString &streamId, const QVector<JarvisLeg> &legs, const QString &projectKey,
+                                const QString &slice, const QString &question, bool followup,
+                                const QByteArray &image) const
+{
+    TieredPrompt p = tieredPrompt(projectKey, slice, question, m_sharedHistory);
+    p.effort = legEffort(legs, followup);
+    if (!followup)
+        return p;
+    p.imageJpeg = image;
+    // A follow-up's "question" is the CUA observation: recall searched with an AX dump finds noise.
+    p.memory.clear();
+    // SGLang scopes cached KV to the exact images in a request, so a turn with a fresh screenshot
+    // prefills every token. A Spotlight step on the desktop carries only what the step needs:
+    // no Studio project trunk, live Studio state, Studio actions or Phonon tail.
+    const bool overStudio = m_spotlight && m_spotlight->state().overStudio;
+    if (!image.isEmpty() && streamId == QLatin1String(kSpotlightStreamId) && !overStudio) {
+        p.trunk.clear();
+        p.liveState.clear();
+        p.recentActions.clear();
+        p.phononTail.clear();
+    }
+    return p;
+}
+
+void Backend::warmJarvisPrefix()
+{
+    // The next Spotlight Turn 0 is Tiers 0-2 (system, trunk, this shared history) plus its leaf.
+    // Inkling's template puts the thinking-effort line right after the system message, and the
+    // hybrid (Mamba) prefix cache only reuses KV up to where an earlier request ended, so prefill
+    // exactly that prefix at Turn 0's effort while the CUA steps run on the Mac.
+    if (m_mode != Mode::Live)
+        return;
+    const QVector<JarvisLeg> legs = jarvisLegs();
+    if (legs.isEmpty() || legs.first().openRouter || !isInklingModel(legs.first().model))
+        return;
+    LlmRouter *router = llmRouter();
+    if (!router)
+        return;
+    const QString project = focusedProject();
+    if (const Project *p = find(project))
+        if (std::any_of(p->sessions.cbegin(), p->sessions.cend(), [](const SessionInfo &s) { return s.redacted; }))
+            return;  // redacted (infinity) context never rides on a speculative request
+    TieredPrompt tp = tieredPrompt(project, QString(), QString(), m_sharedHistory);
+    tp.model = legs.first().model;
+    tp.effort = QStringLiteral("fast");  // Turn 0's forced zero-think, as legEffort picks it
+    const QByteArray body = buildTieredWarmRequest(tp);
+    router->warmPrefix(legs.first().endpoint, legs.first().apiKey, body,
+                       QStringLiteral("jarvis@%1").arg(qHash(body)));
 }
 
 void Backend::cancelStream(const QString &streamId)

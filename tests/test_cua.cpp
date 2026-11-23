@@ -71,10 +71,10 @@ void leaseTests() {
 void formattingTests() {
     AxNode n{1, "AXButton", "Save\n\"document\"", "a\\b", "Example", 42, {-100, -50, 80, 24}, {"AXPress"}};
     const QString text = formatNodesForModel({n});
-    const auto parsed = QJsonDocument::fromJson(text.toUtf8());
-    check(parsed.isObject() && parsed.object().value("title").toString() == n.title, "JSON escaping round trip");
-    check(parsed.object().value("pid").toInt() == 42 && parsed.object().contains("rect") && parsed.object().contains("actions"), "model target fields present");
-    check(text.count('\n') == 1, "one structured line per node");
+    check(text == "[Example pid 42]\nButton \"Save\\n\\\"document\\\"\" = \"a\\\\b\" @-100,-50 80x24 {Press}\n",
+        "compact line: app header, role, escaped title and value, rect, actions");
+    check(text.count('\n') == 2, "one header plus one line per node");
+    check(formatNodesForModel({n, n}).count('\n') == 3, "same app: one header for consecutive nodes");
     check(formatNodesForModel({}).isEmpty(), "empty nodes");
     check(formatNodesForModel({n}, 0).isEmpty() && formatNodesForModel({n}, -1).isEmpty(), "nonpositive budgets");
     for (int cap : {1, 2, 10, 100, 200, 6000}) check(formatNodesForModel({n, n}, cap).size() <= cap, "character budget hard bound");
@@ -563,7 +563,7 @@ void executorTests() {
                    AxNode{9, "AXButton", "Lapis secret", {}, "lapis_studio", 500, {10, 10, 80, 20}, {"AXPress"}}};
         CuaExecutor ex(m.hooks());
         const auto res = ex.clickTarget("Send");
-        check(res.ok && res.observation.contains("\"title\":\"Send\""), "observe: clickTarget fills observation");
+        check(res.ok && res.observation.contains("Button \"Send\""), "observe: clickTarget fills observation");
         check(!res.observation.contains("Lapis secret"), "observe: Lapis's own nodes are left out");
         check(m.pauses.contains(QString::number(kObserveSettleMs)) && m.inspected().size() == 2
                   && m.calls.lastIndexOf("inspectDisplay:7") > m.calls.indexOf("click"),
@@ -918,6 +918,19 @@ void spaceSwitchTests() {
         std::printf("hud statuses: %s\n", qPrintable(m.huds.join(" / ")));
     }
     {
+        // Chrome was already frontmost before activation: no Space slides in, so no 180 ms wait.
+        MockRig m = singleScreenRig();
+        m.activateOk = true; m.activatePid = 600; m.activateDisplay = 1;
+        m.frontSeq = {600};
+        m.nodes = {axNode(2, "AXButton", "Send", {400, 300, 120, 40})};
+        CuaHooks h = m.hooks();
+        const auto activate = h.activateApp;
+        h.activateApp = [activate](const QString &hint) { AppActivation a = activate(hint); a.wasFrontmost = true; return a; };
+        CuaExecutor ex(h);
+        check(ex.clickTarget("Chrome Send").ok && !m.pauses.contains(QString::number(kSpaceSlideMs)),
+            "space: an app already in front skips the slide settle");
+    }
+    {
         // Chrome never comes forward: bounded at 900 ms, no slide settle, still proceeds.
         MockRig m = singleScreenRig();
         m.activateOk = true; m.activatePid = 600;
@@ -1110,6 +1123,10 @@ void traceTests() {
             check(o["action"] == "click" && o["tier"] == "L1_AX" && o["ok"].toBool() && o["app"] == "Example"
                       && o["goal"] == "send the message" && o["target"] == "Send" && o["text"] == "",
                 "trace L1 click: action, tier, ok, app, goal");
+            const QJsonObject t = o["timing_ms"].toObject();
+            check(t.contains("locate") && t.contains("glide") && t.contains("input") && t.contains("settle")
+                      && t.contains("observe") && t.contains("trace") && t.contains("total"),
+                "trace L1 click: timing_ms splits the step into locate / glide / input / settle / observe / trace");
             check(o["display_w"].toDouble() == 1440 && o["display_h"].toDouble() == 900, "trace L1 click: display size in points");
             check(intArray(o["point_1000"], {319, 356}), "trace L1 click: point_1000 normalized to the display");
             check(intArray(o["bbox_1000"], {278, 333, 361, 378}), "trace L1 click: bbox_1000 from the AX rect");
@@ -1667,13 +1684,11 @@ void reliabilityTests() {
     {
         AxNode n{3, "AXStaticText", QString(2000, QChar('p')), "", "Google Chrome", 600, {126.33333333333333, 40.06, 80.25, 19.999}, {}};
         const QString line = formatNodesForModel({n}, 14000);
-        const QJsonObject o = QJsonDocument::fromJson(line.toUtf8()).object();
-        const QJsonArray rect = o.value("rect").toArray();
-        check(!o.isEmpty() && rect.size() == 4 && rect[0].toDouble() == 126.3 && rect[1].toDouble() == 40.1
-                  && rect[3].toDouble() == 20 && !line.contains("126.333"),
-            "format: rect rounded to 0.1");
-        check(o.value("title").toString().size() == 280 && line.size() < 600, "format: one giant paragraph capped at 280 chars");
-        check(kObserveChars == 14000 && kPostActionChars == 11000 && kObserveSettleMs == 220, "format: observation budgets raised");
+        check(line.contains("@126,40 80x20") && !line.contains("126.3"), "format: rect rounded to whole points");
+        check(line.contains(QString(279, QChar('p')) + QChar(0x2026) + "\"") && line.size() < 600,
+            "format: one giant paragraph capped at 280 chars");
+        check(kObserveChars == 8000 && kPostActionChars == 6000 && kObserveSettleMs == 220,
+            "format: compact observation budgets");
         QVector<AxNode> page;
         for (int i = 0; i < 120; ++i)
             page.push_back(AxNode{i + 1, "AXLink", QString("Post %1 by someone").arg(i), "", "Google Chrome", 600,

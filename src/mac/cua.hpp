@@ -145,6 +145,9 @@ QVector<std::pair<AxNode, H>> walkAxTree(H root, const AxWalkLimits &lim, Visit 
 // timeoutSec is a total traversal budget; each IPC also has a remaining-budget timeout.
 QVector<AxNode> inspectApp(int pid, int maxNodes = 200, int maxDepth = 8, double timeoutSec = 0.25);
 QVector<AxNode> inspectDisplay(uint32_t displayId, int maxNodes = 200, double timeoutSec = 0.25);
+// The model's view of AX nodes: one compact line per node (`Button "Send" @x,y wxh {Press}`,
+// title / value escaped JSON-style), an app header line whenever the app changes, whole lines
+// only, "…" when nodes were left out; never longer than maxChars.
 QString formatNodesForModel(const QVector<AxNode> &nodes, int maxChars = 6000);
 // macOS 14+. Worker-thread-only, bounded to 5 s, no implicit permission prompt.
 // Always pass the reticle windowNumber: modern ScreenCaptureKit may ignore sharingType.

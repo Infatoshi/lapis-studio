@@ -3,9 +3,15 @@
 #include "backend.hpp"
 #include "providers.hpp"
 #include "transcript.hpp"
+#include "llm/jarvis_legs.hpp"
+#include "mac/cua.hpp"
+#include "mac/cua_executor.hpp"
 
 #include <QCoreApplication>
 #include <QDir>
+#include <QJsonObject>
+#include <QJsonDocument>
+#include <QFile>
 #include <QElapsedTimer>
 #include <QMap>
 #include <QEventLoop>
@@ -653,6 +659,91 @@ int smokeOffscreen(const QString &shotDir)
                 qPrintable(QGuiApplication::platformName()), img.width(), img.height(), visibleWords(win),
                 backend.spawnCount());
     return img.isNull() ? 3 : 0;
+}
+
+int probeJarvis(const QString &outDir, const QString &app, const QString &jpegPath)
+{
+    // No window, no warm, no send: builds the exact Spotlight Turn 0 and visual follow-up
+    // payloads from live state (shared history from studio_history.jsonl, the app's real AX tree,
+    // a real JPEG) and writes them as JSON for an offline replay against the Jarvis endpoint.
+    Backend backend(Backend::Mode::Live, nullptr, false);
+    settle(6000);  // projects, the Phonon tail poll and the memory index land
+    QVector<ChatTurn> history;
+    {
+        QFile f(Backend::defaultHistoryPath());
+        QList<QByteArray> lines;
+        if (f.open(QIODevice::ReadOnly))
+            lines = f.readAll().split('\n');
+        lines.removeIf([](const QByteArray &l) { return l.trimmed().isEmpty(); });
+        for (const QByteArray &l : lines.mid(std::max<qsizetype>(0, lines.size() - 10))) {
+            const QJsonObject o = QJsonDocument::fromJson(l).object();
+            history << ChatTurn{QStringLiteral("user"), o.value("prompt").toString()}
+                    << ChatTurn{QStringLiteral("assistant"), o.value("answer").toString()};
+        }
+    }
+    backend.setSharedHistory(history);
+    const QVector<JarvisLeg> legs = backend.jarvisLegs();
+    if (legs.isEmpty()) {
+        std::fprintf(stderr, "probe-jarvis: no Jarvis legs (set LAPIS_JARVIS_ENDPOINT)\n");
+        return 2;
+    }
+    int pid = 0;
+    uint32_t display = 0;
+    for (const studio::cua::AppWindowInfo &w : studio::cua::listAppWindows())
+        if (studio::cua::appNameMatches(w.appName, app) && w.displayId) {
+            pid = w.pid;
+            display = w.displayId;
+            break;
+        }
+    if (!pid) {
+        std::fprintf(stderr, "probe-jarvis: no on-screen window for %s\n", qPrintable(app));
+        return 2;
+    }
+    QFile jf(jpegPath);
+    const QByteArray jpeg = jf.open(QIODevice::ReadOnly) ? jf.readAll() : QByteArray();
+    // Turn 0: submitSpotlight's desktop slice.
+    const QString slice = QStringLiteral("Active macOS app behind Spotlight: %1\n").arg(app)
+                          + studio::cua::formatNodesForModel(studio::cua::inspectApp(pid, 500, 32, 0.35),
+                                                             studio::cua::kPostActionChars);
+    const QString goal = QStringLiteral("Click on my profile.");
+    // Follow-up: one click step whose observation is the display's AX nodes, the app's first.
+    QVector<studio::cua::AxNode> nodes = studio::cua::inspectDisplay(display, 500, 0.9);
+    std::stable_partition(nodes.begin(), nodes.end(),
+                          [&](const studio::cua::AxNode &n) { return studio::cua::appNameMatches(n.appName, app); });
+    CuaStepResult step;
+    step.action = QStringLiteral("cua_click");
+    step.target = app + QStringLiteral("|Me");
+    step.ok = true;
+    step.tier = QStringLiteral("L1_AX");
+    step.detail = QStringLiteral("AXButton \"Me\" (%1)").arg(app);
+    step.observation = studio::cua::formatNodesForModel(nodes, studio::cua::kPostActionChars);
+    const QString spot = QStringLiteral("spotlight");
+    const QString project = backend.focusedProject();
+    const TieredPrompt t0 = backend.legPrompt(spot, legs, project, slice, goal, false, {});
+    backend.setSharedHistory(history << ChatTurn{QStringLiteral("user"), goal}
+                                     << ChatTurn{QStringLiteral("assistant"), QStringLiteral("[[ACTION:cua_click:%1|Me]]").arg(app)});
+    const TieredPrompt fu = backend.legPrompt(spot, legs, project, QString(), cuaFollowupPrompt({step}), true, jpeg);
+    QDir().mkpath(outDir);
+    auto dump = [&](const char *name, const TieredPrompt &p) {
+        QFile out(outDir + QLatin1Char('/') + QLatin1String(name) + QStringLiteral(".json"));
+        if (out.open(QIODevice::WriteOnly))
+            out.write(buildJarvisLegRequest(legs.first(), p));
+        qsizetype hist = 0;
+        for (const ChatTurn &t : p.history)
+            hist += t.content.size();
+        std::printf("probe-jarvis: %s effort %s | tier0 %lld trunk %lld history %lld (%lld turns) | leaf: slice %lld "
+                    "live %lld recent %lld phonon %lld memory %lld question %lld | image %lld bytes\n",
+                    name, qPrintable(p.effort),
+                    static_cast<long long>(tier0SystemText(p.systemPrompt, p.model, p.extraSystemContext).size()),
+                    static_cast<long long>(p.trunk.size()), static_cast<long long>(hist),
+                    static_cast<long long>(p.history.size()), static_cast<long long>(p.targetSlice.size()),
+                    static_cast<long long>(p.liveState.size()), static_cast<long long>(p.recentActions.join('\n').size()),
+                    static_cast<long long>(p.phononTail.size()), static_cast<long long>(p.memory.size()),
+                    static_cast<long long>(p.question.size()), static_cast<long long>(p.imageJpeg.size()));
+    };
+    dump("turn0", t0);
+    dump("followup", fu);
+    return 0;
 }
 
 }  // namespace studio

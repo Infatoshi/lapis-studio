@@ -752,6 +752,22 @@ void inklingTests()
                   && o.value("max_tokens").toInt() == 640 && o.value("repeat_penalty").toDouble(-1) == 1.0,
               "inkling: low/medium/high -> reasoning_effort 0.2/0.5/0.8, max_tokens 640", it.key());
     }
+    // Inkling warm: the template renders the effort right after Tier 0, so the warm carries Turn 0's
+    // effort and its messages stay a byte-identical prefix of the ask's.
+    {
+        TieredPrompt w = p;
+        w.effort = QStringLiteral("fast");
+        w.trunk = QStringLiteral("trunk");
+        w.history = {ChatTurn{"user", "open x.com"}, ChatTurn{"assistant", "[[ACTION:cua_open:Chrome|https://x.com]]"}};
+        const QJsonObject warm = jsonOf(buildTieredWarmRequest(w));
+        const QJsonArray wm = warm.value("messages").toArray(), am = jsonOf(buildTieredChatRequest(w)).value("messages").toArray();
+        bool prefix = wm.size() == 4 && am.size() == 6;
+        for (qsizetype i = 0; prefix && i < wm.size(); ++i)
+            prefix = wm[i] == am[i];
+        check(prefix && warm.value("chat_template_kwargs").toObject().value("reasoning_effort").toDouble(-1) == 0.0
+                  && !warm.value("add_generation_prompt").toBool(true) && warm.value("max_tokens").toInt() == 1,
+              "inkling warm: Turn 0's effort kwarg, no generation prompt, a byte-identical prefix of the ask");
+    }
     // Case-insensitive model match; a non-Inkling model keeps the Qwen no-think shape exactly.
     check(isInklingModel("thinkingmachines/inkling-2-mini") && isInklingModel("INKLING") && !isInklingModel("qwen3.8"),
           "inkling: model match is case-insensitive");

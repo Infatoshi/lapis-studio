@@ -68,6 +68,7 @@ add_library(lapis_mac STATIC
   src/mac/cua.hpp src/mac/cua.mm
   src/mac/cua_reticle.hpp src/mac/cua_reticle.mm
   src/mac/cua_executor.hpp src/mac/cua_executor.cpp
+  src/mac/cua_bench.hpp src/mac/cua_bench.cpp
   src/mac/cua_shadow.hpp src/mac/cua_shadow.mm
   src/mac/cua_spotlight.hpp src/mac/cua_spotlight.mm
   src/mac/cua_pad_icon.hpp src/mac/cua_pad_icon.mm

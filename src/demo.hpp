@@ -69,6 +69,9 @@ int probeLive(const QString &shotDir = QString());
 // Headless: two quick asks through the real persistent daemon for MODEL/EFFORT; prints both
 // answers, their latency, and whether the second turn reused the first turn's process.
 int probeChat(const QString &model, const QString &effort, const QString &question);
+// --probe-jarvis OUTDIR APP JPEG: writes the Spotlight Turn 0 and visual follow-up payloads the
+// Jarvis self leg would send (live state, APP's real AX tree, JPEG as the screenshot); no send.
+int probeJarvis(const QString &outDir, const QString &app, const QString &jpegPath);
 int runTests();
 // --snap-omnibar OUT.png: the mock Stage with a hovered table cell and the floating ask card
 // open over it, answered by a local fake SSE endpoint, rendered offscreen at 1920x1080.

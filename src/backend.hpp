@@ -822,6 +822,15 @@ public:
     // (Mock never schedules one), with image as the post-action screenshot.
     void runCuaFollowupForTest(const QString &streamId, const QString &projectKey, const QString &prompt,
                                const QString &note, const QByteArray &image);
+    // The prompt a leg chain (Jarvis or an island card) sends: tieredPrompt with the shared
+    // history, the leg effort and, on a CUA follow-up, the post-action screenshot (leaf only).
+    TieredPrompt legPrompt(const QString &streamId, const QVector<JarvisLeg> &legs, const QString &projectKey,
+                           const QString &slice, const QString &question, bool followup, const QByteArray &image) const;
+    // Live: prefills the next Spotlight Turn 0's prefix (Tiers 0-2 at Turn 0's effort) on the
+    // self-hosted Inkling leg with a one-token warm; a no-op elsewhere.
+    void warmJarvisPrefix();
+    // Probes / tests: replace the shared Tier 2 ring (every Studio exchange, newest last).
+    void setSharedHistory(const QVector<ChatTurn> &history) { m_sharedHistory = history; }
 
 private:
     // One Jarvis turn across its failover legs.
