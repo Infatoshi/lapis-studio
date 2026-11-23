@@ -569,8 +569,34 @@ void Gamepad::processSnapshot(const Snapshot &s, qint64 nowMs)
                 emit voiceHold(active);
                 break;
             }
-            if (m_voiceActive != active)
-                setVoiceActive(active);
+            if (!active && m_voiceSwallowRelease) {
+                m_voiceSwallowRelease = false;  // the press already stopped (toggle) or cancelled
+                break;
+            }
+            if (active) {
+                m_voiceSwallowRelease = false;
+                if (m_voiceToggled) {
+                    // Second tap: stop listening on the press; its release is not a new hold.
+                    m_voiceToggled = false;
+                    m_voiceSwallowRelease = true;
+                    emit voiceToggledChanged();
+                    if (m_voiceActive)
+                        setVoiceActive(false);
+                    break;
+                }
+                m_voicePressMs = nowMs;
+                if (!m_voiceActive)
+                    setVoiceActive(true);
+                break;
+            }
+            if (!m_voiceActive)
+                break;
+            if (m_voiceTapToggle && nowMs - m_voicePressMs < kVoiceTapMs) {
+                m_voiceToggled = true;  // a quick tap: keep listening until the next L2
+                emit voiceToggledChanged();
+                break;
+            }
+            setVoiceActive(false);
             break;
         }
         case GamepadAction::RawCaptured:
@@ -624,10 +650,39 @@ void Gamepad::setVoiceActive(bool active)
     }
 }
 
+void Gamepad::setVoiceTapToggle(bool on)
+{
+    m_voiceTapToggle = on;
+    if (!on && m_voiceToggled) {
+        m_voiceToggled = false;
+        emit voiceToggledChanged();
+        if (m_voiceActive)
+            setVoiceActive(false);
+    }
+}
+
+void Gamepad::cancelVoice()
+{
+    const bool wasToggled = m_voiceToggled;
+    if (m_voiceToggled) {
+        m_voiceToggled = false;
+        emit voiceToggledChanged();
+    }
+    if (!m_voiceActive)
+        return;
+    m_voiceSwallowRelease = !wasToggled;  // a hold: L2 is still down, its release must not count
+    setVoiceActive(false);
+}
+
 void Gamepad::setConnected(bool on, const QString &name)
 {
     if (on == m_connected && name == m_name)
         return;
+    if (!on && m_voiceToggled) {
+        m_voiceToggled = false;
+        emit voiceToggledChanged();
+    }
+    m_voiceSwallowRelease = false;
     if (!on && m_voiceActive)
         setVoiceActive(false);
     m_connected = on;

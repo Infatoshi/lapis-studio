@@ -89,6 +89,10 @@ constexpr double kLand = 0.18;        // landing squash wobble
 constexpr double kPoke = 0.42;        // click poke and rebound
 constexpr double kBurst = 0.46;       // click starburst, ticks, stars, puffs
 constexpr double kFocusIn = 0.22, kIdle = 1.8, kFade = 0.45;
+// The cursor's own pop-out: once hideAt passes, the glove fades over kCursorOut, then the panel
+// orders out. Visible mode arms it on its own: kAutoHideAfterPulse once a click burst ends, or
+// kAutoHideAfterMove once a glide or a frame settles with no newer cursor command.
+constexpr double kCursorOut = 0.16, kAutoHideAfterPulse = 0.55, kAutoHideAfterMove = 0.65;
 constexpr double kNever = -1e9, kForever = 1e18;
 constexpr double kHudIn = 0.22, kHudOut = 0.40, kHudLinger = studio::cua::kHudLingerSec, kHudPad = 30;
 constexpr double kRestAngle = -28;    // degrees; the hand's natural tilt (finger up-left)
@@ -148,6 +152,9 @@ struct Scene {
     double rippleStart = kNever;
     QString label;
     double lastActivity = kNever;
+    double hideAt = kForever;  // when the cursor's fade-out starts (kForever: not scheduled)
+    double cursorAlpha(double t) const { return t < hideAt ? 1 : clamp01(1 - (t - hideAt) / kCursorOut); }
+    bool hideDue(double t) const { return visible && t >= hideAt + kCursorOut; }
     // HUD bar.
     QString hudStatus;
     studio::cua::HudTone hudTone = studio::cua::HudTone::Working;
@@ -258,9 +265,12 @@ struct Scene {
     bool dynamic(double t) const {
         const double idle = t - lastActivity;
         return gliding(t) || trailPending(t) || (trailMove() && t - landAt() < kLand) || burstPending(t)
-               || pokePending(t) || (idle < kIdle + kFade && (focusShown(t) || !label.isEmpty()));
+               || pokePending(t) || (idle < kIdle + kFade && (focusShown(t) || !label.isEmpty()))
+               || (t >= hideAt && t < hideAt + kCursorOut);
     }
-    bool animating(double t) const { return visible && (dynamic(t) || t - lastActivity < kIdle + kFade); }
+    bool animating(double t) const {
+        return visible && (dynamic(t) || t - lastActivity < kIdle + kFade || hideAt < kForever);
+    }
 
     double hudIn(double t) const { return easeOutCubic(clamp01((t - hudShownAt) / kHudIn)); }
     bool hudGone(double t) const { return hudShownAt == kNever || t >= hudHideAt + kHudOut; }
@@ -1036,13 +1046,25 @@ void paintGlove(CGContextRef ctx, const Palette &pal, double shadowScale)
 {
     if (!_scene || !_scene->visible)
         return;
+    const double fade = _scene->cursorAlpha(now);
+    if (fade <= 0)
+        return;
     CGContextSaveGState(ctx);
+    // The idle pop-out: every piece composites through one layer at the fade alpha (the pieces
+    // set their own absolute alphas inside, which a plain CGContextSetAlpha would not scale).
+    const bool fading = fade < 1;
+    if (fading) {
+        CGContextSetAlpha(ctx, fade);
+        CGContextBeginTransparencyLayer(ctx, nullptr);
+    }
     CGContextTranslateCTM(ctx, -_scene->display.x(), -_scene->display.y());  // draw in global points
     [self paintFocus:ctx now:now];
     [self paintTail:ctx now:now];
     [self paintRipple:ctx now:now];
     [self paintPill:ctx now:now];
     [self paintPointer:ctx now:now];
+    if (fading)
+        CGContextEndTransparencyLayer(ctx);
     CGContextRestoreGState(ctx);
 }
 @end
@@ -1344,8 +1366,33 @@ struct CuaReticle::Impl {
         }
         lastBounds = b;
     }
+    // A new cursor command: any pending pop-out is cancelled (alpha back to 1), and the live
+    // overlay re-arms its own idle hide for when this command settles. Offscreen stays manual.
+    void rearmHide(double settlesAt, double idle) {
+        scene.hideAt = detail::kForever;
+        if (!scene.offscreen)
+            scene.hideAt = settlesAt + idle;
+    }
+    void doHide() {
+        scene.visible = false;
+        scene.focus = {};
+        scene.rippleStart = detail::kNever;
+        scene.hideAt = detail::kForever;
+        if (!scene.hudAnimating(scene.now()))
+            stopTimer();  // the HUD keeps its own animation and fade going
+        if (panel) {
+            [panel orderOut:nil];
+            [view setNeedsDisplay:YES];
+        }
+    }
+    // The scheduled fade has run its course: the overlay is gone (panel ordered out).
+    void settleHide(double now) {
+        if (scene.hideDue(now))
+            doHide();
+    }
     void tick() {
         const double now = scene.now();
+        settleHide(now);
         if (scene.visible)
             invalidate(now, false);
         hudTick(now);
@@ -1442,6 +1489,7 @@ void CuaReticle::moveTo(QPointF point, const QString &label)
         impl->place(display);
         impl->scene.label = label.left(120);
         impl->startGlide(point, now);
+        impl->rearmHide(std::max(now, impl->scene.landAt()), detail::kAutoHideAfterMove);
         impl->show(now);
     }
 }
@@ -1460,6 +1508,7 @@ bool CuaReticle::highlightRect(QRectF rect, const QString &label)
         impl->scene.focus = rect;
         impl->scene.focusStart = now;
         impl->scene.label = label.left(120);
+        impl->rearmHide(std::max(now + detail::kFocusIn, impl->scene.landAt()), detail::kAutoHideAfterMove);
         impl->show(now);
     }
     return true;
@@ -1483,6 +1532,7 @@ bool CuaReticle::pulseClick(QPointF point, const QString &label)
             impl->startGlide(point, now);
         impl->scene.rippleAt = point;
         impl->scene.rippleStart = std::max(now, impl->scene.landAt());
+        impl->rearmHide(impl->scene.rippleStart + detail::kBurst, detail::kAutoHideAfterPulse);
         impl->show(now);
     }
     return true;
@@ -1491,14 +1541,24 @@ bool CuaReticle::pulseClick(QPointF point, const QString &label)
 void CuaReticle::hide()
 {
     requireMainThread();
-    impl->scene.visible = false;
-    impl->scene.focus = {};
-    impl->scene.rippleStart = detail::kNever;
-    if (!impl->scene.hudAnimating(impl->scene.now()))
-        impl->stopTimer();  // the HUD keeps its own animation and fade going
-    if (impl->panel) {
-        [impl->panel orderOut:nil];
-        [impl->view setNeedsDisplay:YES];
+    impl->doHide();
+}
+
+void CuaReticle::hideAfter(double seconds)
+{
+    requireMainThread();
+    Scene &s = impl->scene;
+    if (!s.visible)
+        return;
+    const double delay = std::isfinite(seconds) ? std::max(0.0, seconds) : 0.0;
+    if (delay <= 0) {
+        impl->doHide();
+        return;
+    }
+    s.hideAt = std::min(s.hideAt, s.now() + delay);  // an earlier pending pop-out still wins
+    if (!s.offscreen) {
+        impl->invalidate(s.now(), true);
+        impl->ensureTimer();
     }
 }
 
@@ -1581,7 +1641,9 @@ ReticleState CuaReticle::state() const
     @autoreleasepool {
         const Scene &s = impl->scene;
         const double now = s.now();
-        st.visible = s.visible;
+        st.visible = s.visible && !s.hideDue(now);
+        st.cursorAlpha = st.visible ? s.cursorAlpha(now) : 0;
+        st.hideScheduled = st.visible && s.hideAt < detail::kForever;
         st.tip = s.hasTip ? s.tip(now) : QPointF();
         st.target = s.to;
         st.gliding = s.visible && s.gliding(now);
@@ -1606,8 +1668,10 @@ ReticleState CuaReticle::state() const
 
 void CuaReticle::advanceClock(double seconds)
 {
-    if (impl->scene.offscreen && std::isfinite(seconds) && seconds > 0)
+    if (impl->scene.offscreen && std::isfinite(seconds) && seconds > 0) {
         impl->scene.manualNow += seconds;
+        impl->settleHide(impl->scene.now());
+    }
 }
 
 QImage CuaReticle::render(double scale, const QColor &background) const

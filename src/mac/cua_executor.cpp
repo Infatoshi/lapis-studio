@@ -336,6 +336,14 @@ void hideCuaHud(double afterSeconds)
     runOnMainThread([&] { sharedReticle()->hideHud(afterSeconds); });
 }
 
+void hideCuaReticle(double afterSeconds)
+{
+    runOnMainThread([afterSeconds] {
+        if (CuaReticle *r = g_sharedReticle.load())
+            r->hideAfter(afterSeconds);
+    });
+}
+
 void setOverlayTheme(bool lapisBlue)
 {
     g_overlayLapisBlue.store(lapisBlue);
@@ -365,7 +373,8 @@ CuaHooks defaultCuaHooks()
 {
     CuaHooks h;
     h.listDisplays = [] { return studio::cua::listDisplays(); };
-    h.inspectDisplay = [](uint32_t id) { return studio::cua::inspectDisplay(id, 400, 0.4); };
+    // Web pages nest posts 18-30 levels deep: a wider node cap and a longer budget than native UI needs.
+    h.inspectDisplay = [](uint32_t id) { return studio::cua::inspectDisplay(id, 500, 0.9); };
     h.captureDisplayJpeg = [](uint32_t id, int w, const QVector<uint32_t> &exclude, QString *err) {
         return studio::cua::captureDisplayJpeg(id, w, exclude, err);
     };
@@ -385,6 +394,7 @@ CuaHooks defaultCuaHooks()
         runOnMainThread([&] { sharedReticle()->pulseClick(p, label); });
     };
     h.reticleHide = [] { runOnMainThread([] { sharedReticle()->hide(); }); };
+    h.reticleHideAfter = [](double seconds) { hideCuaReticle(seconds); };
     h.reticleWindowId = [] {
         uint32_t id = 0;
         runOnMainThread([&] { id = sharedReticle()->windowNumber(); });
@@ -404,6 +414,11 @@ CuaHooks defaultCuaHooks()
     h.activateApp = [](const QString &hint) {
         AppActivation a;
         runOnMainThread([&] { a.ok = activateAppByName(hint, &a.displayId, &a.pid, &a.launched); });
+        return a;
+    };
+    h.openUrl = [](const QString &hint, const QString &url) {
+        AppActivation a;
+        runOnMainThread([&] { a.ok = openUrlInApp(hint, url, &a.displayId, &a.pid, &a.launched, &a.appName); });
         return a;
     };
     h.selfPid = [] { return int(getpid()); };
@@ -544,7 +559,7 @@ void CuaExecutor::traceStep(const QString &action, const QString &target, const 
                                         r.observation}))
         return;
     const bool observe = action == QLatin1String("observe");
-    const bool pointless = observe || action == QLatin1String("hotkey");  // no screen point to learn
+    const bool pointless = observe || action == QLatin1String("hotkey") || action == QLatin1String("open");  // no screen point
     const bool hasPt = !pointless && (r.ok || !r.globalPt.isNull());
     const DisplayInfo d = traceDisplay(rt, r.globalPt, hasPt);
     if (m_step.before.isEmpty() || m_step.beforeDisplayId != d.displayId) {
@@ -650,6 +665,44 @@ QString normalizeTypedText(const QString &text)
     return out;
 }
 
+bool wholeViewScrollTarget(const QString &targetDesc, const QString &appHint)
+{
+    QString t = targetDesc.simplified();
+    if (!appHint.isEmpty() && t.compare(appHint, Qt::CaseInsensitive) != 0)
+        t = stripAppHint(t, appHint);
+    else if (!appHint.isEmpty())
+        t.clear();  // just the app
+    // "Chrome|x.com page" leaves "|x.com page"; a leftover '|' is a separator, not a target.
+    while (!t.isEmpty() && (t.front() == QLatin1Char('|') || t.front().isSpace()))
+        t.remove(0, 1);
+    while (!t.isEmpty() && (t.back() == QLatin1Char('|') || t.back().isSpace()))
+        t.chop(1);
+    t = t.toLower();
+    static const QRegularExpression article(QStringLiteral("^(the|this|that)\\s+"));
+    t.remove(article);
+    if (t.isEmpty())
+        return true;
+    static const QStringList nouns{QStringLiteral("page"),     QStringLiteral("window"),  QStringLiteral("screen"),
+                                   QStringLiteral("timeline"), QStringLiteral("feed"),    QStringLiteral("content"),
+                                   QStringLiteral("body"),     QStringLiteral("main"),    QStringLiteral("web page"),
+                                   QStringLiteral("webpage")};
+    if (nouns.contains(t))
+        return true;
+    for (const char *suffix : {" page", " window", " timeline", " feed"})
+        if (t.endsWith(QLatin1String(suffix)))
+            return true;
+    return false;
+}
+
+bool navigationHotkey(const QString &combo)
+{
+    const ParsedHotkey hk = parseHotkeyCombo(combo);
+    if (!hk.valid)
+        return false;
+    return hk.display == QLatin1String("Cmd+R") || hk.display == QLatin1String("Cmd+Shift+R")
+           || hk.display == QLatin1String("Cmd+[") || hk.display == QLatin1String("Cmd+]");
+}
+
 int axMatchScore(const AxNode &node, const QString &targetDesc)
 {
     const QString q = targetDesc.simplified().toLower();
@@ -738,6 +791,8 @@ bool CuaExecutor::route(const QString &targetDesc, bool activate, Route *r, QStr
             const AppActivation a = m_hooks.activateApp(r->appHint);
             if (a.ok) {
                 id = a.displayId;
+                r->activated = true;
+                r->appPid = a.pid;
                 // On one screen this is the fullscreen Space slide: wait for the app to be in
                 // front and the slide to finish before anything is inspected or captured.
                 waitFrontmost(a.pid, a.launched, r->selfPid);
@@ -813,6 +868,12 @@ bool CuaExecutor::waitFrontmost(int pid, bool launched, int selfPid)
             return false;
         pause(kFrontPollMs);
     }
+}
+
+void CuaExecutor::endStep() const
+{
+    if (m_hooks.reticleHideAfter)
+        m_hooks.reticleHideAfter(kStepHideSec);
 }
 
 void CuaExecutor::hud(const QString &status, HudTone tone) const
@@ -942,6 +1003,7 @@ CuaExecResult CuaExecutor::clickTarget(const QString &targetDesc, bool doubleCli
     m_step.target = targetDesc;
     Route rt;
     const CuaExecResult r = click(targetDesc, doubleClick, refineCrop, true, &rt);
+    endStep();
     traceStep(QStringLiteral("click"), targetDesc.simplified(), {}, rt, r);
     return r;
 }
@@ -1001,13 +1063,70 @@ QVector<AxNode> CuaExecutor::visibleNodes(const Route &rt, uint32_t displayId) c
     return nodes;
 }
 
-QString CuaExecutor::observeAfterAction(const Route &rt)
+void CuaExecutor::preferDisplay(Route *rt, uint32_t displayId)
 {
-    if (!m_hooks.inspectDisplay || rt.displays.isEmpty())
+    if (!displayId)
+        return;
+    for (qsizetype i = 0; i < rt->displays.size(); ++i)
+        if (rt->displays[i].displayId == displayId) {
+            rt->displays.move(i, 0);
+            rt->targetDisplayId = displayId;
+            return;
+        }
+}
+
+bool CuaExecutor::appWindow(const Route &rt, AppWindowInfo *out) const
+{
+    if (!m_hooks.listAppWindows || (rt.appPid <= 0 && rt.appHint.isEmpty()))
+        return false;
+    // Front to back: the first match is the app's frontmost window (a cmd+n window included).
+    for (const AppWindowInfo &w : m_hooks.listAppWindows()) {
+        if (!w.displayId || w.globalRect.isEmpty() || (rt.selfPid > 0 && w.pid == rt.selfPid))
+            continue;
+        if (rt.appPid > 0 ? w.pid == rt.appPid : appNameMatches(w.appName, rt.appHint)) {
+            *out = w;
+            return true;
+        }
+    }
+    return false;
+}
+
+QString CuaExecutor::observeAfterAction(const Route &routed, bool waitPageLoad, bool followWindow)
+{
+    if (!m_hooks.inspectDisplay || routed.displays.isEmpty())
         return {};
     if (m_hooks.pause)
-        m_hooks.pause(kObserveSettleMs);  // let the click / keystrokes repaint before reading
-    return formatNodesForModel(visibleNodes(rt, rt.displays.first().displayId), kPostActionChars);
+        m_hooks.pause(waitPageLoad ? kNavSettleMs : kObserveSettleMs);  // let the UI repaint before reading
+    Route rt = routed;
+    if (followWindow) {
+        AppWindowInfo w;
+        if (appWindow(rt, &w))
+            preferDisplay(&rt, w.displayId);
+    }
+    const uint32_t displayId = rt.displays.first().displayId;
+    QVector<AxNode> nodes = visibleNodes(rt, displayId);
+    if (waitPageLoad) {
+        // A page that just started loading shows a spinner and an empty web area: re-read until
+        // the app has real content (enough nodes, and some text or a link) or the polls run out.
+        const auto loaded = [&](const QVector<AxNode> &ns) {
+            int inApp = 0;
+            bool content = false;
+            for (const AxNode &n : ns) {
+                if (!rt.appHint.isEmpty() && !appNameMatches(n.appName, rt.appHint) && (rt.appPid <= 0 || n.pid != rt.appPid))
+                    continue;
+                ++inApp;
+                content = content || n.role == QLatin1String("AXStaticText") || n.role == QLatin1String("AXLink")
+                          || n.role == QLatin1String("AXHeading");
+            }
+            return inApp >= kNavMinNodes && content;
+        };
+        for (int i = 0; i < kNavPolls && !loaded(nodes); ++i) {
+            if (m_hooks.pause)
+                m_hooks.pause(kNavPollMs);
+            nodes = visibleNodes(rt, displayId);
+        }
+    }
+    return formatNodesForModel(nodes, kPostActionChars);
 }
 
 CuaExecResult CuaExecutor::observeApp(const QString &appHint)
@@ -1027,6 +1146,7 @@ CuaExecResult CuaExecutor::typeIntoTarget(const QString &targetDesc, const QStri
     m_step.text = text;
     Route rt;
     const CuaExecResult r = typeImpl(targetDesc, text, clearFirst, &rt);
+    endStep();
     traceStep(QStringLiteral("type"), targetDesc.simplified(), normalizeTypedText(text), rt, r);
     return r;
 }
@@ -1037,6 +1157,7 @@ CuaExecResult CuaExecutor::scrollTarget(const QString &targetDesc, int deltaY)
     m_step.target = targetDesc;
     Route rt;
     const CuaExecResult r = scrollImpl(targetDesc, deltaY, &rt);
+    endStep();
     traceStep(QStringLiteral("scroll"), targetDesc.simplified(), {}, rt, r, deltaY);
     return r;
 }
@@ -1100,7 +1221,8 @@ CuaExecResult CuaExecutor::typeImpl(const QString &targetDesc, const QString &te
     if (typed.contains(QLatin1Char('\n')))
         r.detail += QStringLiteral(" + Return");
     hud(QStringLiteral("Done · Typed %1").arg(typedPreview(typed)), HudTone::Done);
-    r.observation = observeAfterAction(rt);
+    // A Return usually submits (an address bar, a search): wait for what it loads.
+    r.observation = observeAfterAction(rt, typed.contains(QLatin1Char('\n')));
     return r;
 }
 
@@ -1112,8 +1234,35 @@ CuaExecResult CuaExecutor::scrollImpl(const QString &targetDesc, int deltaY, Rou
     const QString label = target.isEmpty() ? QStringLiteral("Scrolling") : QStringLiteral("Scrolling %1").arg(target);
     Located loc;
     Route &rt = *rtOut;
-    if (!target.isEmpty())
+    const QString namedApp = extractAppHint(target);
+    const QString viewApp = namedApp.isEmpty() ? m_defaultAppHint : namedApp;
+    const bool wholeView = wholeViewScrollTarget(target, viewApp);
+    if (wholeView) {
+        // "Chrome", "Chrome|x.com page", "timeline": the page itself, never a control. Asking AX
+        // or the VLM for "page" lands on the toolbar (the address bar at y=93), so scroll the
+        // middle of the app's frontmost window, a little below centre to clear its toolbar.
+        QString err;
+        if (!route(target, !namedApp.isEmpty(), &rt, &err)) {
+            hudFail(target, QStringLiteral("Scroll failed · %1").arg(err));
+            return {false, QStringLiteral("ERR"), {}, err};
+        }
+        hud(hudScope(rt.appHint) + QStringLiteral("Scrolling"), HudTone::Working);
+        AppWindowInfo w;
+        if (appWindow(rt, &w)) {
+            preferDisplay(&rt, w.displayId);
+            const QRectF area = w.globalRect.intersected(rt.displays.first().globalPoints);
+            const QRectF box = area.isEmpty() ? w.globalRect : area;
+            loc.ok = true;
+            loc.tier = QStringLiteral("WINDOW");
+            loc.pt = QPointF(box.center().x(), box.top() + box.height() * 0.55);
+            loc.detail = QStringLiteral("%1 window centre").arg(w.appName.isEmpty() ? rt.appHint : w.appName);
+            m_step.app = w.appName;
+            if (m_hooks.reticleMove)
+                m_hooks.reticleMove(loc.pt, label);
+        }
+    } else if (!target.isEmpty()) {
         loc = locate(target, false, label, QStringLiteral("Scrolling"), &rt);
+    }
     if (!loc.ok) {
         // No target, or it was not found: scroll the middle of the routed display (never
         // fullscreen Lapis when another monitor has the user's apps).
@@ -1122,7 +1271,7 @@ CuaExecResult CuaExecutor::scrollImpl(const QString &targetDesc, int deltaY, Rou
             hudFail(target, QStringLiteral("Scroll failed · %1").arg(err));
             return {false, QStringLiteral("ERR"), {}, err};
         }
-        if (target.isEmpty())
+        if (target.isEmpty() && !wholeView)
             hud(hudScope(rt.appHint) + QStringLiteral("Scrolling"), HudTone::Working);
         const DisplayInfo display = rt.displays.first();
         const QString why = loc.detail;
@@ -1155,8 +1304,84 @@ CuaExecResult CuaExecutor::hotkeyAction(const QString &appHint, const QString &c
     m_step.text = combo;
     Route rt;
     const CuaExecResult r = hotkeyImpl(appHint, combo, &rt);
+    endStep();
     traceStep(QStringLiteral("hotkey"), appHint.simplified(), combo.simplified(), rt, r);
     return r;
+}
+
+CuaExecResult CuaExecutor::openAction(const QString &appHint, const QString &url)
+{
+    m_step = {};
+    m_step.target = appHint;
+    m_step.text = url;
+    Route rt;
+    const CuaExecResult r = openImpl(appHint, url, &rt);
+    endStep();
+    traceStep(QStringLiteral("open"), appHint.simplified(), url.trimmed(), rt, r);
+    return r;
+}
+
+CuaExecResult CuaExecutor::openImpl(const QString &appHint, const QString &url, Route *rtOut)
+{
+    const QString raw = appHint.simplified();
+    QString hint = extractAppHint(raw);
+    if (hint.isEmpty())
+        hint = raw;  // an app the hint table does not list: open it by name anyway
+    Route &rt = *rtOut;
+    QString err;
+    if (url.trimmed().isEmpty()) {
+        if (hint.isEmpty()) {
+            hudFail(raw, QStringLiteral("Open failed · name an app or a URL"));
+            return {false, QStringLiteral("ERR"), {}, QStringLiteral("cua_open needs an app or a URL")};
+        }
+        // route() activates, and activateApp reopens a window when the app is running without one.
+        if (!route(raw, true, &rt, &err, hint)) {
+            hudFail(raw, QStringLiteral("Open failed · %1").arg(err));
+            return {false, QStringLiteral("ERR"), {}, err};
+        }
+        if (m_hooks.activateApp && !rt.activated) {
+            hudFail(raw, QStringLiteral("Couldn't open %1").arg(hint));
+            return {false, QStringLiteral("ERR"), {}, QStringLiteral("Could not open %1 (not running and not installed)").arg(hint),
+                    observeAfterAction(rt)};
+        }
+        hud(QStringLiteral("Done · Opened %1").arg(hint), HudTone::Done);
+        return {true, QStringLiteral("OPEN"), {}, QStringLiteral("Opened %1").arg(hint), observeAfterAction(rt, false, true)};
+    }
+
+    const QString full = normalizeOpenUrl(url);
+    if (full.isEmpty()) {
+        hudFail(url, QStringLiteral("Open failed · not a URL"));
+        return {false, QStringLiteral("ERR"), {}, QStringLiteral("Not a URL: %1").arg(url.trimmed())};
+    }
+    if (!m_hooks.openUrl) {
+        hudFail(url, QStringLiteral("Open failed · no URL opener"));
+        return {false, QStringLiteral("ERR"), {}, QStringLiteral("No URL opener")};
+    }
+    QString shown = full;
+    shown.remove(QRegularExpression(QStringLiteral("^https?://")));
+    hud(hudScope(hint) + QStringLiteral("Opening %1").arg(shown), HudTone::Working);
+    const AppActivation a = m_hooks.openUrl(hint, full);
+    if (!a.ok) {
+        hudFail(url, QStringLiteral("Couldn't open %1").arg(shown));
+        return {false, QStringLiteral("ERR"), {}, QStringLiteral("Could not open %1%2").arg(full,
+                    hint.isEmpty() ? QString() : QStringLiteral(" in %1").arg(hint))};
+    }
+    const int selfPid = m_hooks.selfPid ? m_hooks.selfPid() : 0;
+    waitFrontmost(a.pid, a.launched, selfPid);
+    // The browser that took the URL is already in front: route to it without activating again.
+    const QString app = hint.isEmpty() ? a.appName : hint;
+    if (!route(app, false, &rt, &err, app)) {
+        hudFail(url, QStringLiteral("Open failed · %1").arg(err));
+        return {false, QStringLiteral("ERR"), {}, err};
+    }
+    rt.appPid = a.pid;
+    rt.activated = true;
+    AppWindowInfo w;
+    preferDisplay(&rt, appWindow(rt, &w) ? w.displayId : a.displayId);
+    m_step.app = app;
+    hud(QStringLiteral("Done · Opened %1").arg(shown), HudTone::Done);
+    const QString detail = QStringLiteral("Opened %1 in a new tab%2").arg(full, app.isEmpty() ? QString() : QStringLiteral(" (%1)").arg(app));
+    return {true, QStringLiteral("OPEN"), {}, detail, observeAfterAction(rt, true)};
 }
 
 CuaExecResult CuaExecutor::dragTarget(const QString &fromDesc, const QString &toDesc)
@@ -1166,6 +1391,7 @@ CuaExecResult CuaExecutor::dragTarget(const QString &fromDesc, const QString &to
     m_step.text = toDesc;
     Route rt;
     const CuaExecResult r = dragImpl(fromDesc, toDesc, &rt);
+    endStep();
     traceStep(QStringLiteral("drag"), fromDesc.simplified(), toDesc.simplified(), rt, r);
     return r;
 }
@@ -1199,7 +1425,8 @@ CuaExecResult CuaExecutor::hotkeyImpl(const QString &appHint, const QString &com
     hud(QStringLiteral("Done · Pressed %1").arg(hk.display), HudTone::Done);
     const QString detail = rt.appHint.isEmpty() ? QStringLiteral("Pressed %1").arg(hk.display)
                                                 : QStringLiteral("Pressed %1 in %2").arg(hk.display, rt.appHint);
-    return {true, QStringLiteral("KEY"), {}, detail, observeAfterAction(rt)};
+    // Follow the app's frontmost window: cmd+n may have opened it on another monitor.
+    return {true, QStringLiteral("KEY"), {}, detail, observeAfterAction(rt, navigationHotkey(combo), true)};
 }
 
 CuaExecResult CuaExecutor::dragImpl(const QString &fromDesc, const QString &toDesc, Route *rtOut)

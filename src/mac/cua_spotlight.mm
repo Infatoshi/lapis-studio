@@ -31,20 +31,41 @@ double spotlightHeight(bool drawer, double answerHeight)
 {
     if (!drawer)
         return kSpotlightBaseHeight;
-    // base 96 + divider gap 10 + 1 + gap 10 + question 18 + gap 6 + answer + bottom 12 (- 1 overlap)
+    // capsule 56 + hairline 1 + gap 9 + question 18 + gap 6 + answer + bottom 12
     const double body = std::clamp(answerHeight, 0.0, kSpotlightAnswerMaxHeight);
-    return std::min(kSpotlightMaxHeight, kSpotlightBaseHeight + 46 + body);
+    return std::min(kSpotlightMaxHeight, kSpotlightBaseHeight + kSpotlightDrawerChrome + body);
 }
 
-QString spotlightHint(bool listening)
+QString spotlightHint(SpotlightVoice voice, bool answerShown, bool hasText)
 {
-    return listening ? QStringLiteral("● Listening…") : QStringLiteral("L2 voice · R2 send · ○ close");
+    switch (voice) {
+    case SpotlightVoice::Held: return QStringLiteral("L2 release");
+    case SpotlightVoice::Toggled: return QStringLiteral("Listening · tap L2 to send");
+    case SpotlightVoice::Transcribing: return QStringLiteral("Transcribing…");
+    case SpotlightVoice::Idle: break;
+    }
+    if (hasText)
+        return QStringLiteral("R2 send");
+    return answerShown ? QStringLiteral("○ close") : QStringLiteral("L2 voice");
 }
 
-QString spotlightPlaceholder(const QString &targetApp)
+QString spotlightPlaceholder(const QString &context, SpotlightVoice voice)
 {
-    return targetApp.isEmpty() ? QStringLiteral("Command or ask anything…")
-                               : QStringLiteral("Command or ask about %1…").arg(targetApp);
+    switch (voice) {
+    case SpotlightVoice::Held: return QStringLiteral("Speak or type…");
+    case SpotlightVoice::Toggled: return QStringLiteral("Tap L2 to send…");
+    case SpotlightVoice::Transcribing: return QStringLiteral("Transcribing…");
+    case SpotlightVoice::Idle: break;
+    }
+    return context.isEmpty() ? QStringLiteral("Ask or control anything…") : QStringLiteral("Ask or control %1…").arg(context);
+}
+
+QString spotlightContextLabel(const QString &appName)
+{
+    QString n = appName.simplified();
+    if (n.startsWith(QLatin1String("Google ")) && n.size() > 7)
+        n = n.mid(7);
+    return n;
 }
 
 bool studioAppIsActive()
@@ -71,15 +92,18 @@ NSString *ns(const QString &s)
     return s.toNSString();
 }
 
-// Lapis Gold (qml/Theme.qml); lapis-blue mode swaps only the accent pair.
-constexpr uint32_t kCard = 0x0D0C0B, kCardHi = 0x14120F, kHairline = 0x1D1915, kInputBg = 0x050404;
+// Lapis Gold (qml/Theme.qml); lapis-blue mode swaps only the accent.
+constexpr uint32_t kCard = 0x0D0C0B, kCardHi = 0x14120F, kHairline = 0x1D1915;
 constexpr uint32_t kInk = 0xE8D5B5, kBodyText = 0xD9CFC3, kDim = 0x6E665E, kMuted = 0x4C453D;
-constexpr uint32_t kGold = 0xE09F3E, kCopper = 0xB5653B, kBlue = 0x4F8CFF, kBlueDeep = 0x2D5AA8;
+constexpr uint32_t kGold = 0xE09F3E, kBlue = 0x4F8CFF;
 constexpr double kW = studio::cua::kSpotlightWidth;
-constexpr double kHintIcon = 16, kHintTop = 12, kHintH = 22;
+constexpr double kBarH = studio::cua::kSpotlightBaseHeight;
+// The capsule's row: the status mark centred at x 22, the pill from x 38, the badge 16 pt in
+// from the right, everything centred on y 28.
+constexpr double kMarkCx = 22, kRowCy = kBarH / 2, kPillX = 38, kPillH = 22, kBadgeIcon = 16, kBadgeH = 24;
+constexpr double kPromptH = 26;
 
 uint32_t accentRgb() { return g_lapisBlue.load() ? kBlue : kGold; }
-uint32_t secondaryRgb() { return g_lapisBlue.load() ? kBlueDeep : kCopper; }
 
 NSFont *avenir(NSString *name, double size, NSFontWeight fallback)
 {
@@ -91,7 +115,7 @@ NSFont *menlo(double size, bool bold = false)
     NSFont *f = [NSFont fontWithName:bold ? @"Menlo-Bold" : @"Menlo-Regular" size:size];
     return f ?: [NSFont monospacedSystemFontOfSize:size weight:bold ? NSFontWeightBold : NSFontWeightRegular];
 }
-NSFont *promptFont() { return avenir(@"AvenirNext-Regular", 18, NSFontWeightRegular); }
+NSFont *promptFont() { return avenir(@"AvenirNext-Regular", 17.5, NSFontWeightRegular); }
 
 void fillRounded(CGContextRef ctx, CGRect r, double radius, NSColor *fill, NSColor *stroke = nil, double lw = 1)
 {
@@ -114,63 +138,98 @@ void fillRounded(CGContextRef ctx, CGRect r, double radius, NSColor *fill, NSCol
     }
 }
 
-// ---- The top-right hint: [L2] voice  [R2] send  [○] close, or a pulsing dot + Listening… ----
-struct HintItem {
-    studio::cua::PadButton button;
-    NSString *label;
+// ---- The right badge: one controller icon + a word ------------------------------------------------
+// Held [L2] release, Toggled [L2] send, Transcribing "Transcribing…" (no icon), an answer [○] close,
+// typed text [R2] send, else [L2] voice.
+struct Badge {
+    bool icon = true;
+    studio::cua::PadButton button = studio::cua::PadButton::L2;
+    NSString *label = @"voice";
+    bool accent = false;  // the word in the accent (live states), else dim
 };
-const HintItem kHintItems[] = {{studio::cua::PadButton::L2, @"voice"},
-                               {studio::cua::PadButton::R2, @"send"},
-                               {studio::cua::PadButton::Circle, @"close"}};
-constexpr double kHintIconGap = 5, kHintItemGap = 12;
-
-NSDictionary *hintAttrs(bool listening)
+Badge badgeFor(studio::cua::SpotlightVoice v, bool answerShown, bool hasText)
 {
-    return @{NSFontAttributeName: menlo(11), NSForegroundColorAttributeName: listening ? hex(accentRgb()) : hex(kDim)};
+    using V = studio::cua::SpotlightVoice;
+    if (v == V::Held)
+        return {true, studio::cua::PadButton::L2, @"release", true};
+    if (v == V::Toggled)
+        return {true, studio::cua::PadButton::L2, @"send", true};
+    if (v == V::Transcribing)
+        return {false, studio::cua::PadButton::L2, @"Transcribing…", true};
+    if (hasText)
+        return {true, studio::cua::PadButton::R2, @"send", false};
+    if (answerShown)
+        return {true, studio::cua::PadButton::Circle, @"close", false};
+    return {true, studio::cua::PadButton::L2, @"voice", false};
 }
-NSString *listeningText() { return @"Listening…"; }
-
-double hintWidth(bool listening)
+constexpr double kBadgeGap = 6;
+NSDictionary *badgeAttrs(const Badge &b)
 {
-    NSDictionary *attrs = hintAttrs(listening);
-    if (listening)
-        return 7 + 7 + std::ceil([listeningText() sizeWithAttributes:attrs].width);
-    double w = 0;
-    for (const HintItem &it : kHintItems)
-        w += studio::cua::padIconSize(it.button, kHintIcon).width + kHintIconGap + std::ceil([it.label sizeWithAttributes:attrs].width);
-    return w + kHintItemGap * (std::size(kHintItems) - 1);
+    return @{NSFontAttributeName: menlo(11), NSForegroundColorAttributeName: b.accent ? hex(accentRgb(), 0.95) : hex(kDim)};
 }
-
-// Draws the hint right-aligned in `r` (y-down, an NSGraphicsContext current). `phase` in [0, 1)
-// drives the listening pulse.
-void paintHint(CGContextRef ctx, CGRect r, bool listening, double phase)
+double badgeWidth(const Badge &b)
 {
-    NSDictionary *attrs = hintAttrs(listening);
+    const double text = std::ceil([b.label sizeWithAttributes:badgeAttrs(b)].width);
+    return b.icon ? studio::cua::padIconSize(b.button, kBadgeIcon).width + kBadgeGap + text : text;
+}
+// Draws the badge right-aligned in `r` (y-down, an NSGraphicsContext current).
+void paintBadge(CGContextRef ctx, CGRect r, const Badge &b)
+{
+    NSDictionary *attrs = badgeAttrs(b);
     const double cy = CGRectGetMidY(r);
     const double lineH = std::ceil(menlo(11).ascender - menlo(11).descender);
-    double x = CGRectGetMaxX(r) - hintWidth(listening);
-    if (listening) {
+    double x = CGRectGetMaxX(r) - badgeWidth(b);
+    if (b.icon) {
+        // The live states light the icon in the accent; at rest it is warm ink.
+        const studio::cua::PadIconColors colors = studio::cua::padIconColors(b.accent, g_lapisBlue.load());
+        const CGSize sz = studio::cua::padIconSize(b.button, kBadgeIcon);
+        studio::cua::drawPadIcon(ctx, b.button, CGRectMake(x, cy - sz.height / 2, sz.width, sz.height), colors);
+        x += sz.width + kBadgeGap;
+    }
+    [b.label drawAtPoint:NSMakePoint(x, cy - lineH / 2) withAttributes:attrs];
+}
+
+// ---- The left status mark -----------------------------------------------------------------------
+// Listening: a 10 pt breathing accent orb with a ripple ring. Working (transcribing, thinking,
+// acting): a spinning 4-point accent star. Idle: a steady dim accent dot. `phase` in [0, 1).
+enum class Mark { Idle, Listening, Working };
+void paintMark(CGContextRef ctx, CGPoint c, Mark m, double phase)
+{
+    CGContextSaveGState(ctx);
+    if (m == Mark::Listening) {
         const double breathe = 0.5 + 0.5 * std::cos(2 * M_PI * phase);
-        CGContextSaveGState(ctx);
-        const double hr = 3.5 + 4.5 * (1 - std::pow(1 - phase, 3));
-        CGContextSetLineWidth(ctx, 1);
-        CGContextSetStrokeColorWithColor(ctx, hex(accentRgb(), 0.5 * (1 - phase)).CGColor);
-        CGContextStrokeEllipseInRect(ctx, CGRectMake(x + 3.5 - hr, cy - hr, 2 * hr, 2 * hr));
-        CGContextSetShadowWithColor(ctx, CGSizeZero, 3 + 4 * breathe, hex(accentRgb(), 0.45 + 0.4 * breathe).CGColor);
-        CGContextSetFillColorWithColor(ctx, hex(accentRgb(), 0.85 + 0.15 * breathe).CGColor);
-        CGContextFillEllipseInRect(ctx, CGRectMake(x, cy - 3.5, 7, 7));
-        CGContextRestoreGState(ctx);
-        [listeningText() drawAtPoint:NSMakePoint(x + 14, cy - lineH / 2) withAttributes:attrs];
-        return;
+        const double ring = 5 + 7 * (1 - std::pow(1 - phase, 3));
+        CGContextSetLineWidth(ctx, 1.2);
+        CGContextSetStrokeColorWithColor(ctx, hex(accentRgb(), 0.55 * (1 - phase)).CGColor);
+        CGContextStrokeEllipseInRect(ctx, CGRectMake(c.x - ring, c.y - ring, 2 * ring, 2 * ring));
+        const double r = 4.4 + 0.6 * breathe;
+        CGContextSetShadowWithColor(ctx, CGSizeZero, 3 + 5 * breathe, hex(accentRgb(), 0.45 + 0.4 * breathe).CGColor);
+        CGContextSetFillColorWithColor(ctx, hex(accentRgb(), 0.88 + 0.12 * breathe).CGColor);
+        CGContextFillEllipseInRect(ctx, CGRectMake(c.x - r, c.y - r, 2 * r, 2 * r));
+    } else if (m == Mark::Working) {
+        // Four long points, four short notches, turning once every period.
+        const double rot = 2 * M_PI * phase, R = 6.2, r = 1.9;
+        CGMutablePathRef path = CGPathCreateMutable();
+        for (int k = 0; k < 8; ++k) {
+            const double a = rot + k * M_PI / 4 - M_PI / 2;
+            const double rad = (k % 2 == 0) ? R : r;
+            const CGPoint pt = CGPointMake(c.x + rad * std::cos(a), c.y + rad * std::sin(a));
+            if (k == 0)
+                CGPathMoveToPoint(path, nullptr, pt.x, pt.y);
+            else
+                CGPathAddLineToPoint(path, nullptr, pt.x, pt.y);
+        }
+        CGPathCloseSubpath(path);
+        CGContextSetShadowWithColor(ctx, CGSizeZero, 4, hex(accentRgb(), 0.55).CGColor);
+        CGContextAddPath(ctx, path);
+        CGContextSetFillColorWithColor(ctx, hex(accentRgb()).CGColor);
+        CGContextFillPath(ctx);
+        CGPathRelease(path);
+    } else {
+        CGContextSetFillColorWithColor(ctx, hex(accentRgb(), 0.42).CGColor);
+        CGContextFillEllipseInRect(ctx, CGRectMake(c.x - 4, c.y - 4, 8, 8));
     }
-    const studio::cua::PadIconColors colors = studio::cua::padIconColors(false, g_lapisBlue.load());
-    for (const HintItem &it : kHintItems) {
-        const CGSize sz = studio::cua::padIconSize(it.button, kHintIcon);
-        studio::cua::drawPadIcon(ctx, it.button, CGRectMake(x, cy - sz.height / 2, sz.width, sz.height), colors);
-        x += sz.width + kHintIconGap;
-        [it.label drawAtPoint:NSMakePoint(x, cy - lineH / 2) withAttributes:attrs];
-        x += std::ceil([it.label sizeWithAttributes:attrs].width) + kHintItemGap;
-    }
+    CGContextRestoreGState(ctx);
 }
 
 studio::cua::CuaSpotlight *g_liveSpotlight = nullptr;  // the Visible instance (capture exclusion)
@@ -187,9 +246,10 @@ studio::cua::CuaSpotlight::Impl *g_liveImpl = nullptr;  // ... and its state, fo
 @property(nonatomic, assign) studio::cua::CuaSpotlight::Impl *owner;
 @end
 
-// The top-right controller hint, vector [L2] [R2] [○] icons (cua_pad_icon).
-@interface LapisSpotlightHintBar : NSView
-@property(nonatomic, assign) BOOL listening;
+// The animated bits (the status mark and the badge), redrawn alone by the pulse timer.
+@interface LapisSpotlightAnimView : NSView
+@property(nonatomic, assign) studio::cua::CuaSpotlight::Impl *owner;
+@property(nonatomic, assign) BOOL isMark;  // the status mark, else the badge
 @property(nonatomic, assign) double phase;
 @end
 
@@ -205,7 +265,8 @@ struct CuaSpotlight::Impl {
         bool drawer = false;
         bool pill = false;
         CGRect pillRect = CGRectZero;
-        CGRect hintRect = CGRectZero;
+        CGRect badgeRect = CGRectZero;
+        CGRect promptRect = CGRectZero;  // where the inline field sits
         double answerShown = 0;
         double height = kSpotlightBaseHeight;
     };
@@ -220,14 +281,16 @@ struct CuaSpotlight::Impl {
     LapisSpotlightPanel *panel = nil;
     LapisSpotlightFieldDelegate *delegate = nil;
     LapisSpotlightSurface *surface = nil;
-    LapisSpotlightHintBar *hintBar = nil;
+    LapisSpotlightAnimView *markView = nil;
+    LapisSpotlightAnimView *badgeView = nil;
     NSTextField *input = nil;
     NSScrollView *answerScroll = nil;
     NSTextView *answerView = nil;
-    NSTimer *pulseTimer = nil;         // redraws the hint's listening pulse
+    NSTimer *pulseTimer = nil;         // redraws the mark and badge while they animate
     NSMutableArray *orderedOut = nil;  // Studio windows ordered out so activation stays on this Space
     id activeObserver = nil;
     id resignObserver = nil;
+    id escapeMonitor = nil;            // global Esc while a turn acts (setEscapeWatch)
 
     // ---- state -------------------------------------------------------------------------------
     bool drawer() const { return !s.lastQuestion.isEmpty() || !s.answer.isEmpty() || !s.statusLine.isEmpty(); }
@@ -237,10 +300,23 @@ struct CuaSpotlight::Impl {
             return s.answer;
         return s.statusLine;
     }
+    Mark mark() const
+    {
+        if (s.voice == SpotlightVoice::Held || s.voice == SpotlightVoice::Toggled)
+            return Mark::Listening;
+        if (s.voice == SpotlightVoice::Transcribing || s.busy || s.actionRunning)
+            return Mark::Working;
+        return Mark::Idle;
+    }
+    Badge badge() const { return badgeFor(s.voice, !s.answer.isEmpty(), !fieldText().trimmed().isEmpty()); }
+    bool animating() const { return mark() != Mark::Idle; }
     void syncDerived()
     {
-        s.hint = spotlightHint(s.listening);
-        s.placeholder = spotlightPlaceholder(s.targetApp);
+        s.listening = s.voice == SpotlightVoice::Held || s.voice == SpotlightVoice::Toggled;
+        s.toggled = s.voice == SpotlightVoice::Toggled;
+        s.transcribing = s.voice == SpotlightVoice::Transcribing;
+        s.hint = spotlightHint(s.voice, !s.answer.isEmpty(), !fieldText().trimmed().isEmpty());
+        s.placeholder = spotlightPlaceholder(s.contextLabel, s.voice);
         s.drawerVisible = drawer();
         if (offscreen) {
             s.key = s.open;
@@ -271,15 +347,27 @@ struct CuaSpotlight::Impl {
                                           options:NSStringDrawingUsesLineFragmentOrigin | NSStringDrawingUsesFontLeading];
         return std::ceil(r.size.height);
     }
+    // The pill: Menlo 11.5 parchment ("Chrome"); over Studio, "Lapis" in the accent and the
+    // project dim ("Lapis · infinity").
     NSAttributedString *pillAttributed() const
     {
         NSFont *f = menlo(11.5);
-        NSMutableAttributedString *as = [[[NSMutableAttributedString alloc]
-            initWithString:@"in "
-                attributes:@{NSFontAttributeName: f, NSForegroundColorAttributeName: hex(kDim)}] autorelease];
-        [as appendAttributedString:[[[NSAttributedString alloc]
-                                       initWithString:ns(s.targetApp)
-                                           attributes:@{NSFontAttributeName: f, NSForegroundColorAttributeName: hex(kInk)}] autorelease]];
+        NSMutableAttributedString *as = [[[NSMutableAttributedString alloc] init] autorelease];
+        const QString label = s.contextLabel;
+        const qsizetype dot = s.overStudio ? label.indexOf(QStringLiteral(" · ")) : -1;
+        if (dot > 0) {
+            [as appendAttributedString:[[[NSAttributedString alloc]
+                                           initWithString:ns(label.left(dot))
+                                               attributes:@{NSFontAttributeName: f, NSForegroundColorAttributeName: hex(accentRgb())}] autorelease]];
+            [as appendAttributedString:[[[NSAttributedString alloc]
+                                           initWithString:ns(label.mid(dot))
+                                               attributes:@{NSFontAttributeName: f, NSForegroundColorAttributeName: hex(kInk)}] autorelease]];
+        } else {
+            [as appendAttributedString:[[[NSAttributedString alloc]
+                                           initWithString:ns(label)
+                                               attributes:@{NSFontAttributeName: f,
+                                                            NSForegroundColorAttributeName: s.overStudio ? hex(accentRgb()) : hex(kInk)}] autorelease]];
+        }
         return as;
     }
     NSDictionary *questionAttrs() const
@@ -291,9 +379,11 @@ struct CuaSpotlight::Impl {
     }
     NSAttributedString *placeholderAttributed() const
     {
+        const bool live = s.voice != SpotlightVoice::Idle;
         return [[[NSAttributedString alloc]
             initWithString:ns(s.placeholder)
-                attributes:@{NSForegroundColorAttributeName: hex(kMuted), NSFontAttributeName: promptFont()}] autorelease];
+                attributes:@{NSForegroundColorAttributeName: live ? hex(accentRgb(), 0.55) : hex(kMuted),
+                             NSFontAttributeName: promptFont()}] autorelease];
     }
 
     // The layout for `answerH` points of answer body.
@@ -301,15 +391,18 @@ struct CuaSpotlight::Impl {
     {
         Layout l;
         l.drawer = s.drawerVisible;
-        const double hw = std::min(300.0, hintWidth(s.listening));
-        l.hintRect = CGRectMake(kW - 16 - hw, kHintTop, hw, kHintH);
-        l.pill = !s.targetApp.isEmpty();
+        const double bw = std::min(220.0, badgeWidth(badge()));
+        l.badgeRect = CGRectMake(kW - 16 - bw, kRowCy - kBadgeH / 2, bw, kBadgeH);
+        double promptX = kPillX + 2;
+        l.pill = !s.contextLabel.isEmpty();
         if (l.pill) {
             const double textW = std::ceil([pillAttributed() size].width);
-            const double maxPill = kW - 16 - hw - 12 - 84;
-            const double tw = std::max(0.0, std::min(maxPill - 18, textW));
-            l.pillRect = CGRectMake(84, 13, tw + 18, 20);
+            const double tw = std::max(0.0, std::min(170.0, textW));
+            l.pillRect = CGRectMake(kPillX, kRowCy - kPillH / 2, tw + 18, kPillH);
+            promptX = CGRectGetMaxX(l.pillRect) + 12;
         }
+        const double promptR = CGRectGetMinX(l.badgeRect) - 12;
+        l.promptRect = CGRectMake(promptX, kRowCy - kPromptH / 2, std::max(40.0, promptR - promptX), kPromptH);
         if (l.drawer)
             l.answerShown = std::min(kSpotlightAnswerMaxHeight, std::max(18.0, answerH));
         l.height = spotlightHeight(l.drawer, l.drawer ? l.answerShown : 0);
@@ -317,48 +410,43 @@ struct CuaSpotlight::Impl {
     }
 
     // The card and every non-control element, y-down card points; `withControls` also draws the
-    // hint, prompt and answer (offscreen render) that live views draw themselves on screen.
+    // mark, badge, prompt and answer (offscreen render) that live views draw themselves on screen.
     void paint(CGContextRef ctx, const Layout &l, bool withControls, double now) const
     {
         @autoreleasepool {
             const CGRect card = CGRectMake(0, 0, kW, l.height);
-            // Card #0d0c0b at 95%, radius 16, a 1 pt accent border (42%, 72% while listening).
-            fillRounded(ctx, card, 16, hex(kCard, 0.95), hex(accentRgb(), s.listening ? 0.72 : 0.42));
-            // Top row: the status dot (secondary at rest, accent while live), "Lapis", the pill.
-            const bool live = s.listening || s.busy || s.actionRunning;
-            CGContextSetFillColorWithColor(ctx, hex(live ? accentRgb() : secondaryRgb()).CGColor);
-            CGContextFillEllipseInRect(ctx, CGRectMake(16, 19, 8, 8));
-            NSFont *titleFont = avenir(@"AvenirNext-DemiBold", 13.5, NSFontWeightSemibold);
-            const double titleH = std::ceil(titleFont.ascender - titleFont.descender);
-            [@"Lapis" drawAtPoint:NSMakePoint(32, 23 - titleH / 2)
-                   withAttributes:@{NSFontAttributeName: titleFont, NSForegroundColorAttributeName: hex(kInk)}];
+            // One capsule: #0d0c0b, radius 16, a 1.2 pt accent rim (75% while listening, else 38%).
+            const bool live = s.voice == SpotlightVoice::Held || s.voice == SpotlightVoice::Toggled;
+            fillRounded(ctx, card, 16, hex(kCard, 0.97), hex(accentRgb(), live ? 0.75 : 0.38), 1.2);
             if (l.pill) {
-                fillRounded(ctx, l.pillRect, 10, hex(kCardHi), hex(kHairline));
+                fillRounded(ctx, l.pillRect, kPillH / 2, hex(kCardHi), hex(kHairline));
                 NSAttributedString *pt = pillAttributed();
                 const double ph = std::ceil(menlo(11.5).ascender - menlo(11.5).descender);
                 [pt drawWithRect:NSMakeRect(l.pillRect.origin.x + 9, CGRectGetMidY(l.pillRect) - ph / 2,
                                             l.pillRect.size.width - 18, ph)
                          options:NSStringDrawingTruncatesLastVisibleLine | NSStringDrawingUsesLineFragmentOrigin];
             }
-            // The prompt box: #050404, #1d1915 hairline (accent 65% while listening).
-            const CGRect box = CGRectMake(12, 44, kW - 24, 42);
-            fillRounded(ctx, box, 10, hex(kInputBg), s.listening ? hex(accentRgb(), 0.65) : hex(kHairline));
             if (l.drawer) {
                 CGContextSetFillColorWithColor(ctx, hex(kHairline).CGColor);
-                CGContextFillRect(ctx, CGRectMake(1, kSpotlightBaseHeight, kW - 2, 1));
+                CGContextFillRect(ctx, CGRectMake(1.2, kSpotlightBaseHeight, kW - 2.4, 1));
                 if (!s.lastQuestion.isEmpty())
-                    [ns(QStringLiteral("› ") + s.lastQuestion) drawInRect:NSMakeRect(16, kSpotlightBaseHeight + 10, kW - 32, 20)
+                    [ns(QStringLiteral("› ") + s.lastQuestion) drawInRect:NSMakeRect(18, kSpotlightBaseHeight + 10, kW - 36, 20)
                                                            withAttributes:questionAttrs()];
             }
             if (!withControls)
                 return;
-            const double period = 1.2, phase = std::fmod(std::max(0.0, now), period) / period;
-            paintHint(ctx, l.hintRect, s.listening, phase);
+            const double period = mark() == Mark::Working ? 1.1 : 1.4;
+            const double phase = std::fmod(std::max(0.0, now), period) / period;
+            paintMark(ctx, CGPointMake(kMarkCx, kRowCy), mark(), phase);
+            paintBadge(ctx, l.badgeRect, badge());
             // Prompt text (or placeholder) where the field draws it, with the caret when key.
             NSFont *pf = promptFont();
             const double lineH = std::ceil(pf.ascender - pf.descender);
-            const NSPoint at = NSMakePoint(box.origin.x + 16, CGRectGetMidY(box) - lineH / 2);
+            const CGRect box = l.promptRect;
+            const NSPoint at = NSMakePoint(box.origin.x + 2, CGRectGetMidY(box) - lineH / 2);
             double caretX = at.x - 3;  // before the placeholder, not over its first glyph
+            CGContextSaveGState(ctx);
+            CGContextClipToRect(ctx, CGRectInset(box, -2, -4));
             if (!s.inputText.isEmpty()) {
                 NSDictionary *a = @{NSFontAttributeName: pf, NSForegroundColorAttributeName: hex(kInk)};
                 [ns(s.inputText) drawAtPoint:at withAttributes:a];
@@ -368,16 +456,26 @@ struct CuaSpotlight::Impl {
             }
             if (s.open && s.key && !s.actionRunning) {
                 CGContextSetFillColorWithColor(ctx, hex(accentRgb()).CGColor);
-                CGContextFillRect(ctx, CGRectMake(caretX, CGRectGetMidY(box) - 10, 2, 20));
+                CGContextFillRect(ctx, CGRectMake(std::min(caretX, CGRectGetMaxX(box)), CGRectGetMidY(box) - 10, 2, 20));
             }
+            CGContextRestoreGState(ctx);
             if (l.drawer) {
-                const CGRect ar = CGRectMake(16, kSpotlightBaseHeight + 35, kW - 32, l.answerShown);
+                const CGRect ar = CGRectMake(18, kSpotlightBaseHeight + 35, kW - 36, l.answerShown);
                 CGContextSaveGState(ctx);
                 CGContextClipToRect(ctx, ar);
                 [bodyAttributed() drawWithRect:NSMakeRect(ar.origin.x, ar.origin.y, ar.size.width, 1e5)
                                        options:NSStringDrawingUsesLineFragmentOrigin | NSStringDrawingUsesFontLeading];
                 CGContextRestoreGState(ctx);
             }
+        }
+    }
+    void paintAnim(CGContextRef ctx, bool isMark, CGRect bounds, double phase) const
+    {
+        @autoreleasepool {
+            if (isMark)
+                paintMark(ctx, CGPointMake(CGRectGetMidX(bounds), CGRectGetMidY(bounds)), mark(), phase);
+            else
+                paintBadge(ctx, bounds, badge());
         }
     }
 
@@ -391,7 +489,7 @@ struct CuaSpotlight::Impl {
         copy.offscreen = true;
         copy.syncDerived();
         copy.s.key = s.open && (offscreen || (panel && panel.keyWindow));
-        const Layout l = copy.layoutFor(measure(copy.bodyAttributed(), kW - 32));
+        const Layout l = copy.layoutFor(copy.s.drawerVisible ? measure(copy.bodyAttributed(), kW - 36) : 0);
         const int w = int(std::ceil(kW * scale)), h = int(std::ceil(l.height * scale));
         QImage img(w, h, QImage::Format_RGBA8888_Premultiplied);
         img.fill(Qt::transparent);
@@ -406,7 +504,7 @@ struct CuaSpotlight::Impl {
             CGContextScaleCTM(ctx, scale, -scale);
             NSGraphicsContext *previous = [[NSGraphicsContext currentContext] retain];
             [NSGraphicsContext setCurrentContext:[NSGraphicsContext graphicsContextWithCGContext:ctx flipped:YES]];
-            copy.paint(ctx, l, true, 0.15);
+            copy.paint(ctx, l, true, 0.3);
             [NSGraphicsContext setCurrentContext:previous];
             [previous release];
             CGContextRelease(ctx);
@@ -464,10 +562,17 @@ struct CuaSpotlight::Impl {
             surface.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
             panel.contentView = surface;
 
-            hintBar = [[[LapisSpotlightHintBar alloc] initWithFrame:NSMakeRect(kW - 16 - 200, kHintTop, 200, kHintH)] autorelease];
-            [surface addSubview:hintBar];
+            Impl *me = this;
+            markView = [[[LapisSpotlightAnimView alloc] initWithFrame:NSMakeRect(kMarkCx - 13, kRowCy - 13, 26, 26)] autorelease];
+            markView.owner = me;
+            markView.isMark = YES;
+            [surface addSubview:markView];
+            badgeView = [[[LapisSpotlightAnimView alloc] initWithFrame:NSMakeRect(kW - 16 - 120, kRowCy - kBadgeH / 2, 120, kBadgeH)] autorelease];
+            badgeView.owner = me;
+            badgeView.isMark = NO;
+            [surface addSubview:badgeView];
 
-            input = [[[NSTextField alloc] initWithFrame:NSMakeRect(12 + 14, 44 + 9, kW - 24 - 28, 24)] autorelease];
+            input = [[[NSTextField alloc] initWithFrame:NSMakeRect(kPillX + 2, kRowCy - kPromptH / 2, kW - 200, kPromptH)] autorelease];
             input.editable = YES;
             input.selectable = YES;
             input.bezeled = NO;
@@ -484,14 +589,14 @@ struct CuaSpotlight::Impl {
             input.delegate = delegate;
             [surface addSubview:input];
 
-            answerScroll = [[[NSScrollView alloc] initWithFrame:NSMakeRect(16, 130, kW - 32, 20)] autorelease];
+            answerScroll = [[[NSScrollView alloc] initWithFrame:NSMakeRect(18, kSpotlightBaseHeight + 35, kW - 36, 20)] autorelease];
             answerScroll.drawsBackground = NO;
             answerScroll.borderType = NSNoBorder;
             answerScroll.hasVerticalScroller = YES;
             answerScroll.autohidesScrollers = YES;
             answerScroll.scrollerStyle = NSScrollerStyleOverlay;
             answerScroll.scrollerKnobStyle = NSScrollerKnobStyleLight;
-            answerView = [[[NSTextView alloc] initWithFrame:NSMakeRect(0, 0, kW - 32, 20)] autorelease];
+            answerView = [[[NSTextView alloc] initWithFrame:NSMakeRect(0, 0, kW - 36, 20)] autorelease];
             answerView.editable = NO;
             answerView.selectable = YES;
             answerView.drawsBackground = NO;
@@ -523,7 +628,7 @@ struct CuaSpotlight::Impl {
                         usingBlock:^(NSNotification *) {
                             // Clicking into another app dismisses the bar cleanly (keeping the
                             // last exchange for the next L2), just like Raycast/Spotlight.
-                            if (owner->s.open && !owner->s.actionRunning && !owner->s.listening)
+                            if (owner->s.open && !owner->s.actionRunning && owner->s.voice == SpotlightVoice::Idle)
                                 owner->dismissFromUser();
                         }] retain];
         }
@@ -535,28 +640,61 @@ struct CuaSpotlight::Impl {
         [pulseTimer release];
         pulseTimer = nil;
     }
-    // The hint's listening dot breathes: redraw only the hint bar, ~30 fps, only while listening.
+    // The status mark breathes / spins: redraw only it (and the badge), ~30 fps, while it animates.
     void syncPulse()
     {
-        const bool want = panel && s.open && s.listening;
+        const bool want = panel && s.open && animating();
         if (!want) {
             stopPulse();
             return;
         }
         if (pulseTimer)
             return;
-        LapisSpotlightHintBar *bar = hintBar;
+        LapisSpotlightAnimView *m = markView;
+        Impl *owner = this;
         pulseTimer = [[NSTimer timerWithTimeInterval:1.0 / 30 repeats:YES block:^(NSTimer *t) {
             (void)t;
-            bar.phase = std::fmod([[NSProcessInfo processInfo] systemUptime], 1.2) / 1.2;
-            [bar setNeedsDisplay:YES];
+            const double period = owner->mark() == Mark::Working ? 1.1 : 1.4;
+            m.phase = std::fmod([[NSProcessInfo processInfo] systemUptime], period) / period;
+            [m setNeedsDisplay:YES];
         }] retain];
         [[NSRunLoop mainRunLoop] addTimer:pulseTimer forMode:NSRunLoopCommonModes];
+    }
+
+    void setEscapeWatch(bool on)
+    {
+        s.escapeWatch = on;
+        if (offscreen)
+            return;
+        if (!on) {
+            if (escapeMonitor) {
+                [NSEvent removeMonitor:escapeMonitor];
+                [escapeMonitor release];
+                escapeMonitor = nil;
+            }
+            return;
+        }
+        if (escapeMonitor)
+            return;
+        Impl *owner = this;  // removed in teardown, before Impl dies
+        const pid_t myPid = getpid();
+        escapeMonitor = [[NSEvent addGlobalMonitorForEventsMatchingMask:NSEventMaskKeyDown
+                                                                handler:^(NSEvent *e) {
+                                                                    if (e.keyCode != 53 || !owner->s.escapeWatch)
+                                                                        return;
+                                                                    // Our own synthetic keys (a cua_hotkey "esc") never cancel.
+                                                                    CGEventRef cg = e.CGEvent;
+                                                                    if (cg && CGEventGetIntegerValueField(cg, kCGEventSourceUnixProcessID) == myPid)
+                                                                        return;
+                                                                    if (owner->q && owner->q->onGlobalEscape)
+                                                                        owner->q->onGlobalEscape();
+                                                                }] retain];
     }
 
     void teardown()
     {
         stopPulse();
+        setEscapeWatch(false);
         if (activeObserver) {
             [[NSNotificationCenter defaultCenter] removeObserver:activeObserver];
             [activeObserver release];
@@ -570,6 +708,8 @@ struct CuaSpotlight::Impl {
         if (panel) {
             input.delegate = nil;
             surface.owner = nullptr;
+            markView.owner = nullptr;
+            badgeView.owner = nullptr;
             panel.owner = nullptr;
             [panel orderOut:nil];
             [panel close];
@@ -597,7 +737,7 @@ struct CuaSpotlight::Impl {
         double answerH = 0;
         if (offscreen || !panel) {
             if (s.drawerVisible)
-                answerH = measure(bodyAttributed(), kW - 32);
+                answerH = measure(bodyAttributed(), kW - 36);
         } else {
             @autoreleasepool {
                 input.placeholderAttributedString = placeholderAttributed();
@@ -607,7 +747,7 @@ struct CuaSpotlight::Impl {
                 if (d) {
                     [answerView.textStorage setAttributedString:bodyAttributed()];
                     answerView.selectedTextAttributes = @{NSBackgroundColorAttributeName: hex(accentRgb(), 0.28)};
-                    answerView.frame = NSMakeRect(0, 0, kW - 32, answerView.frame.size.height);
+                    answerView.frame = NSMakeRect(0, 0, kW - 36, answerView.frame.size.height);
                     [answerView.layoutManager ensureLayoutForTextContainer:answerView.textContainer];
                     answerH = std::ceil([answerView.layoutManager usedRectForTextContainer:answerView.textContainer].size.height);
                 }
@@ -616,11 +756,12 @@ struct CuaSpotlight::Impl {
         lay = layoutFor(answerH);
         if (panel) {
             @autoreleasepool {
-                hintBar.frame = NSRectFromCGRect(lay.hintRect);
-                hintBar.listening = s.listening;
-                [hintBar setNeedsDisplay:YES];
+                badgeView.frame = NSRectFromCGRect(lay.badgeRect);
+                [badgeView setNeedsDisplay:YES];
+                [markView setNeedsDisplay:YES];
+                input.frame = NSRectFromCGRect(lay.promptRect);
                 if (lay.drawer) {
-                    answerScroll.frame = NSMakeRect(16, kSpotlightBaseHeight + 35, kW - 32, lay.answerShown);
+                    answerScroll.frame = NSMakeRect(18, kSpotlightBaseHeight + 35, kW - 36, lay.answerShown);
                     if (s.busy)
                         [answerView scrollRangeToVisible:NSMakeRange(answerView.string.length, 0)];
                 }
@@ -730,7 +871,35 @@ struct CuaSpotlight::Impl {
         }
         if (offscreen || !active)
             snapshotTarget();
-        const bool reposition = !s.open;
+        s.overStudio = false;
+        s.contextLabel = spotlightContextLabel(s.targetApp);
+        return show(active, reposition0());
+    }
+    bool reposition0() const { return !s.open; }
+
+    // Over Studio itself: no target app, Studio's windows stay where they are.
+    bool openOverStudio(const QString &label)
+    {
+        const bool active = offscreen ? true : studioAppIsActive();
+        const bool wasKey = s.open && !s.actionRunning && s.overStudio && s.contextLabel == label
+                            && (offscreen ? true : (active && panel && panel.keyWindow));
+        if (wasKey) {
+            if (!offscreen)
+                focusInput();
+            return true;
+        }
+        s.overStudio = true;
+        s.targetPid = 0;
+        s.targetApp.clear();
+        s.contextLabel = label;
+        const bool key = show(true, reposition0());
+        if (!offscreen && !active)
+            [NSApp activateIgnoringOtherApps:YES];  // never orders Studio's windows out
+        return key;
+    }
+
+    bool show(bool active, bool reposition)
+    {
         s.open = true;
         s.actionRunning = false;
         ++s.opens;
@@ -764,7 +933,7 @@ struct CuaSpotlight::Impl {
     {
         const bool was = s.open;
         s.open = false;
-        s.listening = false;
+        s.voice = SpotlightVoice::Idle;
         s.actionRunning = false;
         s.key = false;
         s.alpha = 0;
@@ -800,6 +969,12 @@ struct CuaSpotlight::Impl {
         }
     }
 
+    void inputEdited()
+    {
+        render(false);  // the badge follows the text (R2 send)
+        if (q && q->onInputEdited)
+            q->onInputEdited();
+    }
     void submitFromField()
     {
         if (q && q->onSubmit)
@@ -871,18 +1046,25 @@ struct CuaSpotlight::Impl {
 }
 @end
 
-@implementation LapisSpotlightHintBar
+@implementation LapisSpotlightAnimView
 - (BOOL)isFlipped { return YES; }
 - (BOOL)isOpaque { return NO; }
 - (NSView *)hitTest:(NSPoint)point { (void)point; return nil; }
 - (void)drawRect:(NSRect)dirtyRect
 {
     (void)dirtyRect;
-    paintHint([NSGraphicsContext currentContext].CGContext, NSRectToCGRect(self.bounds), self.listening, self.phase);
+    if (self.owner)
+        self.owner->paintAnim([NSGraphicsContext currentContext].CGContext, self.isMark, NSRectToCGRect(self.bounds), self.phase);
 }
 @end
 
 @implementation LapisSpotlightFieldDelegate
+- (void)controlTextDidChange:(NSNotification *)note
+{
+    (void)note;
+    if (self.owner)
+        self.owner->inputEdited();  // Phonon's Cmd+V paste lands here
+}
 - (BOOL)control:(NSControl *)control textView:(NSTextView *)textView doCommandBySelector:(SEL)selector
 {
     (void)control;
@@ -940,17 +1122,31 @@ CuaSpotlight::~CuaSpotlight()
 
 bool CuaSpotlight::openOrFocus() { return impl->openOrFocus(); }
 
+bool CuaSpotlight::openOrFocusOverStudio(const QString &contextLabel)
+{
+    return impl->openOverStudio(contextLabel.simplified().isEmpty() ? QStringLiteral("Lapis") : contextLabel.simplified());
+}
+
 void CuaSpotlight::dismiss(bool restoreTarget) { impl->close(restoreTarget); }
 
 bool CuaSpotlight::isOpen() const { return impl->s.open; }
 
 void CuaSpotlight::setListening(bool on)
 {
-    if (impl->s.listening == on)
+    setVoice(on ? SpotlightVoice::Held : SpotlightVoice::Idle);
+}
+
+void CuaSpotlight::setVoice(SpotlightVoice voice)
+{
+    if (impl->s.voice == voice)
         return;
-    impl->s.listening = on;
+    impl->s.voice = voice;
     impl->render(false);
 }
+
+void CuaSpotlight::notifyInputEdited() { impl->inputEdited(); }
+
+void CuaSpotlight::setEscapeWatch(bool on) { impl->setEscapeWatch(on); }
 
 void CuaSpotlight::setInputText(const QString &text)
 {
@@ -960,6 +1156,7 @@ void CuaSpotlight::setInputText(const QString &text)
         if (NSText *ed = [impl->input currentEditor])
             [ed setSelectedRange:NSMakeRange(impl->input.stringValue.length, 0)];
     }
+    impl->render(false);  // the badge follows the text
 }
 
 QString CuaSpotlight::inputText() const { return impl->fieldText(); }
@@ -1087,15 +1284,23 @@ int snapSpotlight(const QString &outPath)
         "reload the tab. If it still loops, clear that site's data and sign in again.");
     QVector<QImage> shots;
     const bool wasBlue = spotlightLapisBlue();
-    for (int i = 0; i < 4; ++i) {
-        setSpotlightLapisBlue(i == 3);
+    for (int i = 0; i < 6; ++i) {
+        setSpotlightLapisBlue(i == 5);
         CuaSpotlight sp(CuaSpotlight::Mode::Offscreen);
         sp.setFrontmostProbe(chrome);
-        sp.openOrFocus();
+        if (i == 2)
+            sp.openOrFocusOverStudio(QStringLiteral("Lapis · infinity"));
+        else
+            sp.openOrFocus();
         if (i == 1) {
             sp.setListening(true);
             sp.setInputText(QStringLiteral("summarize this thread and draft a reply"));
-        } else if (i >= 2) {
+        } else if (i == 2) {
+            sp.setVoice(SpotlightVoice::Toggled);
+        } else if (i == 3) {
+            sp.setInputText(QStringLiteral("open the latest run in a new tab"));
+            sp.setVoice(SpotlightVoice::Transcribing);
+        } else if (i >= 4) {
             sp.beginTurn(QStringLiteral("why does the sign in page keep reloading?"));
             sp.setAnswer(answer);
             sp.setBusy(false);

@@ -3,6 +3,7 @@
 #include "demo.hpp"
 #include "fixtures.hpp"
 #include "gamepad.hpp"
+#include "mac/cua.hpp"
 #include "mac/cua_spotlight.hpp"
 #include "pdfrender.hpp"
 #include "qml_host.hpp"
@@ -1589,6 +1590,31 @@ void uiTests()
         settle(250);
         check(backend.theme() == "gold" && forbiddenPixels(win->grabWindow()) == 0,
               "theme: ← back to Gold; zero blue/green pixels again", backend.theme());
+        sendKey(win, Qt::Key_Escape);
+        settle(250);
+    }
+
+    // Settings Jarvis Bar row: last (row 9), so no older row index moved; ← / → pick the mode.
+    {
+        sendKey(win, Qt::Key_Comma, Qt::ControlModifier);
+        settle(250);
+        QQuickItem *ov = firstItem(win, "settingsOverlay");
+        for (int i = 0; i < 9; ++i)
+            sendKey(win, Qt::Key_J, Qt::NoModifier, "j");
+        QStringList texts;
+        visibleWords(win, &texts);
+        const QString all = texts.join('\n');
+        check(ov && ov->property("row").toInt() == 9 && ov->property("jarvisRow").toInt() == 9
+                  && ov->property("rowCount").toInt() == 10 && all.contains("Jarvis Bar") && all.contains("Unified Overlay")
+                  && all.contains("Split Studio / Desktop"),
+              "jarvis settings: a Jarvis Bar row (Unified Overlay / Split Studio / Desktop) at the end");
+        const QString before = backend.jarvisBarMode();
+        sendKey(win, Qt::Key_Left);
+        check(backend.jarvisBarMode() == "overlay", "jarvis settings: ← picks Unified Overlay", backend.jarvisBarMode());
+        sendKey(win, Qt::Key_Right);
+        check(backend.jarvisBarMode() == "split", "jarvis settings: → picks Split Studio / Desktop", backend.jarvisBarMode());
+        check(forbiddenPixels(win->grabWindow()) == 0, "jarvis settings: the row has zero blue/green pixels");
+        backend.setJarvisBarMode(before);
         sendKey(win, Qt::Key_Escape);
         settle(250);
     }
@@ -5341,6 +5367,47 @@ void studioControlTests()
               "cua keys: the system prompt teaches cua_hotkey and cua_drag");
     }
 
+    // --- cua_open: apps and URLs without the omnibox; page-sized scroll words ----------------------
+    {
+        QString a = QStringLiteral("[[ACTION:cua_open:Chrome|https://x.com/elonmusk]] [[ACTION:cua_open:Finder]] Opening.");
+        const QList<StudioCommand> tags = extractActionTags(&a);
+        check(tags.size() == 2 && tags[0].action == "cua_open" && tags[0].arg == "Chrome|https://x.com/elonmusk"
+                  && tags[1].action == "cua_open" && tags[1].arg == "Finder" && a == "Opening.",
+              "cua open: [[ACTION:cua_open:...]] is a known tag and keeps the URL's ':'", a);
+        const CuaCommand app = parseCuaAction("cua_open", " Chrome ");
+        check(app.valid && app.kind == "open" && app.target == "Chrome" && app.text.isEmpty(), "cua open: cua_open:Chrome opens the app");
+        const CuaCommand url = parseCuaAction("cua_open", "https://x.com/elonmusk");
+        check(url.valid && url.target.isEmpty() && url.text == "https://x.com/elonmusk", "cua open: a bare URL goes to the default browser");
+        const CuaCommand both = parseCuaAction("cua_open", "Chrome|x.com/elonmusk");
+        check(both.valid && both.target == "Chrome" && both.text == "https://x.com/elonmusk",
+              "cua open: Chrome|x.com/elonmusk adds https://", both.target + " / " + both.text);
+        const CuaCommand bare = parseCuaAction("cua_open", "x.com/pmarca");
+        check(bare.valid && bare.target.isEmpty() && bare.text == "https://x.com/pmarca", "cua open: a bare domain path is a URL");
+        check(!parseCuaAction("cua_open", "").valid && !parseCuaAction("cua_open", "Chrome|not a url").valid
+                  && parseCuaAction("cua_open", "Notion.app").target == "Notion.app",
+              "cua open: empty and junk URLs rejected, a .app name stays an app");
+        check(parseCuaAction("cua_scroll", "Chrome|pagedown").deltaY == -12 && parseCuaAction("cua_scroll", "Chrome|pageup").deltaY == 12
+                  && parseCuaAction("cua_scroll", "Chrome|down").deltaY == -5 && parseCuaAction("cua_scroll", "Chrome|down").target == "Chrome",
+              "cua open: scroll pageup / pagedown words");
+
+        Backend b(Backend::Mode::Mock);
+        const QString r1 = b.dispatchStudioAction("cua_open", "Chrome|x.com/elonmusk");
+        const QString r2 = b.dispatchStudioAction("cua_open", "Chrome");
+        const QString r3 = b.dispatchStudioAction("cua_open", "https://github.com");
+        check(r1.contains("Opening https://x.com/elonmusk in Chrome") && r2.contains("Opening Chrome") && r3.contains("Opening https://github.com")
+                  && r1.contains("not run"),
+              "cua open: mock dispatch confirms without running", r1 + " | " + r2 + " | " + r3);
+        check(b.cuaLog() == QStringList({"cua_open:Chrome|https://x.com/elonmusk", "cua_open:Chrome", "cua_open:https://github.com"}),
+              "cua open: mock backend records app and URL", b.cuaLog().join(" | "));
+        check(b.dispatchStudioAction("cua_open", "Chrome|not a url").isEmpty() && b.cuaLog().size() == 3,
+              "cua open: an invalid URL is not dispatched");
+        check(studioActionNames().contains("cua_open") && kCompatSystemPrompt.contains("cua_open:<app>|<url>")
+                  && kCompatSystemPrompt.contains("[[ACTION:cua_open:Chrome|https://x.com/elonmusk]]")
+                  && kCompatSystemPrompt.contains("[[ACTION:cua_scroll:Chrome|down]]")
+                  && kCompatSystemPrompt.contains("never ask permission"),
+              "cua open: the system prompt teaches cua_open, page scrolling and acting without asking");
+    }
+
     // --- Closed-loop computer use: cua_observe and the bounded follow-up turns ---------------------
     {
         QString a = QStringLiteral("[[ACTION:cua_observe:Discord]] [[ACTION:cua_observe]] Looking.");
@@ -5361,8 +5428,9 @@ void studioControlTests()
         check(cuaShouldContinue({seen}, 0) && cuaShouldContinue({clicked, missed}, 3) && cuaShouldContinue({clicked}, 0)
                   && !cuaShouldContinue({}, 0),
               "cua loop: any non-empty cua batch continues until the model stops emitting tags or hits depth cap");
-        check(!cuaShouldContinue({seen}, kMaxCuaLoopDepth) && !cuaShouldContinue({missed}, kMaxCuaLoopDepth + 3) && kMaxCuaLoopDepth == 4,
-              "cua loop: never past depth 4");
+        check(!cuaShouldContinue({seen}, kMaxCuaLoopDepth) && !cuaShouldContinue({missed}, kMaxCuaLoopDepth + 3) && kMaxCuaLoopDepth == 7
+                  && cuaShouldContinue({seen}, 6),
+              "cua loop: never past depth 7");
         const QString p = cuaFollowupPrompt({seen});
         check(p.startsWith("[CUA observation after cua_observe:Discord (L1_OBS, ok=1, detail=12 AX nodes)]:\n{\"title\":\"John Gout\"}")
                   && p.endsWith("Continue only if more actions are needed; otherwise give a concise final answer without cua_* tags."),
@@ -5388,10 +5456,10 @@ void studioControlTests()
             b.runModelAnswer("[[ACTION:cua_observe:Discord]] [[ACTION:cua_type:Discord search|John]]");
             maxDepth = std::max(maxDepth, b.cuaLoopDepth());
         }
-        check(maxDepth <= kMaxCuaLoopDepth && b.cuaLoopDepth() == 4 && b.cuaFollowups().size() == 4,
-              "cua loop: m_cuaLoopDepth caps at 4 follow-ups per prompt", QString::number(b.cuaLoopDepth()));
+        check(maxDepth <= kMaxCuaLoopDepth && b.cuaLoopDepth() == 7 && b.cuaFollowups().size() == 7,
+              "cua loop: m_cuaLoopDepth caps at 7 follow-ups per prompt", QString::number(b.cuaLoopDepth()));
         b.runModelAnswer("Done: John Gout's DM is open.");
-        check(b.cuaLoopDepth() == 4 && b.cuaFollowups().size() == 4, "cua loop: an answer without cua tags ends the loop");
+        check(b.cuaLoopDepth() == 7 && b.cuaFollowups().size() == 7, "cua loop: an answer without cua tags ends the loop");
         b.clearAnswers();
         check(b.cuaLoopDepth() == 0 && b.cuaFollowups().isEmpty(), "cua loop: dismissing the answer resets the depth");
         b.runModelAnswer("[[ACTION:cua_observe:Discord]]");
@@ -7212,6 +7280,281 @@ void voiceSpotlightTests()
     }
 }
 
+// The Jarvis bar (jarvisBarMode "overlay"): L2 hold or tap, auto-send on Phonon's paste, the
+// instant interrupt, and the unified overlay over Studio itself. Mock + Offscreen bar: no window,
+// no keys posted, no model.
+void jarvisTests()
+{
+    using S = GamepadSnapshot;
+    using studio::cua::SpotlightVoice;
+    auto l2 = [](double v) { S s; s.l2 = v; return s; };
+
+    // Gamepad: hold >= 260 ms stops on release; a quicker tap stays listening until the next L2.
+    {
+        Gamepad g;
+        QStringList ev;
+        g.setVoiceKeySinkForTest([&](bool down) { ev << (down ? "down" : "up"); });
+        g.processSnapshot(l2(1.0), 0);
+        g.processSnapshot(S(), 40);
+        check(!g.voiceActive() && ev == QStringList({"down", "up"}), "jarvis pad: tap-toggle is off by default (release stops)",
+              ev.join(' '));
+        g.setVoiceTapToggle(true);
+        ev.clear();
+        g.processSnapshot(l2(1.0), 1000);
+        g.processSnapshot(S(), 1000 + 300);
+        check(!g.voiceActive() && !g.voiceToggled() && ev == QStringList({"down", "up"}),
+              "jarvis pad: a 300 ms hold stops on release", ev.join(' '));
+        ev.clear();
+        int toggles = 0;
+        QObject::connect(&g, &Gamepad::voiceToggledChanged, &g, [&] { ++toggles; });
+        g.processSnapshot(l2(1.0), 2000);
+        g.processSnapshot(S(), 2000 + 120);
+        check(g.voiceActive() && g.voiceToggled() && toggles == 1 && ev == QStringList({"down"}),
+              "jarvis pad: a 120 ms tap stays listening (toggled), no key-up", ev.join(' '));
+        g.processSnapshot(l2(1.0), 4000);
+        check(!g.voiceActive() && !g.voiceToggled() && ev == QStringList({"down", "up"}),
+              "jarvis pad: the second tap's press stops listening (key-up)", ev.join(' '));
+        g.processSnapshot(S(), 4000 + 90);
+        check(!g.voiceActive() && ev.size() == 2, "jarvis pad: ...and its release is swallowed (no new hold)");
+        g.processSnapshot(l2(1.0), 5000);
+        g.processSnapshot(S(), 5000 + 259);
+        check(g.voiceToggled(), "jarvis pad: 259 ms is still a tap");
+        g.processSnapshot(l2(1.0), 6000);
+        g.processSnapshot(S(), 6010);
+        ev.clear();
+        g.processSnapshot(l2(1.0), 7000);
+        g.cancelVoice();  // ○ mid-hold
+        check(!g.voiceActive() && ev == QStringList({"down", "up"}), "jarvis pad: cancelVoice mid-hold lifts the key", ev.join(' '));
+        g.processSnapshot(S(), 7600);
+        check(!g.voiceActive() && !g.voiceToggled() && ev.size() == 2, "jarvis pad: the held L2's release after a cancel is swallowed");
+    }
+
+    // Mode plumbing: Mock defaults to split; the pref round-trips through studio_prefs.json.
+    {
+        QTemporaryDir tmp;
+        const QString prefs = tmp.path() + "/studio_prefs.json";
+        Backend b(Backend::Mode::Mock);
+        check(b.jarvisBarMode() == "split" && !b.jarvisOverlay() && !b.gamepad()->voiceTapToggle(),
+              "jarvis mode: Mock defaults to split (the pad ui tests' routing)");
+        b.setPrefsPath(prefs);
+        b.setJarvisBarMode("bogus");
+        check(b.jarvisBarMode() == "split", "jarvis mode: unknown values are ignored");
+        b.setJarvisBarMode("overlay");
+        check(b.property("jarvisBarMode").toString() == "overlay" && b.gamepad()->voiceTapToggle(),
+              "jarvis mode: overlay turns L2 tap-toggle on (Q_PROPERTY)");
+        b.savePrefs();
+        Backend r(Backend::Mode::Mock);
+        r.setPrefsPath(prefs);
+        check(r.jarvisBarMode() == "overlay" && r.gamepad()->voiceTapToggle(), "jarvis mode: persisted in studio_prefs.json");
+    }
+
+    // Outside Studio, overlay mode: hold -> release auto-sends once the paste lands (no R2).
+    {
+        Backend b(Backend::Mode::Mock);
+        b.setTestStreamCapture(true);
+        b.setJarvisBarMode("overlay");
+        bool studioActive = false;
+        b.setStudioActiveProbeForTest([&] { return studioActive; });
+        Gamepad *pad = b.gamepad();
+        QStringList keys;
+        pad->setVoiceKeySinkForTest([&](bool down) { keys << (down ? "down" : "up"); });
+        studio::cua::CuaSpotlight *sp = b.spotlight();
+        sp->setFrontmostProbe([](int *pid, QString *name) { *pid = 4242; *name = QStringLiteral("Google Chrome"); });
+        qint64 t = 10000;
+        pad->processSnapshot(l2(1.0), t);
+        settle(80);
+        check(b.spotlightOpen() && sp->state().voice == SpotlightVoice::Held && sp->state().contextLabel == "Chrome"
+                  && keys == QStringList({"down"}),
+              "jarvis send: L2 hold opens the bar over Chrome, [L2] release", keys.join(' '));
+        pad->processSnapshot(S(), t += 400);
+        check(keys == QStringList({"down", "up"}) && sp->state().voice == SpotlightVoice::Transcribing && b.awaitingAutoSend()
+                  && sp->state().hint == "Transcribing…" && b.testStreamStarts().isEmpty(),
+              "jarvis send: release lifts fn, shows Transcribing…, arms auto-send");
+        settle(150);  // Phonon is still transcribing (~185 ms)
+        check(b.testStreamStarts().isEmpty() && b.awaitingAutoSend(), "jarvis send: nothing sent before the paste");
+        sp->setInputText(QStringLiteral("summarize this page"));  // Phonon's Cmd+V
+        sp->notifyInputEdited();
+        settle(20);
+        check(b.testStreamStarts().isEmpty(), "jarvis send: the paste is debounced (65 ms), not sent mid-paste");
+        settle(120);
+        check(b.testStreamStarts().value(0) == "spotlight|summarize this page" && !b.awaitingAutoSend()
+                  && sp->state().voice == SpotlightVoice::Idle && sp->state().busy && sp->inputText().isEmpty(),
+              "jarvis send: the paste auto-submits after the debounce, zero R2 presses", b.testStreamStarts().join(';'));
+        b.testStreamDelta("spotlight", "It is a pricing page.");
+        b.testStreamFinish("spotlight");
+        check(sp->state().open && sp->state().answer == "It is a pricing page." && sp->state().hint == "○ close",
+              "jarvis send: the answer shows in the drawer, badge [○] close");
+
+        // Tap-toggle: quick tap keeps listening; the second tap stops and sends.
+        keys.clear();
+        pad->processSnapshot(l2(1.0), t += 1000);
+        pad->processSnapshot(S(), t += 110);
+        settle(20);
+        check(pad->voiceToggled() && sp->state().voice == SpotlightVoice::Toggled && keys == QStringList({"down"})
+                  && sp->state().hint == "Listening · tap L2 to send" && sp->state().placeholder == "Tap L2 to send…"
+                  && !b.awaitingAutoSend(),
+              "jarvis toggle: a quick tap stays listening, Listening · tap L2 to send", keys.join(' '));
+        settle(400);
+        check(sp->state().voice == SpotlightVoice::Toggled && b.testStreamStarts().size() == 1,
+              "jarvis toggle: still listening 400 ms later, nothing sent");
+        pad->processSnapshot(l2(1.0), t += 3000);
+        check(keys == QStringList({"down", "up"}) && b.awaitingAutoSend() && sp->state().voice == SpotlightVoice::Transcribing,
+              "jarvis toggle: the second tap stops Phonon and arms auto-send", keys.join(' '));
+        pad->processSnapshot(S(), t += 80);
+        sp->setInputText(QStringLiteral("and the pricing for teams"));
+        sp->notifyInputEdited();
+        settle(130);
+        check(b.testStreamStarts().value(1) == "spotlight|and the pricing for teams" && keys.size() == 2,
+              "jarvis toggle: the paste auto-sends turn 2 (the stop tap's release is swallowed)", b.testStreamStarts().join(';'));
+        b.testStreamFinish("spotlight");
+
+        // Text already in the field and no new paste: sent as is after 260 ms.
+        pad->processSnapshot(l2(1.0), t += 1000);
+        sp->setInputText(QStringLiteral("open the docs"));  // typed while holding
+        pad->processSnapshot(S(), t += 400);
+        settle(150);
+        check(b.testStreamStarts().size() == 2, "jarvis send: typed text waits 260 ms for a paste");
+        settle(200);
+        check(b.testStreamStarts().value(2) == "spotlight|open the docs", "jarvis send: ...then sends what is there",
+              b.testStreamStarts().join(';'));
+        b.testStreamFinish("spotlight");
+
+        // Nothing said: the empty bar closes quietly after 1.3 s.
+        pad->processSnapshot(l2(1.0), t += 1000);
+        pad->processSnapshot(S(), t += 400);
+        settle(900);
+        check(b.spotlightOpen() && b.awaitingAutoSend(), "jarvis send: an empty field waits for a late paste");
+        settle(550);
+        check(!b.spotlightOpen() && !b.awaitingAutoSend() && b.testStreamStarts().size() == 3,
+              "jarvis send: still empty at 1.3 s, the bar closes without sending");
+
+        // ○ while listening: cancel, draft cleared, nothing sent.
+        keys.clear();
+        pad->processSnapshot(l2(1.0), t += 1000);
+        settle(80);  // the reopened bar takes focus, then the fn key goes down
+        pad->processSnapshot(S(), t += 100);  // tap: toggled
+        sp->setInputText(QStringLiteral("half a thou"));
+        {
+            S s;
+            s.b = true;
+            pad->processSnapshot(s, t += 30);
+            pad->processSnapshot(S(), t += 16);
+        }
+        settle(30);
+        check(!b.spotlightOpen() && !pad->voiceActive() && !pad->voiceToggled() && keys == QStringList({"down", "up"})
+                  && sp->inputText().isEmpty() && !b.awaitingAutoSend(),
+              "jarvis cancel: ○ while toggled stops Phonon, clears the draft, closes", keys.join(' '));
+        settle(400);
+        check(b.testStreamStarts().size() == 3, "jarvis cancel: nothing was submitted");
+    }
+
+    // Instant interrupt: L2 while a turn streams and a cua_* step is in flight.
+    {
+        Backend b(Backend::Mode::Mock);
+        b.setTestStreamCapture(true);
+        b.setJarvisBarMode("overlay");
+        b.setStudioActiveProbeForTest([] { return false; });
+        Gamepad *pad = b.gamepad();
+        pad->setVoiceKeySinkForTest([](bool) {});
+        studio::cua::CuaSpotlight *sp = b.spotlight();
+        sp->setFrontmostProbe([](int *pid, QString *name) { *pid = 4242; *name = QStringLiteral("Google Chrome"); });
+        qint64 t = 50000;
+        pad->processSnapshot(l2(1.0), t);
+        sp->setInputText(QStringLiteral("open my latest pull request"));
+        pad->processSnapshot(S(), t += 400);
+        sp->notifyInputEdited();
+        settle(120);
+        check(b.testStreamStarts().value(0) == "spotlight|open my latest pull request" && b.jarvisBusy(),
+              "jarvis interrupt: turn 1 is streaming");
+        b.testBeginCuaAction();  // a live step mid-glide
+        check(!studio::cua::cancelFlag.load() && b.cuaPending() == 1, "jarvis interrupt: a step in flight, no cancel yet");
+        pad->processSnapshot(l2(1.0), t += 1000);  // the user cuts in
+        check(b.jarvisInterrupts() == 1 && studio::cua::cancelFlag.load() && b.cuaPending() == 1,
+              "jarvis interrupt: L2 latches cancelFlag while the step is still running");
+        const QVector<ChatTurn> h = b.sharedHistory();
+        check(h.size() >= 2 && h[h.size() - 2].content == "open my latest pull request"
+                  && h.last().content.contains("Interrupted by user") && h.last().content.contains("superseded"),
+              "jarvis interrupt: the interrupted request is in the shared history",
+              h.isEmpty() ? QString() : h.last().content);
+        check(sp->state().voice == SpotlightVoice::Held && !sp->state().busy && sp->state().open,
+              "jarvis interrupt: the bar is listening for the correction");
+        b.testFinishCuaAction();  // the aborted step returns
+        check(!studio::cua::cancelFlag.load() && b.cuaPending() == 0, "jarvis interrupt: the latch clears once the step returns");
+        b.testStreamDelta("spotlight", "late tokens from the cancelled turn");
+        check(!sp->state().answer.contains("late tokens"),
+              "jarvis interrupt: the cancelled stream's tokens never reach the bar");
+        sp->setInputText(QStringLiteral("no, open it in a new tab instead"));
+        pad->processSnapshot(S(), t += 400);
+        sp->notifyInputEdited();
+        settle(120);
+        check(b.testStreamStarts().value(1) == "spotlight|no, open it in a new tab instead" && !studio::cua::cancelFlag.load(),
+              "jarvis interrupt: the correction goes out as the next turn, cancelFlag clear", b.testStreamStarts().join(';'));
+        {
+            QStringList tier2;  // tieredPrompt sends m_sharedHistory as the next turn's Tier 2
+            for (const ChatTurn &c : b.sharedHistory())
+                tier2 << c.content;
+            check(tier2.contains("open my latest pull request") && tier2.join('\n').contains("superseded by the next instruction"),
+                  "jarvis interrupt: the next turn's Tier 2 carries what was interrupted", tier2.join(" | "));
+        }
+        b.testStreamFinish("spotlight");
+        // Nothing running: L2 interrupts nothing and never latches.
+        pad->processSnapshot(l2(1.0), t += 1000);
+        check(b.jarvisInterrupts() == 1 && !studio::cua::cancelFlag.load(), "jarvis interrupt: an idle L2 cancels nothing");
+        pad->processSnapshot(S(), t += 400);
+        settle(10);
+        // ○ while a step runs with the bar closed: the same clean cancel.
+        b.dismissSpotlight(true);
+        b.testBeginCuaAction();
+        {
+            S s;
+            s.b = true;
+            pad->processSnapshot(s, t += 1000);
+            pad->processSnapshot(S(), t += 16);
+        }
+        settle(20);
+        check(b.jarvisInterrupts() == 2 && studio::cua::cancelFlag.load(), "jarvis interrupt: ○ with the bar closed stops the step");
+        b.testFinishCuaAction();
+        check(!studio::cua::cancelFlag.load() && !b.jarvisBusy(), "jarvis interrupt: ...and the latch clears again");
+        studio::cua::cancelFlag.store(false);
+    }
+
+    // Unified overlay over Studio itself: "Lapis" context, Studio + desktop actions in one turn.
+    {
+        Backend b(Backend::Mode::Mock);
+        b.setTestStreamCapture(true);
+        b.setJarvisBarMode("overlay");
+        b.setStudioActiveProbeForTest([] { return true; });
+        Gamepad *pad = b.gamepad();
+        pad->setVoiceKeySinkForTest([](bool) {});
+        studio::cua::CuaSpotlight *sp = b.spotlight();
+        QStringList ui;
+        QObject::connect(&b, &Backend::uiActionRequested, &b, [&](const QString &a, const QString &) { ui << a; });
+        qint64 t = 90000;
+        pad->processSnapshot(l2(1.0), t);
+        const studio::cua::SpotlightState st = sp->state();
+        check(b.spotlightOpen() && st.overStudio && st.contextLabel.startsWith("Lapis") && st.targetPid == 0,
+              "jarvis studio: L2 inside Studio opens the Jarvis overlay with a Lapis pill", st.contextLabel);
+        sp->setInputText(QStringLiteral("set the mood and play it in the browser"));
+        pad->processSnapshot(S(), t += 400);
+        sp->notifyInputEdited();
+        settle(120);
+        check(b.testStreamStarts().value(0) == "spotlight|set the mood and play it in the browser"
+                  && b.testLastSlice().contains("Lapis Studio itself") && b.testLastSlice().contains("cua_*"),
+              "jarvis studio: the turn's slice says it is over Studio, Studio + cua actions allowed",
+              b.testLastSlice().left(120));
+        b.testStreamDelta("spotlight", "On it. [[ACTION:open_music]] [[ACTION:cua_click:Play]]");
+        b.testStreamFinish("spotlight");
+        check(ui.contains("open_music") && b.cuaLog().contains("cua_click:Play"),
+              "jarvis studio: one turn runs a Studio UI action and a desktop cua_* action", ui.join(',') + " | " + b.cuaLog().join(';'));
+        // Split mode: L2 inside Studio never opens the bar (the ask card's path).
+        b.dismissSpotlight(false);
+        b.setJarvisBarMode("split");
+        pad->processSnapshot(l2(1.0), t += 1000);
+        check(!b.spotlightOpen() && !pad->voiceTapToggle(), "jarvis studio: split mode keeps L2 in Studio on the ask card");
+        pad->processSnapshot(S(), t += 400);
+    }
+}
+
 int runTests()
 {
     unitTests();
@@ -7234,6 +7577,7 @@ int runTests()
     uiTests();
     gamepadUiTests();
     voiceSpotlightTests();
+    jarvisTests();
     std::printf("%d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

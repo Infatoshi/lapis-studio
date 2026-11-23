@@ -8,6 +8,7 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QRegularExpression>
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -81,23 +82,22 @@ QVector<Entry> scan(int pid, int maxNodes, int maxDepth, const Budget &budget, b
                 Clock::now() - s.time < std::chrono::milliseconds(150)) return s.entries;
     }
     QVector<Entry> result;
-    std::deque<std::pair<Element, int>> pending;
     Element app = own(AXUIElementCreateApplication(pid));
-    if (app) {
-        // Unlock full DOM accessibility trees in Electron/Chromium apps (Discord, Slack, VS Code).
-        AXUIElementSetAttributeValue(app.get(), CFSTR("AXManualAccessibility"), kCFBooleanTrue);
-        // Google Chrome only exposes its live web DOM tree (buttons, inputs, sliders, links) with this flag.
-        AXUIElementSetAttributeValue(app.get(), CFSTR("AXEnhancedUserInterface"), kCFBooleanTrue);
-        pending.push_back({std::move(app), 0});
-    }
-    CF<CFMutableSetRef> visited(CFSetCreateMutable(nullptr, 0, &kCFTypeSetCallBacks));
+    if (!app) return result;
+    // Unlock full DOM accessibility trees in Electron/Chromium apps (Discord, Slack, VS Code).
+    AXUIElementSetAttributeValue(app.get(), CFSTR("AXManualAccessibility"), kCFBooleanTrue);
+    // Google Chrome only exposes its live web DOM tree (buttons, inputs, sliders, links) with this flag.
+    AXUIElementSetAttributeValue(app.get(), CFSTR("AXEnhancedUserInterface"), kCFBooleanTrue);
+    CF<CFMutableSetRef> visitedSet(CFSetCreateMutable(nullptr, 0, &kCFTypeSetCallBacks));
     QString appName;
-    while (!pending.empty() && result.size() < maxNodes && budget.left() > 0 && !cancelFlag.load()) {
-        auto [e, depth] = pending.front(); pending.pop_front();
-        if (!e || CFSetContainsValue(visited.get(), e.get())) continue;
-        CFSetAddValue(visited.get(), e.get());
+    const auto visit = [&](const Element &e) {
+        if (!e || CFSetContainsValue(visitedSet.get(), e.get())) return false;
+        CFSetAddValue(visitedSet.get(), e.get());
+        return true;
+    };
+    const auto read = [&](const Element &e, int depth) {
         AxNode n;
-        n.id = int(result.size()) + 1; n.pid = pid;
+        n.pid = pid;
         n.role = stringValue(attribute(e.get(), kAXRoleAttribute, budget).get());
         n.title = stringValue(attribute(e.get(), kAXTitleAttribute, budget).get());
         if (depth == 0) appName = n.title;
@@ -107,30 +107,38 @@ QVector<Entry> scan(int pid, int maxNodes, int maxDepth, const Budget &budget, b
         // Never copy secure text-field contents into model context.
         const auto subrole = stringValue(attribute(e.get(), kAXSubroleAttribute, budget).get());
         if (subrole != "AXSecureTextField") n.value = stringValue(attribute(e.get(), kAXValueAttribute, budget).get());
+        // An unnamed wrapper is walked through, never shown: skip its rect and action IPCs.
+        if (axStructuralNoise(n, depth)) return n;
         auto position = attribute(e.get(), kAXPositionAttribute, budget);
         auto size = attribute(e.get(), kAXSizeAttribute, budget);
         CGPoint p{}; CGSize s{};
         if (position && size && CFGetTypeID(position.get()) == AXValueGetTypeID() && CFGetTypeID(size.get()) == AXValueGetTypeID() &&
             AXValueGetValue((AXValueRef)position.get(), kAXValueTypeCGPoint, &p) &&
             AXValueGetValue((AXValueRef)size.get(), kAXValueTypeCGSize, &s)) n.globalRect = {p.x, p.y, s.width, s.height};
+        if (axTinyRect(n, depth)) return n;
         CFArrayRef actions = nullptr;
         if (budget.prepare(e.get())) AXUIElementCopyActionNames(e.get(), &actions);
         CF<CFArrayRef> actionOwner(actions);
         if (actions) for (CFIndex i = 0; i < std::min<CFIndex>(CFArrayGetCount(actions), 32); ++i)
             n.actions.push_back(stringValue(CFArrayGetValueAtIndex(actions, i)));
-        result.push_back({n, e});
-        // Never descend into AXMenuBar: hundreds of hidden pull-down menu items starve the visible window DOM.
-        if (depth >= maxDepth || n.role == "AXMenuBar" || !budget.prepare(e.get())) continue;
+        return n;
+    };
+    const auto children = [&](const Element &e, int capacity) {
+        QVector<Element> out;
+        if (!budget.prepare(e.get())) return out;
         // Bounded array fetch: do not materialize an unbounded AXChildren attribute.
-        CFArrayRef children = nullptr;
-        const auto capacity = maxNodes - result.size() - qsizetype(pending.size());
-        if (capacity > 0) AXUIElementCopyAttributeValues(e.get(), kAXChildrenAttribute, 0, capacity, &children);
-        CF<CFArrayRef> childOwner(children);
-        if (children) for (CFIndex i = 0; i < CFArrayGetCount(children); ++i) {
-            auto child = CFArrayGetValueAtIndex(children, i);
-            if (CFGetTypeID(child) == AXUIElementGetTypeID()) pending.push_back({own((AXUIElementRef)CFRetain(child)), depth + 1});
+        CFArrayRef kids = nullptr;
+        AXUIElementCopyAttributeValues(e.get(), kAXChildrenAttribute, 0, capacity, &kids);
+        CF<CFArrayRef> owner(kids);
+        if (kids) for (CFIndex i = 0; i < CFArrayGetCount(kids); ++i) {
+            auto child = CFArrayGetValueAtIndex(kids, i);
+            if (CFGetTypeID(child) == AXUIElementGetTypeID()) out.push_back(own((AXUIElementRef)CFRetain(child)));
         }
-    }
+        return out;
+    };
+    const auto more = [&] { return budget.left() > 0 && !cancelFlag.load(); };
+    const AxWalkLimits limits{maxNodes, maxDepth, std::max(maxNodes * 8, 3200)};
+    for (auto &[n, e] : walkAxTree(std::move(app), limits, visit, read, children, more)) result.push_back({n, e});
     if (!cancelFlag.load()) {
         std::lock_guard lock(cacheMutex);
         std::erase_if(cache, [pid](const Snapshot &s) { return s.pid == pid; });
@@ -150,9 +158,9 @@ ActionResult axAction(int pid, const QString &key, const QRectF &near, const QSt
     if (key.isEmpty() || !near.isValid() || !finite(near.topLeft()) || !finite(near.bottomRight())) return {false, "A title/role and valid target rectangle are required"};
     std::unique_lock lock(actuator, std::defer_lock);
     if (!acquire(lock)) return cancelled();
-    Budget budget(0.25);
-    // Fresh resolution avoids acting through stale cached UI elements.
-    auto entries = scan(pid, 200, 8, budget, false);
+    Budget budget(0.6);
+    // Fresh resolution avoids acting through stale cached UI elements (as deep as inspectDisplay).
+    auto entries = scan(pid, 500, 32, budget, false);
     Element best; double distance = std::numeric_limits<double>::infinity(); bool ambiguous = false;
     for (const auto &entry : entries) {
         const auto &n = entry.node;
@@ -342,6 +350,37 @@ NSRunningApplication *launchApp(NSURL *url) {
     dispatch_release(done);
     return finished ? [launched autorelease] : nil;  // on timeout the late handler's retain leaks one object, never crashes
 }
+// The display of pid's largest on-screen window; 0 when it has none.
+uint32_t largestWindowDisplay(int pid) {
+    uint32_t id = 0;
+    double bestArea = 0;
+    for (const auto &w : listAppWindows())
+        if (w.pid == pid && w.displayId && w.globalRect.width() * w.globalRect.height() > bestArea) {
+            bestArea = w.globalRect.width() * w.globalRect.height();
+            id = w.displayId;
+        }
+    return id;
+}
+// Polls (60 ms apart, up to 750 ms) for pid's first on-screen window; its display, else 0.
+uint32_t waitForWindow(int pid) {
+    for (int waited = 0;; waited += 60) {
+        if (const uint32_t id = largestWindowDisplay(pid)) return id;
+        if (waited + 60 > 750 || cancelFlag.load()) return 0;
+        std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    }
+}
+// The regular running app matching a canonical name (never this process); nil when none runs.
+NSRunningApplication *runningApp(const QString &canon) {
+    const pid_t self = getpid();
+    NSRunningApplication *loose = nil;
+    for (NSRunningApplication *app in NSWorkspace.sharedWorkspace.runningApplications) {
+        if (app.processIdentifier == self || app.terminated || app.activationPolicy != NSApplicationActivationPolicyRegular) continue;
+        const QString name = QString::fromNSString(app.localizedName ?: @"");
+        if (name.compare(canon, Qt::CaseInsensitive) == 0) return app;
+        if (!loose && appNameMatches(name, canon)) loose = app;
+    }
+    return loose;
+}
 }
 bool activateAppByName(const QString &hint, uint32_t *outDisplayId, int *outPid, bool *outLaunched) {
     if (outDisplayId) *outDisplayId = 0;
@@ -350,15 +389,7 @@ bool activateAppByName(const QString &hint, uint32_t *outDisplayId, int *outPid,
     const QString canon = canonicalAppName(hint);
     if (canon.isEmpty()) return false;
     @autoreleasepool {
-        const pid_t self = getpid();
-        NSRunningApplication *exact = nil, *loose = nil;
-        for (NSRunningApplication *app in NSWorkspace.sharedWorkspace.runningApplications) {
-            if (app.processIdentifier == self || app.terminated || app.activationPolicy != NSApplicationActivationPolicyRegular) continue;
-            const QString name = QString::fromNSString(app.localizedName ?: @"");
-            if (name.compare(canon, Qt::CaseInsensitive) == 0) { exact = app; break; }
-            if (!loose && appNameMatches(name, canon)) loose = app;
-        }
-        NSRunningApplication *app = exact ?: loose;
+        NSRunningApplication *app = runningApp(canon);
         bool activated = false;
         if (app) {
             if (@available(macOS 14.0, *)) {
@@ -368,6 +399,16 @@ bool activateAppByName(const QString &hint, uint32_t *outDisplayId, int *outPid,
                     || [app activateWithOptions:NSApplicationActivateAllWindows];
             } else {
                 activated = [app activateWithOptions:NSApplicationActivateAllWindows];
+            }
+            // Running with no window (Chrome in the Dock, every window closed): reopen it the way
+            // a Dock click does (openApplicationAtURL sends kAEReopenApplication), so Chrome,
+            // Finder, Safari and Terminal open a fresh window instead of activating nothing.
+            if (activated && app.bundleURL && !largestWindowDisplay(app.processIdentifier)) {
+                if (NSRunningApplication *reopened = launchApp(app.bundleURL)) app = reopened;
+                const uint32_t id = waitForWindow(app.processIdentifier);
+                if (outPid) *outPid = app.processIdentifier;
+                if (outDisplayId) *outDisplayId = id;
+                return true;
             }
         } else if (NSURL *url = installedAppUrl(canon)) {
             // Not running: launch it ("open x.com in Chrome" works with Chrome closed).
@@ -381,14 +422,74 @@ bool activateAppByName(const QString &hint, uint32_t *outDisplayId, int *outPid,
         }
         if (!activated) return false;
         if (outPid) *outPid = app.processIdentifier;
-        if (outDisplayId) {
-            double bestArea = 0;
-            for (const auto &w : listAppWindows())
-                if (w.pid == app.processIdentifier && w.displayId && w.globalRect.width() * w.globalRect.height() > bestArea) {
-                    bestArea = w.globalRect.width() * w.globalRect.height();
-                    *outDisplayId = w.displayId;
-                }
+        if (outDisplayId) *outDisplayId = largestWindowDisplay(app.processIdentifier);
+        return true;
+    }
+}
+QString normalizeOpenUrl(const QString &raw) {
+    const QString u = raw.trimmed();
+    if (u.isEmpty() || u.contains(QRegularExpression(QStringLiteral("\\s")))) return {};
+    static const QRegularExpression scheme(QStringLiteral("^[a-zA-Z][a-zA-Z0-9+.-]*:"));
+    if (scheme.match(u).hasMatch() && !u.contains(QRegularExpression(QStringLiteral("^[^/:]+:\\d"))))
+        return u;  // https:, file:, mailto: ... ("localhost:8080" is a port, not a scheme)
+    // domain.tld[/...] or localhost[:port][/...]
+    static const QRegularExpression host(QStringLiteral(
+        "^(localhost|[a-zA-Z0-9-]+(\\.[a-zA-Z0-9-]+)*\\.[a-zA-Z]{2,}|\\d{1,3}(\\.\\d{1,3}){3})(:\\d+)?([/?#].*)?$"));
+    if (!host.match(u).hasMatch()) return {};
+    return QStringLiteral("https://") + u;
+}
+bool openUrlInApp(const QString &hint, const QString &rawUrl, uint32_t *outDisplayId, int *outPid, bool *outLaunched,
+                  QString *outAppName) {
+    if (outDisplayId) *outDisplayId = 0;
+    if (outPid) *outPid = 0;
+    if (outLaunched) *outLaunched = false;
+    if (outAppName) outAppName->clear();
+    const QString url = normalizeOpenUrl(rawUrl);
+    if (url.isEmpty()) return false;
+    @autoreleasepool {
+        NSURL *nsUrl = [NSURL URLWithString:url.toNSString()];
+        if (!nsUrl) return false;
+        const QString canon = canonicalAppName(hint);
+        NSURL *appUrl = nil;
+        NSRunningApplication *before = nil;
+        if (!canon.isEmpty()) {
+            before = runningApp(canon);
+            appUrl = before.bundleURL ?: installedAppUrl(canon);
+            if (!appUrl) return false;  // a named app that is neither running nor installed
+        } else {
+            appUrl = [NSWorkspace.sharedWorkspace URLForApplicationToOpenURL:nsUrl];
+            if (appUrl) {
+                NSString *bundle = [NSBundle bundleWithURL:appUrl].bundleIdentifier;
+                for (NSRunningApplication *a in NSWorkspace.sharedWorkspace.runningApplications)
+                    if (bundle && [a.bundleIdentifier isEqualToString:bundle]) { before = a; break; }
+            }
         }
+        if (@available(macOS 14.0, *)) {
+            NSString *bundle = appUrl ? [NSBundle bundleWithURL:appUrl].bundleIdentifier : nil;
+            if (NSApp && bundle) [NSApp yieldActivationToApplicationWithBundleIdentifier:bundle];
+        }
+        __block NSRunningApplication *opened = nil;
+        dispatch_semaphore_t done = dispatch_semaphore_create(0);
+        NSWorkspaceOpenConfiguration *config = [NSWorkspaceOpenConfiguration configuration];
+        config.activates = YES;
+        // A browser opens a URL handed over by the system in a new tab: the user's current tab
+        // and the omnibox (inline autocomplete) are never involved.
+        void (^handler)(NSRunningApplication *, NSError *) = ^(NSRunningApplication *app, NSError *error) {
+            if (app && !error) opened = [app retain];
+            dispatch_semaphore_signal(done);
+        };
+        if (appUrl)
+            [NSWorkspace.sharedWorkspace openURLs:@[nsUrl] withApplicationAtURL:appUrl configuration:config completionHandler:handler];
+        else
+            [NSWorkspace.sharedWorkspace openURL:nsUrl configuration:config completionHandler:handler];
+        const bool finished = dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, 4 * NSEC_PER_SEC)) == 0;
+        dispatch_release(done);
+        NSRunningApplication *app = finished ? [opened autorelease] : nil;
+        if (!app) return false;
+        if (outPid) *outPid = app.processIdentifier;
+        if (outLaunched) *outLaunched = before == nil;
+        if (outAppName) *outAppName = QString::fromNSString(app.localizedName ?: @"");
+        if (outDisplayId) *outDisplayId = waitForWindow(app.processIdentifier);
         return true;
     }
 }
@@ -454,20 +555,36 @@ QVector<AxNode> inspectDisplay(uint32_t displayId, int maxNodes, double timeoutS
         if (result.size() >= maxNodes || budget.left() <= 0 || cancelFlag.load()) break;
         // Background apps get a capped slice so they can never burn the timeout.
         const Budget appBudget = pid == front ? budget : Budget(std::min(budget.left(), 0.35));
-        for (const auto &e : scan(pid, maxNodes - int(result.size()), 14, appBudget, true)) {
+        for (const auto &e : scan(pid, maxNodes - int(result.size()), 32, appBudget, true)) {
             if (!e.node.globalRect.intersects(bounds)) continue;
             auto n = e.node; n.id = int(result.size()) + 1; result.push_back(n);
         }
     }
     return result;
 }
+bool axStructuralNoise(const AxNode &n, int depth) {
+    static const QStringList wrappers{"AXGroup", "AXGenericElement", "AXUnknown", "AXSection", "AXList", "AXScrollArea",
+        "AXSplitGroup", "AXLayoutArea", "AXLandmarkMain", "AXLandmarkNavigation", "AXLandmarkBanner", "AXLandmarkRegion",
+        "AXWebArea"};
+    return depth > 0 && n.title.trimmed().isEmpty() && n.value.trimmed().isEmpty() && wrappers.contains(n.role);
+}
+bool axTinyRect(const AxNode &n, int depth) {
+    return depth > 0 && !(n.globalRect.width() >= 2 && n.globalRect.height() >= 2);
+}
 QString formatNodesForModel(const QVector<AxNode> &nodes, int maxChars) {
     if (maxChars <= 0) return {};
+    // One giant paragraph must never eat the whole budget.
+    constexpr int kTextCap = 280;
+    const auto cap = [&](const QString &s) {
+        const int n = std::min(maxChars, kTextCap);
+        return s.size() > n ? s.left(n - 1) + QChar(0x2026) : s;
+    };
+    const auto num = [](double v) { return std::round(v * 10.0) / 10.0; };
     QString out;
     for (const auto &n : nodes) {
         QJsonObject obj{{"id", n.id}, {"pid", n.pid}, {"app", n.appName.left(maxChars)}, {"role", n.role.left(maxChars)},
-            {"title", n.title.left(maxChars)}, {"value", n.value.left(maxChars)},
-            {"rect", QJsonArray{n.globalRect.x(), n.globalRect.y(), n.globalRect.width(), n.globalRect.height()}}};
+            {"title", cap(n.title)}, {"value", cap(n.value)},
+            {"rect", QJsonArray{num(n.globalRect.x()), num(n.globalRect.y()), num(n.globalRect.width()), num(n.globalRect.height())}}};
         QJsonArray actions; for (const auto &a : n.actions.mid(0, 32)) actions.append(a.left(maxChars));
         obj.insert("actions", actions);
         QString line = QString::fromUtf8(QJsonDocument(obj).toJson(QJsonDocument::Compact)) + '\n';
@@ -585,11 +702,22 @@ ActionResult scrollAt(QPointF point, int deltaY) {
     if (!move(point)) return cancelFlag.load() ? cancelled() : ActionResult{false, "Pointer move failed"};
     lease.moved = true;
     if (!shouldRestoreCursor(saved, cursor(), point, 12)) return {false, "User moved pointer; lease aborted"};
-    CF<CGEventRef> event(CGEventCreateScrollWheelEvent(nullptr, kCGScrollEventUnitPixel, 1, deltaY));
-    if (!event) return {false, "Cannot create scroll event"};
-    CGEventSetLocation(event.get(), CGPointMake(point.x(), point.y()));
-    if (!post(event.get())) return cancelled();
-    return cancelFlag.load() ? cancelled() : ActionResult{true, "Scroll posted"};
+    // deltaY is in scroll notches (positive = up, "down" = -5): each is kScrollPxPerNotch points,
+    // posted as a few smooth pixel ticks so web pages and native lists both move visibly.
+    const int totalPx = std::clamp(deltaY * kScrollPxPerNotch, -kScrollMaxPx, kScrollMaxPx);
+    int sent = 0;
+    for (int i = 1; i <= kScrollTicks; ++i) {
+        const int target = int(std::lround(double(totalPx) * i / kScrollTicks));
+        const int step = target - sent;
+        sent = target;
+        if (!step) continue;
+        CF<CGEventRef> event(CGEventCreateScrollWheelEvent(nullptr, kCGScrollEventUnitPixel, 1, step));
+        if (!event) return {false, "Cannot create scroll event"};
+        CGEventSetLocation(event.get(), CGPointMake(point.x(), point.y()));
+        if (!post(event.get())) return cancelled();
+        if (i < kScrollTicks) std::this_thread::sleep_for(std::chrono::milliseconds(kScrollTickMs));
+    }
+    return cancelFlag.load() ? cancelled() : ActionResult{true, QString("Scrolled %1 px").arg(totalPx)};
 }
 ActionResult typeText(const QString &text) {
     if (cancelFlag.load()) return cancelled();
@@ -601,8 +729,23 @@ ActionResult typeText(const QString &text) {
         const QChar c = text.at(offset);
         if (c == '\n' || c == '\r') {
             // A real Return key: a typed newline character is ignored by address bars.
+            const bool afterText = offset > 0 && text.at(offset - 1) != '\n' && text.at(offset - 1) != '\r';
             offset += (c == '\r' && offset + 1 < text.size() && text.at(offset + 1) == '\n') ? 2 : 1;
             std::this_thread::sleep_for(std::chrono::milliseconds(30));  // let autocomplete settle
+            if (afterText) {
+                // Omnibox inline autocomplete selects a suffix ("x.com/pmarca[/followers]"):
+                // ForwardDelete drops exactly that selection. At the end of a plain field (the
+                // caret after what we just typed) it deletes nothing.
+                CF<CGEventRef> fdDown(CGEventCreateKeyboardEvent(nullptr, CGKeyCode(117), true));
+                CF<CGEventRef> fdUp(CGEventCreateKeyboardEvent(nullptr, CGKeyCode(117), false));
+                if (!fdDown || !fdUp) return {false, "Cannot create keyboard events"};
+                CGEventSetFlags(fdDown.get(), 0);
+                CGEventSetFlags(fdUp.get(), 0);
+                if (!post(fdDown.get())) return cancelled();
+                CGEventPost(kCGHIDEventTap, fdUp.get());
+                std::this_thread::sleep_for(std::chrono::milliseconds(15));
+                if (cancelFlag.load()) return cancelled();
+            }
             CF<CGEventRef> down(CGEventCreateKeyboardEvent(nullptr, CGKeyCode(36), true));
             CF<CGEventRef> up(CGEventCreateKeyboardEvent(nullptr, CGKeyCode(36), false));
             if (!down || !up) return {false, "Cannot create keyboard events"};

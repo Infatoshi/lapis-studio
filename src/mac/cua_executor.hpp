@@ -45,6 +45,7 @@ struct AppActivation {
     uint32_t displayId = 0;
     int pid = 0;
     bool launched = false;
+    QString appName = {};  // openUrl: the app that took the URL (the default browser when unnamed)
 };
 
 // Every side effect the executor has, injectable. defaultCuaHooks() wires the real
@@ -69,6 +70,10 @@ struct CuaHooks {
     std::function<void(QRectF globalRect, const QString &label)> reticleHighlight;
     std::function<void(QPointF globalPt, const QString &label)> reticlePulse;
     std::function<void()> reticleHide;
+    // Pops the cursor out after `seconds` (CuaReticle::hideAfter): every visible step ends with
+    // kStepHideSec, so the glove is gone soon after the last step while a next step that starts
+    // inside that window glides on from where it is. Unset means the cursor is left as it is.
+    std::function<void(double seconds)> reticleHideAfter;
     std::function<uint32_t()> reticleWindowId;  // excluded from captures; 0 when none
     std::function<uint32_t()> hudWindowId;      // the HUD bar, also excluded; 0 when none
     // The floating HUD bar's status line ("Chrome · Clicking address bar"); Done/Error fade out.
@@ -79,6 +84,9 @@ struct CuaHooks {
     // lapisDisplayId is derived from listAppWindows (largest selfPid window).
     std::function<QVector<AppWindowInfo>()> listAppWindows;
     std::function<AppActivation(const QString &appHint)> activateApp;  // activates, else launches
+    // Opens a normalized URL in appHint (empty: the default browser) through NSWorkspace: a new
+    // tab, never the user's current one, never through the omnibox. Unset means no URL opening.
+    std::function<AppActivation(const QString &appHint, const QString &url)> openUrl;
     std::function<int()> selfPid;
     std::function<uint32_t()> lapisDisplayId;  // 0 when Lapis has no on-screen window
     // Space switching. Unset frontmostPid means a fixed 220 ms settle after activation instead of
@@ -115,6 +123,11 @@ void runOnMainThread(const std::function<void()> &fn);
 // Live app only: these open a real window.
 void showCuaHud(const QString &status, HudTone tone);
 void hideCuaHud(double afterSeconds = 0);
+// Pops the shared cartoon cursor out after afterSeconds (0: at once). Never creates the overlay:
+// a no-op until a step has shown it. Any thread.
+void hideCuaReticle(double afterSeconds = 0);
+// How long after a visible step finishes its cursor pops out (unless the next step moves it).
+constexpr double kStepHideSec = 0.45;
 // The desktop overlays' theme (shared reticle + HUD, Spotlight bar): Gold (#e09f3e accent, the
 // default) or lapis blue (#4f8cff). Any thread. Stores the flag and restyles overlays that
 // already exist on the main thread; never creates a window (sharedReticle() applies the flag
@@ -130,14 +143,19 @@ QVector<uint32_t> overlayWindowIds();
 constexpr int kFrontPollMs = 40, kFrontWaitMs = 900, kLaunchWaitMs = 2500, kSpaceSlideMs = 180;
 constexpr int kActivateSettleMs = 220;  // the fixed fallback when there is no frontmost signal
 // Closed loop: after a visible action, let the UI settle this long, then re-read the AX tree.
-constexpr int kObserveSettleMs = 200;
-constexpr int kObserveChars = 3500;      // observeApp's budget for formatted AX nodes
-constexpr int kPostActionChars = 2500;   // the post-action observation's budget
+constexpr int kObserveSettleMs = 220;
+// Navigation (cua_open with a URL, typing a Return, cmd+r / cmd+[ / cmd+]): settle kNavSettleMs,
+// then re-read up to kNavPolls more times, kNavPollMs apart, while the page still looks blank
+// (fewer than kNavMinNodes nodes in the app, or no text or link yet). At most ~1.85 s.
+constexpr int kNavSettleMs = 650, kNavPollMs = 300, kNavPolls = 4, kNavMinNodes = 25;
+constexpr int kObserveChars = 14000;     // observeApp's budget for formatted AX nodes
+constexpr int kPostActionChars = 11000;  // the post-action observation's budget
 
 struct CuaExecResult {
     bool ok = false;
-    // "L1_AX", "L3_VLM", "L1_OBS", "ERR"; scrollTarget's display-centre fallback is "CENTER";
-    // hotkeyAction is "KEY"; dragTarget is "L1_AX" when both ends came from AX, else "L3_VLM".
+    // "L1_AX", "L3_VLM", "L1_OBS", "ERR"; scrollTarget's display-centre fallback is "CENTER" and
+    // its whole-window scroll is "WINDOW"; hotkeyAction is "KEY"; openAction is "OPEN"; dragTarget
+    // is "L1_AX" when both ends came from AX, else "L3_VLM".
     QString tier;
     QPointF globalPt;
     QString detail;
@@ -159,6 +177,12 @@ QString extractAppHint(const QString &targetDesc);
 QString stripAppHint(const QString &targetDesc, const QString &appHint);
 // Model tags carry "\n" as two characters; turn each literal backslash-n into a real newline.
 QString normalizeTypedText(const QString &text);
+// True when a scroll target means the whole view rather than a control: empty, or "page",
+// "window", "screen", "timeline", "feed", "content", "body", "main", or ending in " page" /
+// " window" / " timeline" / " feed" (once the app phrase and any '|' are stripped).
+bool wholeViewScrollTarget(const QString &targetDesc, const QString &appHint);
+// True for shortcuts that load a page: cmd+r, cmd+shift+r, cmd+[, cmd+].
+bool navigationHotkey(const QString &combo);
 
 // Visible computer use: L1 Accessibility first, L3 local VLM pixel grounding as fallback, with
 // the reticle showing every step. Blocking; run it on a worker thread (capture requires one).
@@ -170,8 +194,14 @@ public:
     // Clicks the field, then (clearFirst) Cmd+A + Backspace so a retry replaces the old text
     // instead of inserting into it, then types.
     CuaExecResult typeIntoTarget(const QString &targetDesc, const QString &text, bool clearFirst = true);
-    // Glides to the target (AX, then VLM, else the display centre), then scrolls there.
+    // Glides to the target (AX, then VLM, else the display centre), then scrolls there. A
+    // whole-view target ("Chrome", "Chrome|x.com page", "timeline") never goes to AX or the VLM:
+    // it scrolls the middle of the app's largest window (tier "WINDOW"), below the toolbar.
     CuaExecResult scrollTarget(const QString &targetDesc, int deltaY);
+    // url empty: brings appHint forward (reopening a window when it has none), tier "OPEN".
+    // url given: opens it (normalizeOpenUrl) in appHint, else the default browser, as a new tab
+    // through the openUrl hook, waits for the page to load, and returns its AX tree.
+    CuaExecResult openAction(const QString &appHint, const QString &url);
     // No input: brings appHint forward (when given) and returns its display's AX tree as
     // tier "L1_OBS" with observation = up to kObserveChars of formatted nodes, the app's first.
     CuaExecResult observeApp(const QString &appHint);
@@ -222,7 +252,13 @@ private:
         uint32_t lapisDisplayId = 0;
         int selfPid = 0;
         bool allowSelf = false;
+        int appPid = 0;          // the activated app's pid, 0 when unknown
+        bool activated = false;  // activateApp succeeded
     };
+    // Moves displayId to the front of rt's search order (no-op for 0 or an unknown id).
+    static void preferDisplay(Route *rt, uint32_t displayId);
+    // The frontmost on-screen window of the routed app (by pid, else by name), never Lapis's.
+    bool appWindow(const Route &rt, AppWindowInfo *out) const;
     // Activates the hinted app (waiting for it to come to the front) when activate is true; on a
     // single display, hides Lapis when it is still frontmost and the target does not name it.
     // hintOverride names the app directly (observeApp's bare "Discord" or an unlisted app).
@@ -230,7 +266,10 @@ private:
     // The AX nodes on one display with Lapis's own dropped (unless allowed), the hinted app's first.
     QVector<AxNode> visibleNodes(const Route &rt, uint32_t displayId) const;
     // After a visible action: settle kObserveSettleMs, then format the routed display's nodes.
-    QString observeAfterAction(const Route &rt);
+    // waitPageLoad: settle kNavSettleMs and re-read while the page looks blank (see kNavPolls).
+    // followWindow: re-route to the display of the app's frontmost window first (cmd+n opened
+    // one on another monitor).
+    QString observeAfterAction(const Route &rt, bool waitPageLoad = false, bool followWindow = false);
     // `verb` ("Clicking") builds the HUD status once the route is known.
     Located locate(const QString &targetDesc, bool refineCrop, const QString &label, const QString &verb,
                    Route *routeOut = nullptr);
@@ -243,8 +282,11 @@ private:
     CuaExecResult scrollImpl(const QString &targetDesc, int deltaY, Route *rt);
     CuaExecResult observeImpl(const QString &appHint, Route *rt);
     CuaExecResult hotkeyImpl(const QString &appHint, const QString &combo, Route *rt);
+    CuaExecResult openImpl(const QString &appHint, const QString &url, Route *rt);
     CuaExecResult dragImpl(const QString &fromDesc, const QString &toDesc, Route *rt);
     void hud(const QString &status, HudTone tone) const;
+    // A visible step is over: arm the cursor's pop-out (kStepHideSec).
+    void endStep() const;
     void hudFail(const QString &targetDesc, const QString &why) const;
     bool tracing() const { return !m_hooks.traceDir.isEmpty() && m_hooks.captureDisplayJpeg; }
     // The display a step happened on: the one holding pt, else the route's first.

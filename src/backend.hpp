@@ -236,11 +236,14 @@ QString answerDisplayText(const QString &raw, bool streaming = false);
 QString cuaFollowupBreak(const QString &shownSoFar);
 // A visible computer-use action from a cua_click / cua_type / cua_scroll tag. cua_type's arg is
 // "<target>|<text>" (split at the first '|'); cua_scroll's is "<target>|<deltaY>" (split at the
-// last '|'; deltaY is an integer line count, positive scrolls up, or "up" / "down" for +-5).
+// last '|'; deltaY is an integer notch count clamped to +-100, positive scrolls up, or "up" /
+// "down" for +-5, "pageup" / "pagedown" for +-12).
 // cua_hotkey's is "<combo>" or "<app>|<combo>" (target = app, text = combo, valid only when
 // parseHotkeyCombo accepts it); cua_drag's is "<from>|<to>" (target = from, text = to).
+// cua_open's is "<app>", "<url>" or "<app>|<url>" (target = app, text = the URL with https://
+// added when it has no scheme; invalid when the URL half is not a URL).
 struct CuaCommand {
-    QString kind;  // "click", "type", "scroll", "observe", "hotkey", "drag"
+    QString kind;  // "click", "type", "scroll", "observe", "hotkey", "drag", "open"
     QString target;
     QString text;
     int deltaY = 0;
@@ -255,7 +258,7 @@ struct CuaStepResult {
     QString tier, detail, observation;
 };
 // At most this many automatic follow-up turns per user prompt.
-constexpr int kMaxCuaLoopDepth = 4;
+constexpr int kMaxCuaLoopDepth = 7;
 // "[CUA observation after <action> (<tier>, ok=<0|1>, detail=<detail>)]:\n<observation>".
 QString cuaObservationPrompt(const QString &action, const QString &tier, bool ok, const QString &detail,
                              const QString &observation);
@@ -377,6 +380,11 @@ class Backend : public QObject {
     Q_PROPERTY(QStringList tasteRules READ tasteRules NOTIFY tasteRulesChanged)
     // The MacBook-wide Spotlight bar (studio::cua::CuaSpotlight) is up: it owns L2 / R2 / ✕ / ○.
     Q_PROPERTY(bool spotlightOpen READ spotlightOpen NOTIFY spotlightOpenChanged)
+    // "overlay" (Live default): L2 anywhere, Studio included, opens the Jarvis bar (CuaSpotlight)
+    // with hold-or-tap voice, auto-send on Phonon's paste and instant interrupt. "split" (Mock
+    // default, the pre-Jarvis routing): L2 inside Studio dictates into the ask card, the bar only
+    // opens over other apps, and R2 sends. Persisted in studio_prefs.json.
+    Q_PROPERTY(QString jarvisBarMode READ jarvisBarMode WRITE setJarvisBarMode NOTIFY jarvisBarModeChanged)
 
 public:
     enum class Mode { Live, Mock };
@@ -433,6 +441,33 @@ public:
     Q_INVOKABLE void dismissSpotlight(bool restoreTarget = true);
     // Background d-pad: close the bar and bring full Studio forward.
     void summonStudio();
+
+    // --- Jarvis (jarvisBarMode "overlay") --------------------------------------------------
+    QString jarvisBarMode() const { return m_jarvisBarMode; }
+    void setJarvisBarMode(const QString &mode);
+    bool jarvisOverlay() const { return m_jarvisBarMode == QLatin1String("overlay"); }
+    // Auto-send timing after listening stops (fn key-up): Phonon pastes ~185 ms later (120-450).
+    // A paste is debounced kAutoSendDebounceMs, then sent. Text already in the field with no new
+    // paste within kAutoSendNoPasteMs is sent as is. Still empty at kAutoSendGiveUpMs: the bar
+    // closes quietly.
+    static constexpr int kAutoSendDebounceMs = 65, kAutoSendNoPasteMs = 260, kAutoSendGiveUpMs = 1300;
+    bool awaitingAutoSend() const { return m_awaitingAutoSend; }
+    // A model stream (any conversation card or the bar) or computer use is in flight.
+    bool jarvisBusy() const;
+    // The harness's Esc: aborts in-flight cua_* steps (cancelFlag, cleared again for the next
+    // turn), cancels every conversation stream and the CUA loop, hides the cursor and HUD, and
+    // records the interrupted request in the shared history (superseded: "superseded by the next
+    // instruction", else "stopped"). False when nothing was running.
+    bool interruptJarvis(bool superseded);
+    // ○ / Esc while listening or waiting for the paste: stops Phonon, clears the draft, closes.
+    void cancelJarvisListening();
+    // Esc (the bar's own, or the global watch while a turn acts) and ○ in overlay mode.
+    void handleJarvisEscape();
+    int jarvisInterrupts() const { return m_jarvisInterrupts; }
+    // Tests: a fake in-flight live cua_* action (no executor), finished through the real
+    // completion path (which clears a cancelFlag latched by an interrupt).
+    void testBeginCuaAction();
+    void testFinishCuaAction();
     // Tests: what counts as "Studio is the active app" (default: [NSApp isActive] in the real
     // window, true in every offscreen mode).
     void setStudioActiveProbeForTest(std::function<bool()> probe) { m_studioActiveProbe = std::move(probe); }
@@ -731,6 +766,7 @@ signals:
     void shadowRecordChanged();
     void pendingProposalChanged();
     void spotlightOpenChanged();
+    void jarvisBarModeChanged();
     void sessionStarted(const QString &projectKey);
     void quickTick();
     void streamDelta(const QString &streamId, const QString &textDelta, const QString &thinkingDelta);
@@ -794,6 +830,22 @@ private:
     QString m_testLastSlice;
     void syncSpotlightOpen();
     void syncSpotlightTurn();
+    // Jarvis bookkeeping.
+    QString m_jarvisBarMode;  // set in the constructor: "overlay" Live, "split" otherwise
+    bool m_awaitingAutoSend = false;
+    QString m_autoSendBaseline;   // the field when listening stopped
+    QTimer m_autoSendDebounce, m_autoSendNoPaste, m_autoSendGiveUp;
+    bool m_voiceCancelling = false;  // cancelJarvisListening is lifting the voice key
+    int m_jarvisInterrupts = 0;
+    void armAutoSend();
+    void disarmAutoSend();
+    void autoSendNow();
+    void onSpotlightInputEdited();
+    void syncEscapeWatch();
+    // One live cua_* action came back (or a test's fake one): pending count, the cancel latch,
+    // the cursor's pop-out and the escape watch.
+    void onCuaActionDone();
+    QString jarvisStudioLabel();  // "Lapis" or "Lapis · <focused project>"
     void onSpotlightDelta();
     void onSpotlightFinished(const QString &error);
     void noteSpotlightAction(bool ok, const QString &detail);

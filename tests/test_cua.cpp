@@ -10,6 +10,7 @@
 #include <iterator>
 #include <utility>
 #include <QCoreApplication>
+#include <QGuiApplication>
 #include <QDateTime>
 #include <QDir>
 #include <QElapsedTimer>
@@ -19,11 +20,13 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QSet>
 #include <QTemporaryDir>
 #include <QThread>
 #include <cmath>
 #include <cstdio>
 #include <limits>
+#include <memory>
 #include <thread>
 
 using namespace studio::cua;
@@ -226,10 +229,57 @@ void reticleOffscreenTests() {
             clear = hidden.pixelColor(x, y).alpha() == 0;
     check(!r.state().visible && clear, "reticle: hide clears the overlay");
     check(r.render(0).isNull() && r.render(std::numeric_limits<double>::quiet_NaN()).isNull(), "reticle: invalid render scale");
+
+    // Auto-hide: the glove never stays parked. Offscreen only hides when asked (deterministic).
+    {
+        CuaReticle h(CuaReticle::Mode::Offscreen, disp);
+        h.moveTo({200, 200}, "Clicking");
+        h.pulseClick({200, 200});
+        h.advanceClock(5.0);
+        check(h.state().visible && !h.state().hideScheduled && h.state().cursorAlpha == 1.0,
+            "reticle hide: Offscreen never auto-hides (tests at advanceClock(0.5) keep the cursor)");
+        h.hideAfter(0.55);
+        auto hs = h.state();
+        check(hs.visible && hs.hideScheduled && hs.cursorAlpha == 1.0, "reticle hide: hideAfter(0.55) arms, still fully up");
+        h.advanceClock(0.5);
+        check(h.state().visible && h.state().cursorAlpha == 1.0, "reticle hide: 0.50 s in, still up");
+        h.advanceClock(0.13);  // 0.63 s: 0.08 s into the 0.16 s pop-out
+        hs = h.state();
+        check(hs.visible && hs.cursorAlpha > 0.2 && hs.cursorAlpha < 0.8, "reticle hide: fading mid pop-out");
+        h.advanceClock(0.2);
+        hs = h.state();
+        check(!hs.visible && hs.cursorAlpha == 0 && hs.focusRect.isEmpty() && !hs.hideScheduled,
+            "reticle hide: gone (ordered out) once the fade ends");
+        int lit = 0;
+        const QImage gone = h.render(2);
+        for (int y = 0; y < gone.height(); y += 2)
+            for (int x = 0; x < gone.width(); x += 2)
+                lit += qAlpha(gone.pixel(x, y)) > 0;
+        check(lit == 0, "reticle hide: the hidden overlay renders nothing");
+        // A new command cancels a pending pop-out and brings the glove back to full alpha.
+        h.moveTo({300, 220}, "Typing");
+        h.hideAfter(0.45);
+        h.advanceClock(0.52);  // mid-fade
+        check(h.state().visible && h.state().cursorAlpha < 1, "reticle hide: fading before the next step");
+        h.moveTo({340, 240}, "Next step");
+        hs = h.state();
+        check(hs.visible && hs.cursorAlpha == 1.0 && !hs.hideScheduled, "reticle hide: moveTo cancels the pop-out, alpha back to 1");
+        h.highlightRect({320, 230, 60, 24});
+        h.hideAfter(1.0);
+        h.hideAfter(0.3);  // the earlier one wins
+        h.advanceClock(0.5);
+        check(!h.state().visible, "reticle hide: the earliest pending hideAfter wins");
+        h.moveTo({100, 100});
+        h.hideAfter(0);
+        check(!h.state().visible, "reticle hide: hideAfter(0) is hide()");
+        h.hideAfter(0.5);  // on a hidden cursor: a no-op
+        check(!h.state().visible && !h.state().hideScheduled, "reticle hide: hideAfter on a hidden cursor is a no-op");
+    }
 }
 // A CuaHooks whose every side effect appends to `calls` and touches nothing real.
 struct MockRig {
     QStringList calls;
+    QVector<double> hideAfters;  // reticleHideAfter seconds, kept out of `calls`
     QVector<DisplayInfo> displays{{7, "primary", {0, 0, 1440, 900}, 2, true}, {9, "side", {1440, 0, 1920, 1080}, 1, false}};
     QVector<AxNode> nodes;
     QByteArray jpeg = "not-a-real-jpeg";
@@ -319,6 +369,7 @@ struct MockRig {
         h.reticleHighlight = [this](QRectF r, const QString &) { calls << "reticleHighlight"; highlightRect = r; };
         h.reticlePulse = [this](QPointF p, const QString &) { calls << "reticlePulse"; pulsePt = p; };
         h.reticleHide = [this] { calls << "reticleHide"; };
+        h.reticleHideAfter = [this](double s) { hideAfters << s; };
         h.reticleWindowId = [this] { return windowId; };
         h.pause = [this](int ms) { pauses << QString::number(ms); };
         return h;
@@ -365,6 +416,8 @@ void executorTests() {
         check(close(res.globalPt, button.center()) && close(m.clickPt, button.center()), "exec L1: clicks the AXButton centre");
         check(m.highlightRect == button && close(m.pulsePt, button.center()), "exec L1: ring on the button, pulse at its centre");
         check(m.effects() == QStringList({"reticleHighlight", "reticlePulse", "click"}), "exec L1: highlight -> pulse -> click only");
+        check(m.hideAfters == QVector<double>({kStepHideSec}) && kStepHideSec == 0.45,
+            "exec hide: a finished click arms the cursor's 0.45 s pop-out");
         check(!m.calls.contains("capture") && !m.calls.contains("ground"), "exec L1: no capture, no grounding");
         check(m.calls.contains("inspectDisplay:7"), "exec L1: inspects the primary display");
         check(!m.clickDouble, "exec L1: single click by default");
@@ -465,6 +518,7 @@ void executorTests() {
         check(res.ok && res.tier == "L1_AX" && m.typed == "hello world", "exec type: ok, text typed");
         check(m.effects() == QStringList({"reticleHighlight", "reticlePulse", "click", "clear", "type"}),
             "exec type: highlight -> pulse -> click -> clear -> type");
+        check(m.hideAfters == QVector<double>({kStepHideSec}), "exec hide: a finished type arms the pop-out once");
         MockRig f;
         f.ground.ok = false;
         CuaExecutor exf(f.hooks());
@@ -576,6 +630,7 @@ void executorTests() {
         const auto res = ex.scrollTarget("results", -5);
         check(res.ok && res.tier == "L1_AX" && close(m.scrollPt, list.center()) && m.scrollDy == -5, "exec scroll: scrolls the AX target");
         check(m.effects() == QStringList({"reticleHighlight", "reticleMove", "scroll"}), "exec scroll: highlight -> move -> scroll");
+        check(m.hideAfters == QVector<double>({kStepHideSec}), "exec hide: a finished scroll arms the pop-out");
         MockRig c;
         c.ground.ok = false;
         CuaExecutor exc(c.hooks());
@@ -1208,9 +1263,9 @@ void hotkeyDragTests() {
         check(m.effects().indexOf("activate:Chrome") < m.effects().indexOf("hotkey"), "hotkey exec: activation precedes the press");
         check(m.huds.contains("working|Chrome · Pressing Cmd+L") && m.huds.last() == "done|Done · Pressed Cmd+L",
             "hotkey exec: HUD shows Chrome · Pressing Cmd+L, then Done");
-        check(res.observation.contains("Address and search bar") && m.pauses.contains("200")
+        check(res.observation.contains("Address and search bar") && m.pauses.contains(QString::number(kObserveSettleMs))
                   && m.inspected().last() == "9",
-            "hotkey exec: settles 200 ms, then observes the app's display");
+            "hotkey exec: settles kObserveSettleMs, then observes the app's display");
         check(!m.calls.contains("click") && !m.calls.contains("reticlePulse"), "hotkey exec: no pointer input");
     }
     // No app: nothing is activated; a fullscreen single-screen Lapis is hidden first.
@@ -1264,11 +1319,13 @@ void hotkeyDragTests() {
         const QStringList fx = m.effects();
         check(fx == QStringList({"reticleHighlight", "reticleHighlight", "reticleMove", "reticlePulse", "reticleMove", "drag"}),
             "drag exec: locate both, glide to from, pulse, glide to to, drag");
+        check(m.hideAfters == QVector<double>({kStepHideSec}), "exec hide: a finished drag arms the pop-out");
         check(close(m.pulsePt, {110, 410}) && close(m.movePt, {620, 410}), "drag exec: pulse at from, reticle ends at to");
         check(m.huds.contains("working|Dragging slider handle to volume max")
                   && m.huds.last() == "done|Done · Dragged slider handle to volume max",
             "drag exec: HUD 'Dragging <from> to <to>', then Done");
-        check(m.pauses.contains("200") && res.observation.contains("volume max"), "drag exec: settles, then observes");
+        check(m.pauses.contains(QString::number(kObserveSettleMs)) && res.observation.contains("volume max"),
+            "drag exec: settles, then observes");
     }
     // To via the VLM: from is AX, to is not in the tree, so the grounder places it.
     {
@@ -1384,6 +1441,215 @@ QVector<QJsonObject> humanLines(const QString &dir) {
     for (const QByteArray &l : f.readAll().split('\n'))
         if (!l.trimmed().isEmpty()) out << QJsonDocument::fromJson(l).object();
     return out;
+}
+// The six live-prompt reliability fixes: deep web scan, compact observations, whole-page scroll,
+// cua_open, navigation settle, and following a new window.
+void reliabilityTests() {
+    // --- scan policy on a synthetic Chrome tree --------------------------------------------------
+    {
+        struct T { AxNode n; QVector<int> kids; };
+        QVector<T> tree;
+        const auto add = [&](int parent, const QString &role, const QString &title, QRectF rect, const QString &value = {}) {
+            tree.push_back({AxNode{0, role, title, value, "Google Chrome", 600, rect, {}}, {}});
+            const int id = int(tree.size()) - 1;
+            if (parent >= 0) tree[parent].kids.push_back(id);
+            return id;
+        };
+        const QRectF win(0, 25, 1440, 875);
+        const int app = add(-1, "AXApplication", "Google Chrome", {});
+        const int menu = add(app, "AXMenuBar", "", {0, 0, 1440, 24});
+        add(menu, "AXMenuBarItem", "File", {10, 0, 30, 24});
+        const int w = add(app, "AXWindow", "Elon Musk (@elonmusk) / X", win);
+        const int tabs = add(w, "AXTabGroup", "", {0, 25, 1440, 40});
+        for (int i = 0; i < 40; ++i) add(tabs, "AXRadioButton", QString("Background tab %1").arg(i), {double(i) * 30, 25, 30, 40});
+        add(w, "AXTextField", "Address and search bar", {200, 80, 800, 28}, "x.com/elonmusk");
+        int g = add(w, "AXGroup", "", win);
+        const int webArea = add(g, "AXWebArea", "", {0, 120, 1440, 780});
+        int deep = webArea;
+        for (int i = 0; i < 20; ++i) deep = add(deep, "AXGroup", "", {0, 120, 1440, 780});  // React wrappers
+        const int zero = add(deep, "AXGroup", "Post", {0, 0, 0, 0});  // named but zero-size: walked through, not kept
+        add(zero, "AXStaticText", "", {40, 300, 600, 20}, "Elon Musk reposted");
+        add(deep, "AXLink", "Posts", {40, 200, 60, 20});
+        add(deep, "AXLink", "Replies", {120, 200, 60, 20});
+        const auto walk = [&](int maxNodes, int maxDepth) {
+            QSet<int> seen;
+            return walkAxTree<int>(
+                app, AxWalkLimits{maxNodes, maxDepth, std::max(maxNodes * 8, 3200)},
+                [&](int h) { if (seen.contains(h)) return false; seen.insert(h); return true; },
+                [&](int h, int) { return tree[h].n; },
+                [&](int h, int cap) { return tree[h].kids.mid(0, cap); }, [] { return true; });
+        };
+        const auto out = walk(500, 32);
+        bool noWrappers = true, reposted = false, posts = false, menuItem = false, zeroKept = false;
+        int repostIdx = -1, postsIdx = -1, tabCount = 0;
+        for (int i = 0; i < out.size(); ++i) {
+            const AxNode &n = out[i].first;
+            if (n.role == "AXGroup" && n.title.isEmpty()) noWrappers = false;
+            if (n.role == "AXWebArea") noWrappers = false;
+            if (n.value == "Elon Musk reposted") { reposted = true; repostIdx = i; }
+            if (n.title == "Posts") { posts = true; postsIdx = i; }
+            if (n.title == "File") menuItem = true;
+            if (n.title == "Post") zeroKept = true;
+            if (n.role == "AXRadioButton") ++tabCount;
+            check(n.id == i + 1, "scan: kept nodes are numbered 1..n");
+        }
+        check(noWrappers, "scan: empty AXGroup / AXWebArea wrappers are walked through, never kept");
+        check(reposted && posts && out[repostIdx].second > webArea + 20, "scan: AXStaticText / AXLink at depth > 18 reach the result");
+        check(!zeroKept && reposted, "scan: a zero-size node is dropped but its children are still read");
+        check(!menuItem, "scan: AXMenuBar is never expanded");
+        // app, menu bar, window, tab group, 40 tabs, address bar, then the page's text and two links.
+        check(tabCount == 40 && out.size() == 48, "scan: toolbar and tabs kept alongside the page");
+        check(repostIdx >= 0 && repostIdx < postsIdx, "scan: page content kept in document order");
+        const auto shallow = walk(500, 14);
+        bool shallowReach = false;
+        for (const auto &e : shallow) shallowReach = shallowReach || e.first.value == "Elon Musk reposted";
+        check(!shallowReach, "scan: the old maxDepth 14 could not reach the post (the bug)");
+        const auto tight = walk(30, 32);
+        check(tight.size() == 30, "scan: maxNodes caps the kept nodes, not the visited ones");
+        check(axStructuralNoise(AxNode{0, "AXGroup", "", "", "", 0, {0, 0, 10, 10}, {}}, 3)
+                  && !axStructuralNoise(AxNode{0, "AXGroup", "Toolbar", "", "", 0, {0, 0, 10, 10}, {}}, 3)
+                  && !axStructuralNoise(AxNode{0, "AXGroup", "", "", "", 0, {}, {}}, 0)
+                  && !axStructuralNoise(AxNode{0, "AXStaticText", "", "", "", 0, {0, 0, 10, 10}, {}}, 3)
+                  && axTinyRect(AxNode{0, "AXButton", "x", "", "", 0, {0, 0, 1, 30}, {}}, 2)
+                  && !axTinyRect(AxNode{0, "AXApplication", "x", "", "", 0, {}, {}}, 0),
+            "scan: noise and tiny-rect predicates");
+    }
+    // --- compact observations ---------------------------------------------------------------------
+    {
+        AxNode n{3, "AXStaticText", QString(2000, QChar('p')), "", "Google Chrome", 600, {126.33333333333333, 40.06, 80.25, 19.999}, {}};
+        const QString line = formatNodesForModel({n}, 14000);
+        const QJsonObject o = QJsonDocument::fromJson(line.toUtf8()).object();
+        const QJsonArray rect = o.value("rect").toArray();
+        check(!o.isEmpty() && rect.size() == 4 && rect[0].toDouble() == 126.3 && rect[1].toDouble() == 40.1
+                  && rect[3].toDouble() == 20 && !line.contains("126.333"),
+            "format: rect rounded to 0.1");
+        check(o.value("title").toString().size() == 280 && line.size() < 600, "format: one giant paragraph capped at 280 chars");
+        check(kObserveChars == 14000 && kPostActionChars == 11000 && kObserveSettleMs == 220, "format: observation budgets raised");
+        QVector<AxNode> page;
+        for (int i = 0; i < 120; ++i)
+            page.push_back(AxNode{i + 1, "AXLink", QString("Post %1 by someone").arg(i), "", "Google Chrome", 600,
+                                  {40, 200.0 + i * 30, 600, 20}, {"AXPress"}});
+        check(formatNodesForModel(page, kPostActionChars).count('\n') >= 60, "format: a post-action read fits 60+ page nodes, not 16");
+    }
+    // --- URLs and whole-view scroll targets ------------------------------------------------------
+    check(normalizeOpenUrl("x.com/elonmusk") == "https://x.com/elonmusk" && normalizeOpenUrl("https://x.com/pmarca") == "https://x.com/pmarca"
+              && normalizeOpenUrl(" github.com ") == "https://github.com" && normalizeOpenUrl("localhost:8080/a") == "https://localhost:8080/a"
+              && normalizeOpenUrl("file:///tmp/a.html") == "file:///tmp/a.html",
+        "open: URLs get https:// only when they have no scheme");
+    check(normalizeOpenUrl("Chrome").isEmpty() && normalizeOpenUrl("").isEmpty() && normalizeOpenUrl("elon musk").isEmpty(),
+        "open: app names and phrases are not URLs");
+    check(wholeViewScrollTarget("Chrome", "Chrome") && wholeViewScrollTarget("Chrome page", "Chrome")
+              && wholeViewScrollTarget("Chrome|x.com page", "Chrome") && wholeViewScrollTarget("Chrome timeline", "Chrome")
+              && wholeViewScrollTarget("", "") && wholeViewScrollTarget("the page", "") && wholeViewScrollTarget("feed", ""),
+        "scroll: whole-view targets");
+    check(!wholeViewScrollTarget("results list", "") && !wholeViewScrollTarget("Chrome sidebar", "Chrome")
+              && !wholeViewScrollTarget("Send button in Discord", "Discord"),
+        "scroll: named controls are not whole-view");
+    check(navigationHotkey("cmd+r") && navigationHotkey("cmd+[") && navigationHotkey("cmd+]") && navigationHotkey("cmd+shift+r")
+              && !navigationHotkey("cmd+l") && !navigationHotkey("cmd+t"),
+        "nav: reload / back / forward are navigation hotkeys");
+
+    // --- scrollTarget("Chrome|x.com page") scrolls the window, never the toolbar ----------------
+    {
+        MockRig m;
+        m.activateOk = true; m.activatePid = 600; m.activateDisplay = 7;
+        m.windows = {{600, "Google Chrome", 7, {0, 25, 1440, 875}, true}};
+        m.nodes = {AxNode{1, "AXTextField", "Address and search bar", "x.com", "Google Chrome", 600, {200, 80, 800, 28}, {}},
+                   AxNode{2, "AXStaticText", "x.com page title", "", "Google Chrome", 600, {200, 150, 400, 20}, {}}};
+        m.ground.ok = true; m.ground.hasPoint1000 = true; m.ground.point1000 = {500, 103};  // the URL bar at y=93
+        CuaExecutor ex(m.hooks());
+        const auto r = ex.scrollTarget("Chrome|x.com page", -5);
+        check(r.ok && r.tier == "WINDOW" && !m.calls.contains("ground") && !m.calls.contains("capture")
+                  && !m.calls.contains("reticleHighlight"),
+            "scroll page: no AX match, no VLM call");
+        check(close(m.scrollPt, {720, 25 + 875 * 0.55}) && m.scrollDy == -5 && m.calls.contains("activate:Chrome"),
+            "scroll page: the middle of Chrome's window, below the toolbar");
+        MockRig d;  // "down" with no window info: the display centre, still no VLM
+        d.ground = m.ground;
+        CuaExecutor exd(d.hooks());
+        const auto rd = exd.scrollTarget("Chrome", -5);
+        check(rd.ok && rd.tier == "CENTER" && !d.calls.contains("ground") && close(d.scrollPt, {720, 450}),
+            "scroll page: no window falls back to the display centre");
+        MockRig s;  // the Spotlight bar's app is the default: a bare scroll scrolls its window
+        s.activateOk = true; s.activatePid = 600;
+        s.windows = {{600, "Google Chrome", 9, {1440, 0, 1920, 1080}, true}};
+        CuaExecutor exs(s.hooks());
+        exs.setDefaultAppHint("Google Chrome");
+        const auto rs = exs.scrollTarget("", -12);
+        check(rs.ok && rs.tier == "WINDOW" && close(s.scrollPt, {2400, 1080 * 0.55}), "scroll page: default app's window on its display");
+    }
+
+    // --- cua_open -----------------------------------------------------------------------------------
+    {
+        MockRig m;
+        m.selfPid = 500;
+        m.windows = {{600, "Google Chrome", 9, {1440, 0, 1920, 1080}, true}};
+        QVector<AxNode> blank{AxNode{1, "AXButton", "Reload", "", "Google Chrome", 600, {1500, 40, 30, 30}, {"AXPress"}}};
+        m.nodesByDisplay[9] = blank;
+        CuaHooks h = m.hooks();
+        QStringList opened;
+        h.openUrl = [&](const QString &hint, const QString &url) {
+            opened << hint + "|" + url;
+            AppActivation a; a.ok = true; a.pid = 600; a.displayId = 9; a.appName = "Google Chrome";
+            return a;
+        };
+        CuaExecutor ex(h);
+        const auto r = ex.openAction("Chrome", "x.com/elonmusk");
+        check(r.ok && r.tier == "OPEN" && opened == QStringList({"Chrome|https://x.com/elonmusk"}) && r.detail.contains("new tab"),
+            "open url: opened through the URL hook as a new tab, https:// added");
+        check(!m.calls.contains("click") && !m.calls.contains("type") && !m.calls.contains("clear") && !m.calls.contains("hotkey"),
+            "open url: never clicks or types into the address bar");
+        check(m.pauses.contains(QString::number(kNavSettleMs)) && m.inspected().size() == 1 + kNavPolls
+                  && m.inspected().value(0) == "9" && r.observation.contains("Reload"),
+            "open url: a blank page is re-read until the polls run out, on the browser's display");
+        // A page that has loaded is read once.
+        MockRig l;
+        l.windows = m.windows;
+        for (int i = 0; i < 30; ++i)
+            l.nodesByDisplay[9].push_back(AxNode{i + 1, i % 2 ? "AXLink" : "AXStaticText", QString("post %1").arg(i), "",
+                                                 "Google Chrome", 600, {1500, 100.0 + i * 20, 400, 18}, {}});
+        CuaHooks lh = l.hooks();
+        lh.openUrl = h.openUrl;
+        CuaExecutor exl(lh);
+        const auto rl = exl.openAction("", "https://x.com/elonmusk");
+        check(rl.ok && l.inspected().size() == 1 && rl.observation.contains("post 29") && opened.last() == "|https://x.com/elonmusk",
+            "open url: a loaded page is read once; a bare URL goes to the default browser");
+        check(!ex.openAction("Chrome", "not a url").ok && opened.size() == 2, "open url: junk URL rejected before opening");
+        // App only: activates (reopening a window when there is none), tier OPEN.
+        MockRig a;
+        a.activateOk = true; a.activatePid = 600; a.activateDisplay = 9;
+        a.nodesByDisplay[9] = blank;
+        CuaExecutor exa(a.hooks());
+        const auto ra = exa.openAction("Chrome", "");
+        check(ra.ok && ra.tier == "OPEN" && a.calls.contains("activate:Chrome") && ra.observation.contains("Reload")
+                  && a.pauses.contains(QString::number(kObserveSettleMs)),
+            "open app: activates Chrome and observes it");
+        MockRig f;  // not running, not installed
+        CuaExecutor exf(f.hooks());
+        check(!exf.openAction("Nonexistent", "").ok && !exf.openAction("", "").ok, "open app: failed activation and empty args are errors");
+    }
+
+    // --- navigation settle and following a new window ------------------------------------------
+    {
+        MockRig m;
+        m.nodes = {axNode(1, "AXTextField", "Search", {100, 100, 300, 30})};
+        CuaExecutor ex(m.hooks());
+        ex.typeIntoTarget("Search", "elon\\n");
+        check(m.pauses.contains(QString::number(kNavSettleMs)), "nav: typing a Return waits for the page");
+        MockRig p;
+        p.nodes = m.nodes;
+        CuaExecutor exp(p.hooks());
+        exp.typeIntoTarget("Search", "elon");
+        check(!p.pauses.contains(QString::number(kNavSettleMs)) && p.inspected().size() == 2, "nav: plain typing keeps the quick settle");
+        MockRig n;  // cmd+n opens a small new window on display 9; the big old one is on 7
+        n.activateOk = true; n.activatePid = 600; n.activateDisplay = 7;
+        n.windows = {{600, "Google Chrome", 9, {1500, 100, 800, 600}, true}, {600, "Google Chrome", 7, {0, 25, 1440, 875}, true}};
+        n.nodesByDisplay[9] = {AxNode{1, "AXTextField", "New window address bar", "", "Google Chrome", 600, {1600, 140, 600, 28}, {}}};
+        CuaExecutor exn(n.hooks());
+        const auto rn = exn.hotkeyAction("Chrome", "cmd+n");
+        check(rn.ok && n.inspected().last() == "9" && rn.observation.contains("New window address bar"),
+            "nav: after cmd+n the observation follows the app's frontmost window");
+    }
 }
 void shadowTests() {
     const qint64 t0 = 1763600000000;  // fixed ms, so frame names are deterministic
@@ -1505,24 +1771,33 @@ void spotlightTests() {
     {
         const QRectF screen(0, 0, 1512, 982);  // AppKit: origin bottom-left
         const QRectF f = spotlightFrame(screen, kSpotlightBaseHeight);
-        check(f.width() == kSpotlightWidth && std::abs(f.center().x() - screen.center().x()) <= 1,
-            "spotlight: 620 wide, centred horizontally");
+        check(kSpotlightWidth == 580 && kSpotlightBaseHeight == 56 && f.width() == kSpotlightWidth
+                  && f.height() == 56 && std::abs(f.center().x() - screen.center().x()) <= 1,
+            "spotlight: one 580 x 56 Jarvis capsule, centred horizontally");
         check(std::abs((f.y() + f.height()) - (982 - std::round(982 * 0.20))) < 1e-9,
             "spotlight: top edge 20% below the screen top (AppKit coords)");
         const QRectF g = spotlightFrame(QRectF(-1920, 200, 1920, 1080), 200);
-        check(g.x() == -1920 + 650 && std::abs(g.y() + g.height() - (200 + 1080 - 216)) < 1e-9,
+        check(g.x() == -1920 + 670 && std::abs(g.y() + g.height() - (200 + 1080 - 216)) < 1e-9,
             "spotlight: a secondary screen with a negative origin");
         check(spotlightFrame(screen, 10).height() == kSpotlightBaseHeight
                   && spotlightFrame(screen, 1000).height() == kSpotlightMaxHeight,
-            "spotlight: height clamped to 96..340");
-        check(spotlightHeight(false, 500) == 96 && spotlightHeight(true, 0) > 96 && spotlightHeight(true, 5000) <= 340
-                  && spotlightHeight(true, 40) < spotlightHeight(true, 120),
-            "spotlight: the drawer grows with the answer, capped at 340");
-        check(spotlightHint(true) == QStringLiteral("● Listening…")
-                  && spotlightHint(false) == QStringLiteral("L2 voice · R2 send · ○ close"),
-            "spotlight: hint text listening / idle");
-        check(spotlightPlaceholder("Google Chrome") == QStringLiteral("Command or ask about Google Chrome…"),
-            "spotlight: placeholder names the target app");
+            "spotlight: height clamped to 56..292");
+        check(kSpotlightMaxHeight == 292 && spotlightHeight(false, 500) == 56 && spotlightHeight(true, 0) > 56
+                  && spotlightHeight(true, 5000) <= kSpotlightMaxHeight && spotlightHeight(true, 40) < spotlightHeight(true, 120),
+            "spotlight: the answer drawer grows below the capsule, capped at 292");
+        using V = SpotlightVoice;
+        check(spotlightHint(V::Held) == QStringLiteral("L2 release") && spotlightHint(V::Toggled) == QStringLiteral("Listening · tap L2 to send")
+                  && spotlightHint(V::Transcribing) == QStringLiteral("Transcribing…")
+                  && spotlightHint(V::Idle, true) == QStringLiteral("○ close") && spotlightHint(V::Idle, false, true) == QStringLiteral("R2 send")
+                  && spotlightHint(V::Idle) == QStringLiteral("L2 voice"),
+            "spotlight: one badge per state (release / tap to send / transcribing / close / send / voice)");
+        check(spotlightPlaceholder("Chrome") == QStringLiteral("Ask or control Chrome…")
+                  && spotlightPlaceholder({}) == QStringLiteral("Ask or control anything…")
+                  && spotlightPlaceholder("Chrome", V::Held) == QStringLiteral("Speak or type…")
+                  && spotlightPlaceholder("Chrome", V::Toggled) == QStringLiteral("Tap L2 to send…"),
+            "spotlight: placeholder per voice state, naming the context when idle");
+        check(spotlightContextLabel("Google Chrome") == "Chrome" && spotlightContextLabel("Discord") == "Discord",
+            "spotlight: the context pill's short app name");
     }
     {
         CuaSpotlight sp(CuaSpotlight::Mode::Offscreen);
@@ -1536,17 +1811,32 @@ void spotlightTests() {
         check(!sp.isOpen() && sp.windowNumber() == 0 && sp.state().opens == 0, "spotlight off: closed, no window");
         const bool wasKey = sp.openOrFocus();
         SpotlightState st = sp.state();
-        check(!wasKey && st.open && st.key && st.alpha == 1.0 && st.targetPid == 4321 && st.targetApp == "Google Chrome",
-            "spotlight off: openOrFocus captures the frontmost app as the target");
+        check(!wasKey && st.open && st.key && st.alpha == 1.0 && st.targetPid == 4321 && st.targetApp == "Google Chrome"
+                  && st.contextLabel == "Chrome" && !st.overStudio && st.placeholder == "Ask or control Chrome…",
+            "spotlight off: openOrFocus captures the frontmost app as the target, pill 'Chrome'");
         check(st.frame.height() == kSpotlightBaseHeight && !st.drawerVisible && sp.windowNumber() == 0,
             "spotlight off: base height without a drawer, still no window");
         check(sp.openOrFocus(), "spotlight off: a second openOrFocus is already key (no voice-key delay)");
         sp.setListening(true);
-        check(sp.state().listening && sp.state().hint.contains("Listening"), "spotlight off: listening hint");
+        check(sp.state().listening && sp.state().voice == SpotlightVoice::Held && sp.state().hint == "L2 release"
+                  && sp.state().placeholder == "Speak or type…",
+            "spotlight off: held listening shows [L2] release");
+        sp.setVoice(SpotlightVoice::Toggled);
+        check(sp.state().listening && sp.state().toggled && sp.state().hint.contains("tap L2 to send")
+                  && sp.state().placeholder == "Tap L2 to send…",
+            "spotlight off: tap-toggled listening shows Listening · tap L2 to send");
+        int edits = 0;
+        sp.onInputEdited = [&] { ++edits; };
         sp.setInputText("click sign in");
+        check(edits == 0, "spotlight off: setInputText alone never fires onInputEdited");
+        sp.notifyInputEdited();
+        check(edits == 1, "spotlight off: notifyInputEdited (Phonon's paste) fires onInputEdited");
+        sp.setVoice(SpotlightVoice::Transcribing);
+        check(!sp.state().listening && sp.state().transcribing && sp.state().hint == "Transcribing…",
+            "spotlight off: transcribing state");
         sp.setListening(false);
-        check(sp.inputText() == "click sign in" && sp.state().hint.startsWith("L2 voice"),
-            "spotlight off: dictated text kept after release");
+        check(sp.inputText() == "click sign in" && sp.state().hint == "R2 send" && sp.state().voice == SpotlightVoice::Idle,
+            "spotlight off: dictated text kept after release (badge [R2] send)");
         const QString q = sp.takeInputText();
         sp.beginTurn(q);
         st = sp.state();
@@ -1577,6 +1867,18 @@ void spotlightTests() {
         check(!sp.isOpen() && sp.state().dismissals == 2 && !sp.reactivateTarget(),
             "spotlight off: dismiss closes; Offscreen never activates an app");
         check(submitted.isEmpty() && dismissed == 0, "spotlight off: state calls never fire the user callbacks");
+        // Over Lapis Studio itself (the unified Jarvis overlay).
+        check(!sp.openOrFocusOverStudio("Lapis · infinity"), "spotlight studio: not key yet on open");
+        st = sp.state();
+        check(st.open && st.overStudio && st.contextLabel == "Lapis · infinity" && st.targetPid == 0 && st.targetApp.isEmpty()
+                  && st.placeholder == "Ask or control Lapis · infinity…" && !sp.reactivateTarget(),
+            "spotlight studio: pill 'Lapis · infinity', no other app to target or re-activate");
+        check(sp.openOrFocusOverStudio("Lapis · infinity"), "spotlight studio: a second open is already key");
+        sp.setEscapeWatch(true);
+        check(sp.state().escapeWatch && sp.windowNumber() == 0, "spotlight studio: the Esc watch records, Offscreen opens nothing");
+        sp.setEscapeWatch(false);
+        sp.dismiss(false);
+        check(!sp.isOpen() && !sp.state().escapeWatch, "spotlight studio: dismissed");
     }
     {
         // A step naming no app goes to the Spotlight's target app, which is activated first.
@@ -1773,22 +2075,36 @@ void spotlightRenderTests() {
     sp.openOrFocus();
     QImage idle = sp.render(2);
     check(!idle.isNull() && idle.width() == int(kSpotlightWidth * 2) && idle.height() == int(kSpotlightBaseHeight * 2),
-        "spotlight render: 2x image of the base bar");
+        "spotlight render: 2x image of the single 56 pt capsule");
     check(forbiddenPixels(idle) == 0, "spotlight render: idle bar has zero blue/green pixels");
     check(countIn(idle, QRectF(0, 0, kSpotlightWidth, kSpotlightBaseHeight), 2, goldish) > 100,
         "spotlight render: idle bar has its gold border");
-    // The hint draws vector controller icons: warm ink in the top-right, gold only while listening.
-    const QRectF hintArea(kSpotlightWidth - 230, 12, 214, 22);
+    // The badge: one vector controller icon on the right, warm ink at rest, gold while listening.
+    const QRectF hintArea(kSpotlightWidth - 130, 16, 114, 24);
+    const QRectF markArea(12, 18, 20, 20);
     const int hintInk = countIn(idle, hintArea, 2, [](const QColor &c) { return c.alpha() > 200 && c.red() > 150 && c.red() > c.blue(); });
-    check(hintInk > 40 && countIn(idle, hintArea, 2, goldish) < 10, "spotlight render: idle hint is [L2] [R2] [○] icons in Lapis ink");
-    // The context pill: #14120f body.
-    check(countIn(idle, QRectF(90, 15, 20, 16), 2, [](const QColor &c) {
+    check(hintInk > 40 && countIn(idle, hintArea, 2, goldish) < 10, "spotlight render: idle badge is an [L2] icon in Lapis ink");
+    // The context pill: #14120f body, just right of the status mark.
+    check(countIn(idle, QRectF(40, 19, 6, 18), 2, [](const QColor &c) {
               return c.alpha() > 240 && std::abs(c.red() - 0x14) <= 3 && std::abs(c.green() - 0x12) <= 3 && std::abs(c.blue() - 0x0F) <= 3; }) > 8,
         "spotlight render: the context pill is #14120f");
+    const int idleMark = countIn(idle, markArea, 2, goldish);
     sp.setListening(true);
     const QImage listening = sp.render(2);
-    check(forbiddenPixels(listening) == 0 && countIn(listening, hintArea, 2, goldish) > 40,
-        "spotlight render: listening shows the gold dot + Listening… and no blue/green");
+    const int liveMark = countIn(listening, markArea, 2, goldish);
+    check(forbiddenPixels(listening) == 0 && countIn(listening, hintArea, 2, goldish) > 40 && liveMark > idleMark,
+        "spotlight render: listening lights the gold orb + [L2] release, no blue/green");
+    // The rim: 1.2 pt gold, brighter while listening (75%) than idle (38%).
+    const auto rimGold = [](const QImage &im) {
+        int sum = 0;
+        for (int x = 80; x < 1000; x += 4)
+            sum += QColor(im.pixel(x, 1)).red();
+        return sum;
+    };
+    check(rimGold(listening) > rimGold(idle), "spotlight render: the gold rim brightens while listening");
+    sp.setVoice(SpotlightVoice::Transcribing);
+    check(forbiddenPixels(sp.render(2)) == 0 && countIn(sp.render(2), markArea, 2, goldish) > 10,
+        "spotlight render: transcribing spins the gold star, no blue/green");
     sp.setListening(false);
     sp.beginTurn(QStringLiteral("why does the sign in page keep reloading?"));
     sp.setAnswer(QStringLiteral("The page wants a cookie the browser blocks, so the form never gets its session token.\n\n"
@@ -1841,7 +2157,13 @@ void writeProofs(const QString &dir) {
     std::printf("proofs: %s\n", qPrintable(dir));
 }
 int main(int argc, char **argv) {
-    QCoreApplication app(argc, argv);
+    // --proofs draws text with QPainter (the snap-cursor captions), which needs QGuiApplication's
+    // font database; the unit tests stay on QCoreApplication.
+    bool proofs = false;
+    for (int a = 1; a < argc; ++a)
+        proofs = proofs || QByteArray(argv[a]) == "--proofs";
+    std::unique_ptr<QCoreApplication> appPtr(proofs ? new QGuiApplication(argc, argv) : new QCoreApplication(argc, argv));
+    QCoreApplication &app = *appPtr;
     if (const int i = int(app.arguments().indexOf("--proofs")); i > 0 && i + 1 < app.arguments().size()) {
         writeProofs(app.arguments().at(i + 1));
         std::printf("test_cua: %d passed, %d failed\n", passed, failed);
@@ -1857,6 +2179,7 @@ int main(int argc, char **argv) {
     reticleGeometryTests(); reticleOffscreenTests(); hudTests(); executorTests(); multiMonitorTests();
     spaceSwitchTests();
     hotkeyDragTests();
+    reliabilityTests();
     spotlightTests();
     if (app.arguments().contains("--capture-smoke")) captureSmokeTest();
     std::printf("test_cua: %d passed, %d failed\n", passed, failed);

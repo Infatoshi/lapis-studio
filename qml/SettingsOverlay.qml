@@ -2,7 +2,7 @@ import QtQuick
 
 // Cmd+, : a centred OLED card. Rows run most-used first: Model (every model visible at once),
 // Default Effort, Controller Mapping, Ambient Voice, Navigation Mode, Theme, UI Scale, Code Diffs,
-// Model Suggestions; then the active keybinds. j/k (w/s, Up/Down) pick a row, h/l (a/d,
+// Model Suggestions, Jarvis Bar; then the active keybinds. j/k (w/s, Up/Down) pick a row, h/l (a/d,
 // Left/Right) change it, Esc or Cmd+, closes. Everything is clickable too.
 FocusScope {
     id: root
@@ -23,7 +23,8 @@ FocusScope {
     readonly property int scaleRow: 6
     readonly property int diffsRow: 7
     readonly property int suggestRow: 8
-    readonly property int rowCount: 9
+    readonly property int jarvisRow: 9  // last, so no older row index moves
+    readonly property int rowCount: 10
 
     readonly property string mode: backend ? backend.navMode : "controller"
     readonly property var modes: [
@@ -35,6 +36,10 @@ FocusScope {
     readonly property var themes: [
         { id: "gold", name: "Gold" },
         { id: "lapis", name: "Lapis Blue" }
+    ]
+    readonly property var jarvisModes: [
+        { id: "overlay", name: "Unified Overlay" },
+        { id: "split", name: "Split Studio / Desktop" }
     ]
     readonly property var models: backend ? backend.models : []
     function providerName(p) {
@@ -107,6 +112,7 @@ FocusScope {
         case scaleRow: backend.zoomBy(d > 0 ? 1.1 : 1 / 1.1); break;
         case diffsRow: backend.showCodeDiffs = d > 0; break;
         case suggestRow: backend.modelSuggestions = d > 0; break;
+        case jarvisRow: backend.jarvisBarMode = d > 0 ? "split" : "overlay"; break;
         }
     }
 
@@ -471,6 +477,41 @@ FocusScope {
                     firstOn: true
                     note: on ? "Tab prompts come from fast model, warm" : "Tab prompts from local heuristics only"
                     onPicked: (v) => { if (root.backend) root.backend.modelSuggestions = v; }
+                }
+            }
+
+            // 9. Jarvis Bar: L2 opens the desktop overlay everywhere (Studio too), or split
+            // (the in-Studio ask card inside Studio, the overlay over other apps).
+            SettingRow {
+                index: root.jarvisRow
+                caption: "Jarvis Bar"
+                Row {
+                    spacing: 12
+                    anchors.verticalCenter: parent.verticalCenter
+                    Repeater {
+                        model: root.jarvisModes
+                        Rectangle {
+                            required property var modelData
+                            objectName: "settingsJarvisBar"
+                            readonly property bool current: (root.backend ? root.backend.jarvisBarMode : "overlay") === modelData.id
+                            width: jarvisName.implicitWidth + 36
+                            height: 40
+                            radius: 20
+                            color: current ? Theme.goldA(0.14) : "transparent"
+                            border.width: 1.5
+                            border.color: current ? Theme.gold : Theme.line
+                            Text {
+                                id: jarvisName
+                                anchors.centerIn: parent
+                                text: parent.modelData.name
+                                color: parent.current ? Theme.gold : Theme.dim
+                                font.family: Theme.sans
+                                font.pixelSize: 18
+                                font.weight: Font.DemiBold
+                            }
+                            TapHandler { onTapped: { root.row = root.jarvisRow; if (root.backend) root.backend.jarvisBarMode = modelData.id; } }
+                        }
+                    }
                 }
             }
 

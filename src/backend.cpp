@@ -25,8 +25,10 @@
 #include <QtConcurrent>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <memory>
+#include <mutex>
 #include <optional>
 
 namespace studio {
@@ -47,6 +49,34 @@ constexpr char kSpotlightStreamId[] = "spotlight";
 // How long the Phonon fn key-down waits after the bar had to activate this app, so Phonon's
 // frontmost-app / focused-field snapshot lands on the bar's prompt, not the app behind it.
 constexpr int kSpotlightVoiceDelayMs = 45;
+
+// The Jarvis interrupt's cancel latch. studio::cua::cancelFlag aborts an in-flight step within
+// milliseconds, but it is one process-wide flag: left set, it would kill the next turn's steps
+// too. Each interrupt bumps the epoch under the lock; a queued step from an older epoch never
+// runs, and the first step of the new epoch clears a latch whose step has already returned (the
+// pool runs one step at a time). onCuaActionDone clears it as soon as the queue drains.
+std::mutex g_cuaEpochMx;
+std::atomic<quint64> g_cuaEpoch{0};
+void latchCuaCancel()
+{
+    const std::lock_guard<std::mutex> lock(g_cuaEpochMx);
+    studio::cua::cancelFlag.store(true);
+    g_cuaEpoch.fetch_add(1);
+}
+// Worker thread, before a step runs: false when an interrupt superseded it.
+bool claimCuaEpoch(quint64 epoch)
+{
+    const std::lock_guard<std::mutex> lock(g_cuaEpochMx);
+    if (epoch != g_cuaEpoch.load())
+        return false;
+    studio::cua::cancelFlag.store(false);
+    return true;
+}
+void releaseCuaCancel()
+{
+    const std::lock_guard<std::mutex> lock(g_cuaEpochMx);
+    studio::cua::cancelFlag.store(false);
+}
 // Tier 2 cap per conversation stream, in messages (user + assistant pairs).
 constexpr int kMaxStreamHistory = 24;
 
@@ -1129,7 +1159,51 @@ Backend::Backend(Mode mode, QObject *parent, bool warmHelpers)
     m_gamepad.setSummonStudio([this] { summonStudio(); });
     connect(&m_gamepad, &Gamepad::sendPressed, this, [this] { if (spotlightOpen()) submitSpotlight(); }, Qt::QueuedConnection);
     connect(&m_gamepad, &Gamepad::confirm, this, [this] { if (spotlightOpen()) submitSpotlight(); }, Qt::QueuedConnection);
-    connect(&m_gamepad, &Gamepad::back, this, [this] { if (spotlightOpen()) dismissSpotlight(true); }, Qt::QueuedConnection);
+    connect(&m_gamepad, &Gamepad::back, this, [this] {
+        // Jarvis: ○ cancels listening, or stops a running turn (bar open, closed or ghosted).
+        if (jarvisOverlay() && (m_awaitingAutoSend || m_gamepad.voiceActive()
+                                || (spotlightOpen() && m_spotlight->state().voice != studio::cua::SpotlightVoice::Idle)
+                                || m_spotlightTurn || m_cuaPending > 0)) {
+            handleJarvisEscape();
+            return;
+        }
+        if (spotlightOpen())
+            dismissSpotlight(true);
+    }, Qt::QueuedConnection);
+    // Jarvis: the live Studio defaults to the unified overlay; every mock / offscreen mode keeps
+    // the split routing its tests were written for (a test opts in with setJarvisBarMode).
+    m_jarvisBarMode = mode == Mode::Live ? QStringLiteral("overlay") : QStringLiteral("split");
+    m_gamepad.setVoiceTapToggle(jarvisOverlay());
+    connect(&m_gamepad, &Gamepad::voiceToggledChanged, this, [this] {
+        if (m_voiceTarget == VoiceTarget::Spotlight && spotlightOpen() && m_gamepad.voiceToggled())
+            m_spotlight->setVoice(studio::cua::SpotlightVoice::Toggled);
+    });
+    for (QTimer *t : {&m_autoSendDebounce, &m_autoSendNoPaste, &m_autoSendGiveUp})
+        t->setSingleShot(true);
+    m_autoSendDebounce.setInterval(kAutoSendDebounceMs);
+    m_autoSendNoPaste.setInterval(kAutoSendNoPasteMs);
+    m_autoSendGiveUp.setInterval(kAutoSendGiveUpMs);
+    connect(&m_autoSendDebounce, &QTimer::timeout, this, [this] {
+        if (m_awaitingAutoSend && m_spotlight && !m_spotlight->inputText().trimmed().isEmpty())
+            autoSendNow();  // the paste has landed
+    });
+    connect(&m_autoSendNoPaste, &QTimer::timeout, this, [this] {
+        // Text was already there and no paste came: send what the field holds.
+        if (m_awaitingAutoSend && m_spotlight && !m_spotlight->inputText().trimmed().isEmpty()
+            && m_spotlight->inputText() == m_autoSendBaseline && !m_autoSendDebounce.isActive())
+            autoSendNow();
+    });
+    connect(&m_autoSendGiveUp, &QTimer::timeout, this, [this] {
+        if (!m_awaitingAutoSend || !m_spotlight)
+            return;
+        if (!m_spotlight->inputText().trimmed().isEmpty()) {
+            autoSendNow();
+            return;
+        }
+        // Nothing was said: close the empty bar quietly.
+        disarmAutoSend();
+        dismissSpotlight(!m_spotlight->state().overStudio);
+    });
     connect(this, &Backend::streamDelta, this, [this](const QString &id, const QString &text, const QString &) {
         if (id == QLatin1String(kSpotlightStreamId)) {
             m_spotlightRaw += text;
@@ -1525,6 +1599,20 @@ void Backend::setModelSuggestions(bool on)
         m_prefsSave.start();
 }
 
+void Backend::setJarvisBarMode(const QString &mode)
+{
+    const QString m = mode.trimmed().toLower();
+    if ((m != QLatin1String("overlay") && m != QLatin1String("split")) || m == m_jarvisBarMode)
+        return;
+    m_jarvisBarMode = m;
+    m_gamepad.setVoiceTapToggle(jarvisOverlay());
+    if (!jarvisOverlay())
+        disarmAutoSend();
+    emit jarvisBarModeChanged();
+    if (!m_prefsPath.isEmpty())
+        m_prefsSave.start();
+}
+
 void Backend::setShowCodeDiffs(bool on)
 {
     if (on == m_showCodeDiffs)
@@ -1682,6 +1770,14 @@ void Backend::loadPrefs()
     if (o.value(QLatin1String("effortSchema")).toInt(1) < 2 && effortsFor(m_chatModel).value(0) == QLatin1String("fast"))
         m_chatEffort = QStringLiteral("fast");
     m_modelSuggestions = o.value(QLatin1String("modelSuggestions")).toBool(false);
+    {
+        const QString jm = o.value(QLatin1String("jarvisBarMode")).toString().trimmed().toLower();
+        if ((jm == QLatin1String("overlay") || jm == QLatin1String("split")) && jm != m_jarvisBarMode) {
+            m_jarvisBarMode = jm;
+            m_gamepad.setVoiceTapToggle(jarvisOverlay());
+            emit jarvisBarModeChanged();
+        }
+    }
     m_openaiCompatUrl = o.value(QLatin1String("openaiCompatUrl")).toString().trimmed();
     m_compatUrlCleared = false;
     const QString compatModel = o.value(QLatin1String("openaiCompatModel")).toString().trimmed();
@@ -1985,6 +2081,7 @@ bool Backend::savePrefs()
     o.insert(QStringLiteral("defaultEffort"), m_chatEffort);
     o.insert(QStringLiteral("effortSchema"), 2);
     o.insert(QStringLiteral("modelSuggestions"), m_modelSuggestions);
+    o.insert(QStringLiteral("jarvisBarMode"), m_jarvisBarMode);
     if (!m_openaiCompatUrl.isEmpty())
         o.insert(QStringLiteral("openaiCompatUrl"), m_openaiCompatUrl);
     if (!m_openaiCompatModel.isEmpty() && m_openaiCompatModel != QLatin1String("qwen3.8-flash-next"))
@@ -4612,7 +4709,7 @@ QStringList studioActionNames()
             QStringLiteral("open_ladder"),    QStringLiteral("go_home"),       QStringLiteral("sort_map"),
             QStringLiteral("move_cluster"),   QStringLiteral("cua_click"),     QStringLiteral("cua_type"),
             QStringLiteral("cua_scroll"),     QStringLiteral("cua_observe"),   QStringLiteral("cua_hotkey"),
-            QStringLiteral("cua_drag")};
+            QStringLiteral("cua_drag"),       QStringLiteral("cua_open")};
 }
 
 QString cuaObservationPrompt(const QString &action, const QString &tier, bool ok, const QString &detail,
@@ -4666,13 +4763,36 @@ CuaCommand parseCuaAction(const QString &action, const QString &arg)
         c.target = bar < 0 ? QString() : arg.left(bar).simplified();
         bool ok = false;
         const int n = amount.toInt(&ok);
+        // Notches (scrollAt moves kScrollPxPerNotch points each): positive up, negative down.
         if (ok)
             c.deltaY = std::clamp(n, -100, 100);
         else if (amount == QLatin1String("up"))
             c.deltaY = 5;
         else if (amount == QLatin1String("down"))
             c.deltaY = -5;
+        else if (amount == QLatin1String("pageup") || amount == QLatin1String("page up"))
+            c.deltaY = 12;
+        else if (amount == QLatin1String("pagedown") || amount == QLatin1String("page down"))
+            c.deltaY = -12;
         c.valid = c.deltaY != 0;
+    } else if (a == QLatin1String("cua_open")) {
+        // "<app>", "<url>", or "<app>|<url>"; the URL gets https:// when it has no scheme.
+        c.kind = QStringLiteral("open");
+        const qsizetype bar = arg.indexOf(QLatin1Char('|'));
+        QString app = (bar < 0 ? arg : arg.left(bar)).simplified();
+        QString url = bar < 0 ? QString() : arg.mid(bar + 1).trimmed();
+        if (bar < 0 && !app.endsWith(QLatin1String(".app"), Qt::CaseInsensitive)
+            && !studio::cua::normalizeOpenUrl(app).isEmpty()) {
+            url = app;  // a bare URL: the default browser opens it
+            app.clear();
+        }
+        if (!url.isEmpty()) {
+            c.text = studio::cua::normalizeOpenUrl(url);
+            if (c.text.isEmpty())
+                return c;  // a URL half that is not a URL
+        }
+        c.target = app;
+        c.valid = !c.target.isEmpty() || !c.text.isEmpty();
     } else if (a == QLatin1String("cua_observe")) {
         c.kind = QStringLiteral("observe");
         c.target = arg.simplified();  // the app to read; empty reads whatever is in front
@@ -5370,10 +5490,16 @@ QString Backend::startCuaAction(const QString &action, const CuaCommand &c)
                                    .arg(studio::cua::parseHotkeyCombo(c.text).display,
                                         c.target.isEmpty() ? QString() : QStringLiteral(" in %1").arg(c.target))
                          : c.kind == QLatin1String("drag") ? QStringLiteral("Dragging %1 to %2").arg(c.target, c.text)
-                                                           : QStringLiteral("Clicking %1").arg(c.target);
+                         : c.kind == QLatin1String("open")
+                             ? (c.text.isEmpty() ? QStringLiteral("Opening %1").arg(c.target)
+                                                 : QStringLiteral("Opening %1%2")
+                                                       .arg(c.text, c.target.isEmpty() ? QString() : QStringLiteral(" in %1").arg(c.target)))
+                             : QStringLiteral("Clicking %1").arg(c.target);
     // What the log, the finished signal and the follow-up turn name as the step's target.
     const bool hotkey = c.kind == QLatin1String("hotkey");
+    const bool open = c.kind == QLatin1String("open");
     const QString shownTarget = hotkey ? (c.target.isEmpty() ? c.text : c.target + QLatin1Char('|') + c.text)
+                                : open ? (c.text.isEmpty() ? c.target : c.target.isEmpty() ? c.text : c.target + QLatin1Char('|') + c.text)
                                 : c.kind == QLatin1String("drag") ? c.target + QLatin1Char('|') + c.text
                                                                   : c.target;
     const QString logLine = action + QLatin1Char(':') + shownTarget
@@ -5411,8 +5537,10 @@ QString Backend::startCuaAction(const QString &action, const CuaCommand &c)
         m_cuaPool->setMaxThreadCount(1);  // one visible action at a time, in order
     }
     ++m_cuaPending;
+    syncEscapeWatch();
     if (m_cuaHud)
         studio::cua::showCuaHud(verb + QStringLiteral("\u2026"), studio::cua::HudTone::Working);
+    const quint64 epoch = g_cuaEpoch.load();
     // The trace log (training data) learns who asked and whether that project is redacted; the
     // executor skips the step entirely for redacted / infinity work.
     studio::cua::TraceContext trace;
@@ -5422,7 +5550,25 @@ QString Backend::startCuaAction(const QString &action, const CuaCommand &c)
         trace.redacted = std::any_of(p->sessions.cbegin(), p->sessions.cend(), [](const SessionInfo &s) { return s.redacted; })
                          || studio::cua::traceBlocked(false, {p->name, p->dir});
     QPointer<Backend> self(this);
-    m_cuaPool->start([self, action, c, shownTarget, logLine, inBatch, batchId, trace, spot, defaultApp, verb] {
+    m_cuaPool->start([self, action, c, shownTarget, logLine, inBatch, batchId, trace, spot, defaultApp, verb, epoch] {
+        // An interrupt since this step was queued: it never runs. A cancel latched by an older
+        // turn (its last step has returned: the pool runs one at a time) is cleared first.
+        if (!claimCuaEpoch(epoch)) {
+            QMetaObject::invokeMethod(
+                QCoreApplication::instance(),
+                [self, action, target = shownTarget, logLine] {
+                    if (!self)
+                        return;
+                    const QString why = QStringLiteral("interrupted by the user");
+                    self->m_cuaPending = std::max(0, self->m_cuaPending - 1);
+                    self->m_cuaLog << QStringLiteral("%1 -> ERR %2").arg(logLine, why);
+                    emit self->cuaActionFinished(action, target, false, QStringLiteral("ERR"), why);
+                    self->onCuaActionDone();
+                    self->syncSpotlightTurn();  // a new turn may be waiting on the queue to drain
+                },
+                Qt::QueuedConnection);
+            return;
+        }
         studio::cua::CuaExecutor ex;
         ex.setTraceContext(trace);
         ex.setDefaultAppHint(defaultApp);
@@ -5431,6 +5577,7 @@ QString Backend::startCuaAction(const QString &action, const CuaCommand &c)
                                              : c.kind == QLatin1String("observe") ? ex.observeApp(c.target)
                                              : c.kind == QLatin1String("hotkey")  ? ex.hotkeyAction(c.target, c.text)
                                              : c.kind == QLatin1String("drag")    ? ex.dragTarget(c.target, c.text)
+                                             : c.kind == QLatin1String("open")    ? ex.openAction(c.target, c.text)
                                                                                   : ex.clickTarget(c.target);
         QMetaObject::invokeMethod(
             QCoreApplication::instance(),
@@ -5447,6 +5594,7 @@ QString Backend::startCuaAction(const QString &action, const CuaCommand &c)
                 if (inBatch)
                     self->noteCuaResult(batchId, CuaStepResult{action, target, r.ok, r.ok ? r.tier : QStringLiteral("ERR"),
                                                                r.detail, r.observation});
+                self->onCuaActionDone();
                 if (spot)
                     self->syncSpotlightTurn();  // the last step of a turn closes the bar
             },
@@ -5599,7 +5747,14 @@ studio::cua::CuaSpotlight *Backend::spotlight()
                                                            : studio::cua::CuaSpotlight::Mode::Offscreen;
         m_spotlight = std::make_unique<studio::cua::CuaSpotlight>(mode);
         m_spotlight->onSubmit = [this](const QString &) { submitSpotlight(); };
-        m_spotlight->onDismiss = [this] { dismissSpotlight(studio::cua::studioAppIsActive()); };
+        m_spotlight->onDismiss = [this] {
+            if (jarvisOverlay())
+                handleJarvisEscape();
+            else
+                dismissSpotlight(studio::cua::studioAppIsActive());
+        };
+        m_spotlight->onInputEdited = [this] { onSpotlightInputEdited(); };
+        m_spotlight->onGlobalEscape = [this] { if (jarvisOverlay()) handleJarvisEscape(); };
     }
     return m_spotlight.get();
 }
@@ -5623,12 +5778,34 @@ void Backend::syncSpotlightOpen()
 int Backend::prepareVoiceTarget(bool active)
 {
     if (!active) {
-        if (m_spotlight && m_spotlight->isOpen())
-            m_spotlight->setListening(false);
+        if (m_spotlight && m_spotlight->isOpen()) {
+            if (jarvisOverlay() && m_voiceTarget == VoiceTarget::Spotlight && !m_voiceCancelling) {
+                // Listening stopped (release after a hold, or the second tap): Phonon pastes
+                // in ~185 ms, and that paste sends itself.
+                m_spotlight->setVoice(studio::cua::SpotlightVoice::Transcribing);
+                armAutoSend();
+            } else {
+                m_spotlight->setListening(false);
+            }
+        }
         return 0;
     }
     const bool studioActive = m_studioActiveProbe ? m_studioActiveProbe()
                                                   : (m_cuaHud ? studio::cua::studioAppIsActive() : true);
+    if (jarvisOverlay()) {
+        // Instant interrupt: L2 while anything runs is the harness's Esc, then a fresh turn.
+        if (jarvisBusy())
+            interruptJarvis(true);
+        disarmAutoSend();
+        m_voiceTarget = VoiceTarget::Spotlight;
+        studio::cua::CuaSpotlight *sp = spotlight();
+        // The bar already up keeps its context; else Studio itself, or the app in front.
+        const bool overStudio = sp->isOpen() ? sp->state().overStudio : studioActive;
+        const bool wasKey = overStudio ? sp->openOrFocusOverStudio(jarvisStudioLabel()) : sp->openOrFocus();
+        sp->setListening(true);
+        syncSpotlightOpen();
+        return wasKey ? 0 : kSpotlightVoiceDelayMs;
+    }
     if (studioActive && !spotlightOpen()) {
         // Inside Studio: QML's padVoiceHold focuses the ask card; the key goes out at once.
         m_voiceTarget = VoiceTarget::Studio;
@@ -5647,6 +5824,7 @@ void Backend::submitSpotlight()
     if (!m_spotlight || !m_spotlight->isOpen())
         return;
     const QString q = m_spotlight->takeInputText().trimmed();
+    disarmAutoSend();  // R2 / Return beat the paste timer, or the timer fired: either way, once
     if (q.isEmpty())
         return;
     if (m_streamAsks.contains(QLatin1String(kSpotlightStreamId)))
@@ -5655,10 +5833,21 @@ void Backend::submitSpotlight()
     const QString app = m_spotlight->targetApp();
     const int pid = m_spotlight->targetPid();
     QString slice;
-    if (!app.isEmpty() || pid > 0) {
+    if (m_spotlight->state().overStudio) {
+        // The Jarvis bar over Studio itself: the hovered / selected island is the target (the
+        // live state rides in Tier 3 as always), and both Studio UI actions and desktop cua_*
+        // actions are fair game.
+        slice = QStringLiteral("The user is in Lapis Studio itself (%1); the Jarvis bar is open over it. Studio UI actions "
+                               "(open_stage, focus_project, steer_agent, spawn_agent, open_music, ...) and desktop cua_* "
+                               "actions are both available.\n")
+                    .arg(jarvisStudioLabel());
+        if (m_targets && m_targets->hasActiveTarget())
+            slice += formatTargetSlice({m_targets->active()}, 1500);
+    } else if (!app.isEmpty() || pid > 0) {
         slice = QStringLiteral("Active macOS app behind Spotlight: %1\n").arg(app.isEmpty() ? QStringLiteral("unknown") : app);
         if (m_mode == Mode::Live && m_cuaHud && pid > 0)
-            slice += studio::cua::formatNodesForModel(studio::cua::inspectApp(pid, 120, 12, 0.25), 2500);
+            slice += studio::cua::formatNodesForModel(studio::cua::inspectApp(pid, 500, 32, 0.35),
+                                                      studio::cua::kPostActionChars);
     }
     m_spotlight->beginTurn(q);
     m_spotlightTurn = true;
@@ -5672,12 +5861,190 @@ void Backend::dismissSpotlight(bool restoreTarget)
 {
     if (!m_spotlight)
         return;
+    disarmAutoSend();
+    if (jarvisOverlay() && m_voiceTarget == VoiceTarget::Spotlight && (m_gamepad.voiceActive() || m_gamepad.voiceToggled())) {
+        m_voiceCancelling = true;  // never leave Phonon's fn key down behind a closed bar
+        m_gamepad.cancelVoice();
+        m_voiceCancelling = false;
+    }
     if (m_streamAsks.contains(QLatin1String(kSpotlightStreamId)))
         cancelStream(QLatin1String(kSpotlightStreamId));
     m_spotlightTurn = false;
     m_spotlight->setBusy(false);
     m_spotlight->dismiss(restoreTarget);
     syncSpotlightOpen();
+}
+
+// --- Jarvis: hold / tap voice, auto-send, instant interrupt ---------------------------------
+
+QString Backend::jarvisStudioLabel()
+{
+    const Project *p = m_focusedProject.isEmpty() ? nullptr : find(m_focusedProject);
+    const QString name = p ? p->name.simplified() : QString();
+    return name.isEmpty() ? QStringLiteral("Lapis") : QStringLiteral("Lapis \u00B7 ") + name;
+}
+
+bool Backend::jarvisBusy() const
+{
+    return !m_streamAsks.isEmpty() || m_cuaPending > 0 || m_cuaBatch.open || m_cuaBatch.outstanding > 0
+           || m_cuaFollowupScheduled || m_spotlightTurn;
+}
+
+bool Backend::interruptJarvis(bool superseded)
+{
+    if (!jarvisBusy())
+        return false;
+    ++m_jarvisInterrupts;
+    // What was being done, for the model's next turn: the bar's request first, then any card's.
+    QString goal;
+    const auto spotIt = m_streamAsks.constFind(QLatin1String(kSpotlightStreamId));
+    if (spotIt != m_streamAsks.cend())
+        goal = spotIt->goal.isEmpty() ? spotIt->question : spotIt->goal;
+    for (auto it = m_streamAsks.cbegin(); goal.isEmpty() && it != m_streamAsks.cend(); ++it)
+        goal = it->goal.isEmpty() ? it->question : it->goal;
+    if (goal.isEmpty())
+        goal = m_cuaBatch.goal;
+    if (goal.isEmpty() && m_spotlightTurn && m_spotlight)
+        goal = m_spotlight->state().lastQuestion;
+    // 1. Abort the in-flight step (glide, click, type, hotkey, drag, AX scan) and drop the queue.
+    latchCuaCancel();  // also bumps the epoch: nothing queued by the old turn will run
+    if (m_cuaPending == 0)
+        releaseCuaCancel();  // nothing in flight: never leave the latch set for the next turn
+    // 2. Every conversation stream and the closed CUA loop.
+    const QStringList ids = m_streamAsks.keys();
+    for (const QString &id : ids) {
+        cancelStream(id);
+        if (id != QLatin1String(kSpotlightStreamId))
+            emit streamFinished(id, QStringLiteral("Interrupted"));  // the card stops its busy state
+    }
+    resetCuaLoop();
+    m_spotlightTurn = false;
+    m_spotlightRaw.clear();
+    if (m_spotlight) {
+        m_spotlight->setActionRunning(false);
+        m_spotlight->setBusy(false);
+        m_spotlight->setStatusLine(superseded ? QStringLiteral("Interrupted") : QStringLiteral("Stopped"));
+    }
+    // 3. Nothing of the old turn stays on screen.
+    if (m_cuaHud) {
+        studio::cua::hideCuaReticle(0);
+        studio::cua::hideCuaHud(0);
+    }
+    // 4. The model sees what was cut off, so "no, in a new tab instead" lands in context.
+    if (!goal.trimmed().isEmpty()) {
+        m_sharedHistory << ChatTurn{QStringLiteral("user"), goal.trimmed()}
+                        << ChatTurn{QStringLiteral("assistant"),
+                                    superseded ? QStringLiteral("[Interrupted by user \u2014 superseded by the next instruction]")
+                                               : QStringLiteral("[Stopped by user]")};
+        while (m_sharedHistory.size() > 20)
+            m_sharedHistory.remove(0, 2);
+    }
+    syncEscapeWatch();
+    return true;
+}
+
+void Backend::cancelJarvisListening()
+{
+    disarmAutoSend();
+    if (m_gamepad.voiceActive() || m_gamepad.voiceToggled()) {
+        m_voiceCancelling = true;
+        m_gamepad.cancelVoice();  // fn key-up (when it went down), toggle cleared
+        m_voiceCancelling = false;
+    }
+    if (!m_spotlight)
+        return;
+    m_spotlight->setInputText(QString());  // the partial draft goes too
+    m_spotlight->setVoice(studio::cua::SpotlightVoice::Idle);
+    if (m_spotlight->isOpen())
+        dismissSpotlight(!m_spotlight->state().overStudio);
+}
+
+void Backend::handleJarvisEscape()
+{
+    const bool listening = m_awaitingAutoSend || m_gamepad.voiceActive() || m_gamepad.voiceToggled()
+                           || (m_spotlight && m_spotlight->state().voice != studio::cua::SpotlightVoice::Idle);
+    if (listening) {
+        cancelJarvisListening();
+        return;
+    }
+    if (m_spotlightTurn || m_cuaPending > 0 || m_cuaBatch.outstanding > 0 || m_cuaFollowupScheduled)
+        interruptJarvis(false);
+    if (spotlightOpen())
+        dismissSpotlight(!m_spotlight->state().overStudio);
+}
+
+void Backend::armAutoSend()
+{
+    if (!m_spotlight)
+        return;
+    m_awaitingAutoSend = true;
+    m_autoSendBaseline = m_spotlight->inputText();
+    m_autoSendDebounce.stop();
+    m_autoSendNoPaste.start();
+    m_autoSendGiveUp.start();
+}
+
+void Backend::disarmAutoSend()
+{
+    const bool was = m_awaitingAutoSend;
+    m_awaitingAutoSend = false;
+    m_autoSendDebounce.stop();
+    m_autoSendNoPaste.stop();
+    m_autoSendGiveUp.stop();
+    if (was && m_spotlight && m_spotlight->state().voice == studio::cua::SpotlightVoice::Transcribing)
+        m_spotlight->setVoice(studio::cua::SpotlightVoice::Idle);
+}
+
+void Backend::autoSendNow()
+{
+    if (!m_awaitingAutoSend)
+        return;
+    disarmAutoSend();
+    submitSpotlight();
+}
+
+void Backend::onSpotlightInputEdited()
+{
+    if (!m_awaitingAutoSend)
+        return;
+    // Phonon's Cmd+V: wait for the paste to finish (it can arrive as more than one edit).
+    m_autoSendNoPaste.stop();
+    m_autoSendDebounce.start();
+}
+
+void Backend::syncEscapeWatch()
+{
+    if (!m_spotlight)
+        return;
+    const bool on = jarvisOverlay() && (m_cuaPending > 0 || m_cuaFollowupScheduled || (m_spotlightTurn && m_spotlightTurnRanCua));
+    if (on != m_spotlight->state().escapeWatch)
+        m_spotlight->setEscapeWatch(on);
+}
+
+void Backend::onCuaActionDone()
+{
+    if (m_cuaPending > 0)
+        return;
+    // The queue drained: an interrupt's latch has done its job.
+    if (studio::cua::cancelFlag.load())
+        releaseCuaCancel();
+    // No step left: the cursor pops out (the last step's own 0.45 s fade, never left parked).
+    if (m_cuaHud && !m_cuaFollowupScheduled)
+        studio::cua::hideCuaReticle(studio::cua::kStepHideSec);
+    syncEscapeWatch();
+}
+
+void Backend::testBeginCuaAction()
+{
+    ++m_cuaPending;
+    syncEscapeWatch();
+}
+
+void Backend::testFinishCuaAction()
+{
+    m_cuaPending = std::max(0, m_cuaPending - 1);
+    onCuaActionDone();
+    syncSpotlightTurn();
 }
 
 void Backend::summonStudio()
@@ -5730,6 +6097,9 @@ void Backend::syncSpotlightTurn()
     if (streaming || m_cuaPending > 0 || m_cuaFollowupScheduled)
         return;  // still answering, acting, or about to take a follow-up turn
     m_spotlightTurn = false;
+    syncEscapeWatch();
+    if (m_cuaHud)
+        studio::cua::hideCuaReticle(0);  // the turn is over: no cursor left on screen
     if (m_spotlightTurnRanCua) {
         // Acted on the app behind: leave that app frontmost; the exchange waits for the next L2.
         m_spotlight->finishAfterAction(m_spotlightLastAction.isEmpty() ? QStringLiteral("Done") : m_spotlightLastAction);

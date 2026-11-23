@@ -1,6 +1,8 @@
-// The MacBook-wide floating command bar (L2 / R2 outside Lapis Studio, over any app or Space).
+// The Jarvis bar: the MacBook-wide floating command bar (L2 over any app or Space, and over
+// Lapis Studio itself in the unified "overlay" Jarvis mode).
 //
-// A Raycast-style card that pops up over whatever app is frontmost, takes Phonon's dictation
+// One sleek 56 pt capsule (status mark, context pill, inline prompt, one controller badge) with a
+// compact answer drawer below a hairline. It pops up over whatever app is frontmost, takes Phonon's dictation
 // (Phonon pastes with Cmd+V into the focused field of the frontmost app, so this app has to be
 // active with the bar's text field focused before the fn key goes down), and shows the model's
 // answer below the prompt. While a cua_* action runs on the app behind it, the bar ghosts out
@@ -20,10 +22,16 @@
 
 namespace studio::cua {
 
-constexpr double kSpotlightWidth = 620;
-constexpr double kSpotlightBaseHeight = 96;   // top row + prompt, no drawer
-constexpr double kSpotlightMaxHeight = 340;   // with question + answer
+constexpr double kSpotlightWidth = 580;
+constexpr double kSpotlightBaseHeight = 56;   // the single command capsule, no drawer
 constexpr double kSpotlightAnswerMaxHeight = 190;
+constexpr double kSpotlightDrawerChrome = 46;  // hairline + gaps + question line + bottom margin
+constexpr double kSpotlightMaxHeight = kSpotlightBaseHeight + kSpotlightDrawerChrome + kSpotlightAnswerMaxHeight;
+
+// What the voice side of the bar is doing. Held: L2 is down (release sends). Toggled: a quick L2
+// tap left Phonon listening (the next tap sends). Transcribing: listening stopped and the bar is
+// waiting for Phonon's paste, which auto-sends.
+enum class SpotlightVoice { Idle, Held, Toggled, Transcribing };
 
 // Pure: the panel's frame (AppKit coordinates, origin bottom-left) on a screen whose AppKit frame
 // is `screen`: kSpotlightWidth wide, centred horizontally, its top edge 20% below the screen top.
@@ -32,11 +40,16 @@ QRectF spotlightFrame(const QRectF &screen, double height);
 // Pure: the panel height for a drawer holding an answer body `answerHeight` points tall (the
 // body itself capped at kSpotlightAnswerMaxHeight); no drawer gives kSpotlightBaseHeight.
 double spotlightHeight(bool drawer, double answerHeight);
-// Pure: the hint on the top row's right, as text (state, accessibility). On screen the bar draws
-// it as vector controller icons: [L2] voice  [R2] send  [○] close, or a pulsing dot + Listening….
-QString spotlightHint(bool listening);
-// Pure: the prompt placeholder ("Command or ask about Google Chrome…").
-QString spotlightPlaceholder(const QString &targetApp);
+// Pure: the badge on the bar's right, as text (state, accessibility). On screen it is one vector
+// controller icon plus a word: Held "L2 release", Toggled "Listening · tap L2 to send" (drawn
+// [L2] send), Transcribing "Transcribing…", an answer showing "○ close", typed text "R2 send",
+// else "L2 voice".
+QString spotlightHint(SpotlightVoice voice, bool answerShown = false, bool hasText = false);
+// Pure: the prompt placeholder: "Speak or type…" (held), "Tap L2 to send…" (toggled),
+// "Transcribing…", else "Ask or control <context>…" ("Ask or control anything…" with none).
+QString spotlightPlaceholder(const QString &context, SpotlightVoice voice = SpotlightVoice::Idle);
+// Pure: the context pill's short name for an app ("Google Chrome" -> "Chrome").
+QString spotlightContextLabel(const QString &appName);
 
 // [NSApp isActive] (false without an NSApp).
 bool studioAppIsActive();
@@ -50,15 +63,19 @@ bool spotlightLapisBlue();
 // Main thread: restyles the live bar (if one exists and has a panel) with the current flag.
 void refreshSpotlightTheme();
 
-// --snap-spotlight OUT.png: the bar rendered offscreen (never a window) in four states stacked on
-// #000000: idle with the "in Google Chrome" pill, listening with dictated text, a drawer with a
-// question and a two-paragraph answer, and the same drawer in lapis blue. 0 on success.
+// --snap-spotlight OUT.png: the bar rendered offscreen (never a window) in six states stacked on
+// #000000: idle over Chrome, held listening with dictated text, tap-toggled listening over
+// "Lapis · infinity", transcribing, a drawer with a question and a two-paragraph answer, and the
+// same drawer in lapis blue. 0 on success.
 int snapSpotlight(const QString &outPath);
 
 struct SpotlightState {
     bool open = false;          // the panel is on screen (alpha may be 0 while an action runs)
     bool key = false;           // its text field has keyboard focus (Offscreen: == open)
-    bool listening = false;
+    bool listening = false;     // voice is Held or Toggled
+    SpotlightVoice voice = SpotlightVoice::Idle;
+    bool toggled = false;       // voice == Toggled
+    bool transcribing = false;  // voice == Transcribing
     bool busy = false;
     bool actionRunning = false; // ghosted: alpha 0, click-through
     double alpha = 0;
@@ -68,7 +85,10 @@ struct SpotlightState {
     QString statusLine;
     QString targetApp;
     int targetPid = 0;
-    QString hint;               // spotlightHint(listening)
+    bool overStudio = false;    // opened over Lapis Studio itself (unified Jarvis overlay)
+    QString contextLabel;       // the pill: "Chrome", "Lapis · infinity"; empty: no pill
+    bool escapeWatch = false;   // the global Esc monitor is on (a turn is acting)
+    QString hint;               // spotlightHint(voice, answer shown, typed text)
     QString placeholder;
     bool drawerVisible = false;
     QRectF frame;               // AppKit points (Offscreen: on a virtual 1440x900 screen)
@@ -91,15 +111,29 @@ public:
     // Keeps typed text and the previous exchange. Returns true when it was already open and key
     // (focus is already there: the voice key needs no delay).
     bool openOrFocus();
+    // The unified Jarvis overlay over Lapis Studio itself: the context pill reads contextLabel
+    // ("Lapis · infinity"), there is no other app to target or re-activate, and no Studio window
+    // is ordered out (the bar is on Studio's own Space). Same return as openOrFocus.
+    bool openOrFocusOverStudio(const QString &contextLabel);
     // Closes the bar. restoreTarget: re-activate the app it was opened over. The last exchange
     // stays in memory for the next openOrFocus.
     void dismiss(bool restoreTarget = true);
     bool isOpen() const;
 
+    // Held listening (on) or Idle; setVoice for Toggled / Transcribing.
     void setListening(bool on);
+    void setVoice(SpotlightVoice voice);
     void setInputText(const QString &text);
     QString inputText() const;
     QString takeInputText();  // returns the prompt and clears it
+    // The prompt changed from outside the API (Phonon's Cmd+V paste, typing): fires
+    // onInputEdited. The live field calls it from controlTextDidChange:; tests call it after
+    // setInputText to play a paste.
+    void notifyInputEdited();
+    // While a turn acts on the desktop (even with the bar closed or ghosted), a global Esc key
+    // (from the user, never this process's own synthetic keys) fires onGlobalEscape. Visible
+    // mode installs an NSEvent global monitor; Offscreen only records the flag.
+    void setEscapeWatch(bool on);
     // A new turn: "› question" in the drawer, "Thinking…" as the status, busy.
     void beginTurn(const QString &question);
     void setAnswer(const QString &displayText);  // tags already stripped
@@ -133,6 +167,8 @@ public:
 
     std::function<void(const QString &text)> onSubmit;  // Return / Enter in the prompt
     std::function<void()> onDismiss;                    // Esc
+    std::function<void()> onInputEdited;                // the prompt text changed (paste, typing)
+    std::function<void()> onGlobalEscape;               // Esc anywhere while setEscapeWatch(true)
 
     struct Impl;
 

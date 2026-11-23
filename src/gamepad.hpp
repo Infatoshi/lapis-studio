@@ -156,6 +156,8 @@ class Gamepad : public QObject {
     Q_PROPERTY(bool enabled READ enabled NOTIFY enabledChanged)
     Q_PROPERTY(bool captureMode READ captureMode WRITE setCaptureMode NOTIFY captureModeChanged)
     Q_PROPERTY(bool voiceActive READ voiceActive NOTIFY voiceActiveChanged)
+    // Tap-to-toggle: a quick L2 tap left Phonon listening; the next L2 press stops it.
+    Q_PROPERTY(bool voiceToggled READ voiceToggled NOTIFY voiceToggledChanged)
     Q_PROPERTY(QVariantList bindingSlots READ bindingSlots NOTIFY bindingsChanged)
     Q_PROPERTY(QVariantList availableActions READ availableActions CONSTANT)
     // True while the Music overlay owns the pad (StudioApp binds it): L2 then toggles loop
@@ -178,6 +180,16 @@ public:
     bool enabled() const { return m_enabled; }
     bool captureMode() const { return m_state.captureMode(); }
     bool voiceActive() const { return m_voiceActive; }
+    bool voiceToggled() const { return m_voiceToggled; }
+    // L2 hold OR tap (the Jarvis bar; off by default, so a plain release always stops). On: a
+    // release under kVoiceTapMs after the press keeps listening (toggled), and the next L2 press
+    // stops it (its own release is swallowed); a hold of kVoiceTapMs or more stops on release.
+    static constexpr qint64 kVoiceTapMs = 260;
+    void setVoiceTapToggle(bool on);
+    bool voiceTapToggle() const { return m_voiceTapToggle; }
+    // ○ / Esc while listening: stops Phonon (fn key-up when the down went out), clears the toggle,
+    // and swallows the release of an L2 still held. The prepare hook runs as for any release.
+    void cancelVoice();
     bool musicMode() const { return m_musicMode; }
     void setMusicMode(bool on);
     bool analogCursor() const { return m_state.analogCursor(); }
@@ -229,6 +241,7 @@ signals:
     void enabledChanged();
     void captureModeChanged();
     void voiceActiveChanged();
+    void voiceToggledChanged();
     void bindingsChanged();
     void musicModeChanged();
     void analogCursorChanged();
@@ -279,6 +292,10 @@ private:
     bool m_connected = false;
     bool m_enabled = false;
     bool m_voiceActive = false;
+    bool m_voiceTapToggle = false;
+    bool m_voiceToggled = false;
+    bool m_voiceSwallowRelease = false;  // the stop press of a toggle (or a cancel mid-hold)
+    qint64 m_voicePressMs = 0;
     bool m_musicMode = false;
     double m_leftX = 0, m_leftY = 0;
     QString m_name;

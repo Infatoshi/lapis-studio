@@ -50,6 +50,10 @@ struct ReticleState {
     // its squash-and-stretch along the motion (1 at rest, up to 1.26 at peak glide speed).
     double handAngleDeg = -28;
     double stretch = 1;
+    // The idle pop-out: 1 until a scheduled hide starts, then fades to 0 over 0.16 s, after which
+    // visible is false (the panel is ordered out).
+    double cursorAlpha = 0;
+    bool hideScheduled = false;
     // The all-Spaces HUD bar (independent of the cursor: it stays up while the cursor hides).
     bool hudVisible = false;  // any alpha, including mid fade-out
     QString hudStatus;
@@ -86,6 +90,12 @@ public:
     // label keeps the current one. Returns false for a non-finite point or one on no display.
     bool pulseClick(QPointF globalPt, const QString &label = {});
     void hide();
+    // Pops the cursor out `seconds` from now (a short fade, then the panel orders out); <= 0 is
+    // hide(). An earlier pending pop-out wins; any later moveTo / highlightRect / pulseClick
+    // cancels it and brings the glove back to full alpha. In Visible mode the overlay also arms
+    // this on its own: 0.55 s after a click burst ends, 0.65 s after a glide or frame settles.
+    // Offscreen mode only ever hides through hide() / hideAfter() (deterministic tests).
+    void hideAfter(double seconds);
     uint32_t windowNumber() const;  // 0 in Offscreen mode
     // Accent colours: Lapis gold #e09f3e / copper #b5653b (default), or Lapis blue #4f8cff /
     // #2d5aa8. The cream glove and ink outline never change.
