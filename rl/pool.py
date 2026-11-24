@@ -165,6 +165,48 @@ class CDPError(Exception):
     pass
 
 
+def list_pages():
+    """Page targets from /json/list (DevTools orders them by recent activity, not tab order)."""
+    with urllib.request.urlopen("http://127.0.0.1:%d/json/list" % CDP_PORT, timeout=2) as r:
+        return [t for t in json.load(r) if t.get("type") == "page"]
+
+
+def page_eval(page, expr, timeout=3.0):
+    """Runtime.evaluate on one page over a short-lived websocket; None on any failure."""
+    try:
+        ws = WS(page["webSocketDebuggerUrl"])
+    except Exception:
+        return None
+    try:
+        ws.send(json.dumps({"id": 1, "method": "Runtime.evaluate",
+                            "params": {"expression": expr, "returnByValue": True}}))
+        deadline = time.monotonic() + timeout
+        while True:
+            msg = json.loads(ws.recv(max(0.01, deadline - time.monotonic())))
+            if msg.get("id") == 1:
+                return msg.get("result", {}).get("result", {}).get("value")
+    except Exception:
+        return None
+    finally:
+        try:
+            ws.sock.close()
+        except OSError:
+            pass
+
+
+def tabs_state(expr="document.visibilityState"):
+    """TabForge probe.py's output shape: every page with ``expr`` evaluated in it."""
+    try:
+        pages = list_pages()
+    except Exception as e:
+        return {"ok": False, "error": "%s: %s" % (type(e).__name__, e), "tabs": []}
+    out = []
+    for p in pages:
+        out.append({"id": p.get("id"), "url": p.get("url", ""), "title": p.get("title", ""),
+                    "value": page_eval(p, expr)})
+    return {"ok": True, "tabs": out}
+
+
 class CDP:
     def __init__(self):
         self.ws = None
@@ -172,13 +214,34 @@ class CDP:
         self.lock = threading.RLock()
         self.events = []
 
-    def _connect(self):
-        with urllib.request.urlopen("http://127.0.0.1:%d/json" % CDP_PORT, timeout=2) as r:
-            tabs = json.load(r)
-        page = next(t for t in tabs if t.get("type") == "page")
+    target = None  # CDP target id of the page this client is attached to
+
+    def _connect(self, page=None):
+        if page is None:
+            page = next(t for t in list_pages())
         self.ws = WS(page["webSocketDebuggerUrl"])
+        self.target = page.get("id")
         self.events = []
         self._call("Page.enable", {}, 5)
+
+    def use_front(self):
+        """Attach to the front tab (document.visibilityState == 'visible'); multi-tab browsers."""
+        with self.lock:
+            pages = list_pages()
+            if len(pages) == 1:
+                pick = pages[0]
+            else:
+                vis = [p for p in pages if page_eval(p, "document.visibilityState") == "visible"]
+                pick = vis[0] if vis else pages[0]
+            if self.ws is None or pick.get("id") != self.target:
+                try:
+                    if self.ws is not None:
+                        self.ws.sock.close()
+                except OSError:
+                    pass
+                self.ws = None
+                self._connect(pick)
+            return pick
 
     def _call(self, method, params, timeout):
         self.n += 1
@@ -384,6 +447,10 @@ class H(BaseHTTPRequestHandler):
         try:
             if path == "/__reset":
                 return self._send(200, reset(body))
+            if path == "/__tabs":
+                return self._send(200, tabs_state(body.get("expr") or "document.visibilityState"))
+            if body.get("front"):
+                CDPC.use_front()
             if path == "/__ax":
                 return self._send(200, ax_snapshot())
             if path == "/__cdp":
@@ -523,7 +590,10 @@ class SandboxPool:
     ``screenshot`` / ``state``; ``close_all`` (or the context manager / atexit) tears down."""
 
     def __init__(self, snapshot: str = "daytona-small", api_key: str | None = None, idle_stop_min: int = 30,
-                 pool_id: str | None = None):
+                 pool_id: str | None = None, labels: Mapping[str, str] | None = None,
+                 max_workers: int = MAX_WORKERS):
+        """``labels`` are merged into every sandbox's labels (the pool's own ``lapis-pool`` label
+        always wins); ``max_workers`` lowers the hard cap for this pool."""
         key = (api_key or os.environ.get("DAYTONA_API_KEY", "")).strip()
         if not key:
             raise PoolError("DAYTONA_API_KEY is not set")
@@ -533,6 +603,8 @@ class SandboxPool:
         self.snapshot = snapshot
         self.idle_stop_min = idle_stop_min
         self.pool_id = pool_id or f"pool-{secrets.token_hex(4)}"
+        self.labels = {**dict(labels or {}), LABEL: self.pool_id}
+        self.max_workers = min(MAX_WORKERS, max_workers)
         self.workers: list[Worker] = []
         self._closed = False
         atexit.register(self.close_all)
@@ -546,10 +618,11 @@ class SandboxPool:
         self.close_all()
 
     def start(self, n: int, max_parallel: int = 8, retries: int = 1) -> list[dict[str, Any]]:
-        if not 1 <= n <= MAX_WORKERS:
-            raise ValueError(f"n must be 1..{MAX_WORKERS} (${MAX_WORKERS * USD_PER_WORKER_HR:.2f}/hr cap)")
-        if len(self.workers) + n > MAX_WORKERS:
-            raise ValueError(f"pool would exceed {MAX_WORKERS} workers")
+        cap = self.max_workers
+        if not 1 <= n <= cap:
+            raise ValueError(f"n must be 1..{cap} (${cap * USD_PER_WORKER_HR:.2f}/hr cap)")
+        if len(self.workers) + n > cap:
+            raise ValueError(f"pool would exceed {cap} workers")
         base = len(self.workers)
         results: dict[int, Worker] = {}
         errors: list[str] = []
@@ -584,7 +657,7 @@ class SandboxPool:
         t0 = time.perf_counter()
         sb = self._client.create(
             CreateSandboxFromSnapshotParams(
-                snapshot=self.snapshot, labels={LABEL: self.pool_id},
+                snapshot=self.snapshot, labels=dict(self.labels),
                 auto_stop_interval=self.idle_stop_min, auto_delete_interval=0,
             ),
             timeout=180,
@@ -754,15 +827,52 @@ class SandboxPool:
     def state(self, i: int) -> dict[str, Any]:
         return self._ctl(i, "GET", "/__state")
 
-    def cdp(self, i: int, method: str, params: Mapping[str, Any] | None = None) -> dict[str, Any]:
-        return self._ctl(i, "POST", "/__cdp", {"method": method, "params": dict(params or {})})["result"]
+    def cdp(self, i: int, method: str, params: Mapping[str, Any] | None = None, front: bool = False) -> dict[str, Any]:
+        body: dict[str, Any] = {"method": method, "params": dict(params or {})}
+        if front:
+            body["front"] = True
+        return self._ctl(i, "POST", "/__cdp", body)["result"]
 
-    def eval_js(self, i: int, expression: str) -> Any:
-        r = self.cdp(i, "Runtime.evaluate", {"expression": expression, "returnByValue": True})
+    def eval_js(self, i: int, expression: str, front: bool = False) -> Any:
+        r = self.cdp(i, "Runtime.evaluate", {"expression": expression, "returnByValue": True}, front=front)
         return r.get("result", {}).get("value")
 
-    def ax_raw(self, i: int) -> dict[str, Any]:
-        return self._ctl(i, "POST", "/__ax", {})
+    def ax_raw(self, i: int, front: bool = False) -> dict[str, Any]:
+        """``front``: snapshot the visible tab (multi-tab browsers) instead of the attached page."""
+        return self._ctl(i, "POST", "/__ax", {"front": True} if front else {})
+
+    def tabs(self, i: int, expr: str = "document.visibilityState") -> dict[str, Any]:
+        """Every page target with ``expr`` evaluated in it (TabForge probe.py's output shape)."""
+        return self._ctl(i, "POST", "/__tabs", {"expr": expr})
+
+    def exec(self, i: int, cmd: str, timeout: int = 60) -> Any:
+        return self.workers[i].sandbox.process.exec(cmd, timeout=timeout)
+
+    def relaunch_chrome(self, i: int, url: str | None = None, timeout_s: float = 30.0) -> dict[str, Any]:
+        """Kill every Chromium in worker ``i`` (e.g. one an env launched itself) and start the
+        pool's own again, then re-measure the viewport origin."""
+        w = self.workers[i]
+        t0 = time.perf_counter()
+        w.sandbox.process.exec(
+            "pkill -f '[c]hromium' ; for i in $(seq 1 40); do pgrep -f '[c]hromium' >/dev/null || break; "
+            "sleep 0.25; done ; pkill -9 -f '[c]hromium' ; true", timeout=30)
+        w.sandbox.process.exec(
+            f"export DISPLAY=${{DISPLAY:-:0}}; setsid nohup chromium {CHROME_FLAGS} "
+            f"{shlex.quote(url or f'http://127.0.0.1:{CTL_PORT}/')} > {POOL_DIR}/chrome.log 2>&1 < /dev/null &")
+        deadline = time.monotonic() + timeout_s
+        health: dict[str, Any] = {}
+        while time.monotonic() < deadline:
+            try:
+                health = self._ctl(i, "GET", "/__health", timeout=5) or {}
+            except Exception:  # noqa: BLE001
+                health = {}
+            if health.get("cdp"):
+                break
+            time.sleep(0.3)
+        if not health.get("cdp"):
+            raise PoolError(f"worker {i}: pool Chromium did not come back: {health}")
+        w.origin = self._calibrate(w)
+        return {"relaunch_s": round(time.perf_counter() - t0, 3), "origin": w.origin}
 
     def get_cdp_ax(self, i: int, max_chars: int = 6000, raw: Mapping[str, Any] | None = None) -> str:
         """Studio-format AX lines (``format_cdp_ax_lines``) in screen pixels."""

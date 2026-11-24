@@ -491,7 +491,7 @@ async function openT(id){
    <div class="meta">From: <b>${esc(cur.sender_name)}</b> &lt;${esc(cur.sender_email)}&gt;</div>
    <div class="meta">To: ${esc(cur.to.join(', '))}</div><div class="meta">Cc: ${esc(cur.cc.join(', ')||'none')}</div>
    <div class="meta">${fmt(cur.ts)}</div><div id="acts">__BUTTONS__</div><p id="msg">${esc(cur.body)}</p>
-   <div id="compose"><div id="rcpt" class="meta"></div><textarea id="body"></textarea><br><button id="send" onclick="sendIt()">Send</button></div>
+   <div id="compose"><div id="rcpt" class="meta"></div><textarea id="body" aria-label="Message body" placeholder="Message"></textarea><br><button id="send" onclick="sendIt()">Send</button></div>
    <div id="toast"></div>`;
   load();
 }

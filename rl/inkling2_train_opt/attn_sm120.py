@@ -123,8 +123,12 @@ def _triton_fa2_rel_gatesink_fwd_kernel(
 
         s = tl.where(valid, s, float("-inf"))
         m_ij = tl.maximum(m_i, tl.max(s, axis=1))
-        p = tl.exp2(s - m_ij[:, None])
-        alpha = tl.exp2(m_i - m_ij)
+        # Sliding-window rows past WINDOW + BLOCK_N see a first K block that is fully masked
+        # (k_lo is rounded down to BLOCK_N): m_ij stays -inf and exp2(-inf - -inf) = NaN. Use 0 as
+        # the reference for such rows so p and alpha are 0 until a valid key arrives.
+        m_ref = tl.where(m_ij == float("-inf"), 0.0, m_ij)
+        p = tl.exp2(s - m_ref[:, None])
+        alpha = tl.exp2(m_i - m_ref)
         l_i = l_i * alpha + tl.sum(p, axis=1)
         acc = acc * alpha[:, None]
         v_tile = tl.load(V_ptr + k_global[:, None] * stride_kt + kvh * D + offs_d[None, :], mask=k_mask[:, None], other=0.0)

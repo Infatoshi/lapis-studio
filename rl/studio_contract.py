@@ -475,6 +475,8 @@ def format_cdp_ax_lines(
     scale: float = 1.0,
     max_chars: int = POST_ACTION_CHARS,
     max_nodes: int = 500,
+    display: tuple[float, float, float, float] | None = None,
+    prefix: list[AxNode] | None = None,
 ) -> str:
     """Chromium ``Accessibility.getFullAXTree`` ``nodes`` -> Studio's compact AX lines.
 
@@ -483,8 +485,20 @@ def format_cdp_ax_lines(
     each node. ``origin`` is the viewport's top-left in screen points and ``scale`` CSS px ->
     points, so lines match what Studio reads off a real Chrome window. Walk order is depth first
     from the root in child order (document order, like Studio's in-page walk); ignored nodes,
-    nameless wrappers and sub-2x2 rects are walked through but not shown, as in Studio."""
+    nameless wrappers and sub-2x2 rects are walked through but not shown, as in Studio.
+
+    ``display`` (x, y, w, h in screen points) drops nodes whose rect does not intersect the
+    display, as Studio's ``inspectDisplay`` does (so scrolled-away content is not listed).
+    ``prefix`` nodes (e.g. a synthesized browser tab strip) are emitted before the page's."""
     bounds = bounds or {}
+
+    def on_display(r: tuple[float, float, float, float]) -> bool:
+        if display is None:
+            return True
+        dx, dy, dw, dh = display
+        x, y, w, h = r
+        return w > 0 and h > 0 and x < dx + dw and dx < x + w and y < dy + dh and dy < y + h
+
     by_id = {str(n["nodeId"]): n for n in cdp_nodes}
     child_ids = {c for n in cdp_nodes for c in map(str, n.get("childIds", ()))}
     roots = [n for n in cdp_nodes if str(n["nodeId"]) not in child_ids and "parentId" not in n] or cdp_nodes[:1]
@@ -494,7 +508,7 @@ def format_cdp_ax_lines(
         x, y, w, h = b
         return (origin[0] + x * scale, origin[1] + y * scale, w * scale, h * scale)
 
-    kept: list[AxNode] = []
+    kept: list[AxNode] = list(prefix or [])
     stack = [(r, 0) for r in reversed(roots)]
     seen: set[str] = set()
     while stack and len(kept) < max_nodes:
@@ -507,7 +521,7 @@ def format_cdp_ax_lines(
             continue  # Blink-internal text runs; the Mac tree never exposes them
         if not n.get("ignored"):
             ax = cdp_node_to_ax(n, rect_of(n), app_name, pid)
-            if not (ax_structural_noise(ax, depth) or ax_tiny_rect(ax, depth)):
+            if not (ax_structural_noise(ax, depth) or ax_tiny_rect(ax, depth)) and on_display(ax.rect):
                 kept.append(ax)
         kids = [by_id[c] for c in map(str, n.get("childIds", ())) if c in by_id]
         stack.extend((k, depth + 1) for k in reversed(kids))
