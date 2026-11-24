@@ -251,6 +251,10 @@ struct CuaCommand {
     bool valid = false;
 };
 CuaCommand parseCuaAction(const QString &action, const QString &arg);
+// Cmd+W guard for a model reply's cua_hotkey: "" lets the combo run; otherwise the reason it is
+// blocked. A combo other than Cmd+W always runs. Cmd+W runs only when the user's goal asks to
+// close something (contains "close", any case) and no earlier Cmd+W ran in the same reply.
+QString cuaCloseTabBlockReason(const QString &goal, const QString &combo, int closesThisReply);
 // Closed-loop computer use: one finished cua_* action as the model sees it next turn.
 struct CuaStepResult {
     QString action;  // "cua_click", "cua_observe", ...
@@ -878,6 +882,7 @@ private:
         QVector<CuaStepResult> steps;
         QString goal;  // the user's own prompt (follow-ups keep it), for the CUA trace log
         QString shownRaw;  // the raw reply that started it (what its card is showing at the tail)
+        int closeTabs = 0;  // Cmd+W presses this reply already let through (at most one)
     };
     CuaBatch m_cuaBatch;
     quint64 m_cuaBatchId = 0;  // bumped per batch and per reset: a stale action's result is dropped

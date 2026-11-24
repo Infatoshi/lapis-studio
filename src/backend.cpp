@@ -5178,6 +5178,17 @@ CuaCommand parseCuaAction(const QString &action, const QString &arg)
     return c;
 }
 
+QString cuaCloseTabBlockReason(const QString &goal, const QString &combo, int closesThisReply)
+{
+    if (studio::cua::parseHotkeyCombo(combo).display != QLatin1String("Cmd+W"))
+        return {};
+    if (!goal.contains(QLatin1String("close"), Qt::CaseInsensitive))
+        return QStringLiteral("closing tabs is blocked unless the user asks to close something");
+    if (closesThisReply > 0)
+        return QStringLiteral("only one Cmd+W runs per reply; observe the screen before closing another");
+    return {};
+}
+
 QStringList defaultClusterOrder()
 {
     return {QStringLiteral("Work"), QStringLiteral("Projects"), QStringLiteral("Apps"), QStringLiteral("Quick Qs")};
@@ -5832,6 +5843,20 @@ QString Backend::dispatchStudioAction(const QString &action, const QString &arg)
         const CuaCommand c = parseCuaAction(a, arg);
         if (!c.valid)
             return {};
+        // A model reply's Cmd+W: never unprompted, never twice in one reply. The blocked step
+        // feeds the follow-up turn as an observation so the model sees why.
+        if (m_cuaBatch.open && c.kind == QLatin1String("hotkey")) {
+            const QString why = cuaCloseTabBlockReason(m_cuaBatch.goal, c.text, m_cuaBatch.closeTabs);
+            if (!why.isEmpty()) {
+                const QString shown = c.target.isEmpty() ? c.text : c.target + QLatin1Char('|') + c.text;
+                m_cuaLog << QStringLiteral("%1:%2 -> BLOCKED %3").arg(a, shown, why);
+                emit cuaActionFinished(a, shown, false, QStringLiteral("BLOCKED"), why);
+                m_cuaBatch.steps << CuaStepResult{a, shown, false, QStringLiteral("BLOCKED"), why, QString()};
+                return QStringLiteral("Not pressing Cmd+W: %1.").arg(why);
+            }
+            if (studio::cua::parseHotkeyCombo(c.text).display == QLatin1String("Cmd+W"))
+                ++m_cuaBatch.closeTabs;
+        }
         reply = startCuaAction(a, c);
         emitArg = c.target;
     } else {

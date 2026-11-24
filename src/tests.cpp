@@ -5474,6 +5474,33 @@ void studioControlTests()
         b.ask(QString(), -1, QStringLiteral("what is the weather like on mars"));
         check(b.cuaLoopDepth() == 0 && b.cuaFollowups().isEmpty(), "cua loop: a new user question resets the depth");
     }
+    // --- Cmd+W guard: never unprompted, at most one per model reply ------------------------------
+    {
+        check(cuaCloseTabBlockReason("open my inbox", "cmd+w", 0).contains("unless the user asks to close")
+                  && cuaCloseTabBlockReason("open my inbox", " Command + W ", 0).contains("unless the user asks to close")
+                  && cuaCloseTabBlockReason("Close the duplicate tab", "CMD+W", 0).isEmpty()
+                  && cuaCloseTabBlockReason("Close the duplicate tab", "cmd+w", 1).contains("only one Cmd+W")
+                  && cuaCloseTabBlockReason("open my inbox", "cmd+t", 0).isEmpty()
+                  && cuaCloseTabBlockReason("open my inbox", "cmd+shift+w", 0).isEmpty(),
+              "cmd+w guard: pure reason (unprompted blocked, prompted once, other combos untouched)");
+        Backend b(Backend::Mode::Mock);
+        b.ask(QString(), -1, QStringLiteral("find the pricing page in chrome"));
+        const QString unprompted = b.runModelAnswer("[[ACTION:cua_hotkey:Chrome|cmd+w]]");
+        check(!b.cuaLog().contains("cua_hotkey:Chrome|cmd+w") && b.cuaLog().size() == 1
+                  && b.cuaLog()[0].startsWith("cua_hotkey:Chrome|cmd+w -> BLOCKED closing tabs is blocked")
+                  && unprompted.startsWith("Not pressing Cmd+W") && b.cuaFollowups().size() == 1
+                  && b.cuaFollowups()[0].contains("(BLOCKED, ok=0, detail=closing tabs is blocked unless the user asks to close"),
+              "cmd+w guard: unprompted cmd+w is blocked and the follow-up turn sees why", b.cuaLog().join(" | "));
+        b.clearAnswers();
+        b.ask(QString(), -1, QStringLiteral("Close the duplicate pricing tab"));
+        b.runModelAnswer("[[ACTION:cua_hotkey:Chrome|cmd+w]] [[ACTION:cua_hotkey:cmd + W]] [[ACTION:cua_hotkey:cmd+t]]");
+        const QStringList log = b.cuaLog().mid(1);
+        check(log.size() == 3 && log[0] == "cua_hotkey:Chrome|cmd+w"
+                  && log[1].startsWith("cua_hotkey:cmd+W -> BLOCKED only one Cmd+W runs per reply") && log[2] == "cua_hotkey:cmd+t",
+              "cmd+w guard: a prompted reply runs its first cmd+w, blocks the second, other hotkeys still run", log.join(" | "));
+        b.runModelAnswer("[[ACTION:cua_hotkey:cmd+w]]");
+        check(b.cuaLog().last() == "cua_hotkey:cmd+w", "cmd+w guard: the next reply may close one more", b.cuaLog().join(" | "));
+    }
     check(kCompatSystemPrompt.contains("[[ACTION:") && kCompatSystemPrompt.contains("1-3 crisp sentences"),
           "studio cmd: the system prompt teaches [[ACTION:..]] and short answers");
 
