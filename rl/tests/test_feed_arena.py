@@ -332,3 +332,10 @@ def test_map_hotkey_and_guards():
     assert P.MAX_WORKERS * P.USD_PER_WORKER_HR == pytest.approx(2.24)
     assert "--test-type" in P.CHROME_FLAGS and "--remote-debugging-port=9222" in P.CHROME_FLAGS
     compile(P.CONTROL_SERVER_SRC, "ctl.py", "exec")
+
+
+def test_map_hotkey_dedupes_modifiers():
+    # Stage-4c TabForge crash: cmd+ctrl+w -> press('w', ['ctrl', 'ctrl']) errored in the Daytona executor
+    assert P.map_hotkey("cmd+ctrl+w") == ("w", ["ctrl"])
+    assert P.map_hotkey("ctrl+ctrl+tab") == ("Tab", ["ctrl"])
+    assert P.map_hotkey("meta+command+shift+opt+alt+t") == ("t", ["ctrl", "shift", "alt"])

@@ -559,7 +559,8 @@ _MOD_NAMES = {"cmd": "ctrl", "command": "ctrl", "meta": "ctrl", "ctrl": "ctrl", 
 def map_hotkey(combo: str) -> tuple[str, list[str]]:
     """Studio combo ("cmd+l", "return") -> (X11 key, modifiers) for a Linux sandbox (cmd -> ctrl)."""
     parts = [p for p in combo.lower().split("+") if p]
-    mods = [_MOD_NAMES[p] for p in parts[:-1] if p in _MOD_NAMES]
+    # dedupe after mapping: "cmd+ctrl+w" -> ctrl twice, which the Daytona executor rejects
+    mods = list(dict.fromkeys(_MOD_NAMES[p] for p in parts[:-1] if p in _MOD_NAMES))
     key = parts[-1] if parts else ""
     return _KEY_NAMES.get(key, key), mods
 
